@@ -2,34 +2,25 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <!-- Launchd label (must match filename before .plist) -->
+  <!-- Fix #P1-5: Uses $HOME environment variable for portable path.
+       Before: /Users/ernest/Desktop/DEVPROJECTS/...
+       After:  $HOME/Desktop/DEVPROJECTS/... (portable across users) -->
   <key>Label</key>
   <string>com.hermes-agent.browser-bridge</string>
 
-  <!-- Program to run — use 'node' to respect user's PATH -->
   <key>ProgramArguments</key>
   <array>
-    <string>node</string>
-    <string>/Users/ernest/Desktop/DEVPROJECTS/hermes-browser-bridge/proxy_server/server.js</string>
+    <string>/bin/bash</string>
+    <string>-c</string>
+    <string>cd "$HOME/Desktop/DEVPROJECTS/hermes-browser-bridge/proxy_server" && node server.js</string>
   </array>
 
-  <!--
-    Fix #7: Set to false — start manually via launchctl.
-    User enables/disables via: launchctl enable/disable.
-    Set to true only if you want the proxy running on every login automatically.
-  -->
   <key>RunAtLoad</key>
   <false/>
 
-  <!-- Auto-restart if it crashes — KeepAlive alone, no StartCalendarInterval conflict -->
   <key>KeepAlive</key>
   <true/>
 
-  <!-- Set the working directory using $HOME -->
-  <key>WorkingDirectory</key>
-  <string>/Users/ernest/Desktop/DEVPROJECTS/hermes-browser-bridge/proxy_server</string>
-
-  <!-- stdout/stderr (logged to system log) -->
   <key>StandardOutPath</key>
   <string>/tmp/hermes-browser-bridge.log</string>
   <key>StandardErrorPath</key>

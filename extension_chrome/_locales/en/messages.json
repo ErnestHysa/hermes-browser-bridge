@@ -1,0 +1,4 @@
+{
+  "extension_name": { "message": "Hermes Browser Bridge", "description": "Extension name" },
+  "extension_description": { "message": "Gives Hermes Agent full read and control of the current browser tab", "description": "Extension description" }
+}

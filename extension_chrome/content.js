@@ -1,41 +1,28 @@
 /**
- * content.js — Safari Web Extension Content Script
- * Runs in every page. Reads DOM, observes mutations, executes commands.
- *
- * Fix #P1-4:  MutationObserver race — capture initial snapshot synchronously
- *             BEFORE observer starts, so no mutations are lost during setup.
- * Fix #P3-17: Handle 'cancel' command type — ignore if cmdId matches a pending
- *             command and do not send cmd_ack/error.
- * Fix #P3-18: DOM serialization uses requestIdleCallback to avoid main-thread
- *             blocking on large pages (5000+ elements).
+ * content.js — Chrome Extension Content Script (Manifest V3)
+ * 
+ * Identical logic to the Safari version but uses chrome.* APIs instead of browser.*.
+ * The command set, MutationObserver behavior, and snapshot strategy are the same.
+ * 
+ * Fix #P2-7: Chrome extension implementation for parity with Safari.
  */
 
 'use strict';
 
 const FULL_SNAPSHOT_INTERVAL_MS = 2000;
-const IDLE_DEBOUNCE_MS = 100;       // idle callback timeout for non-urgent serialization
 const MAJOR_MUTATION_DEBOUNCE_MS = 300;
 const MAX_STRUCTURAL_ELEMENTS = 2000;
-const CANCEL_SETTLE_MS = 100;        // wait for in-flight cancel before settling ack
 
-// ─── State ─────────────────────────────────────────────────────────────────────
+// ─── State ─────────────────────────────────────────────────────────────────
 
-/** @type {Map<string, {resolve: function, reject: function, settled?: boolean}>} */
 const pendingCommands = new Map();
-/** @type {number|null} */
 let snapshotInterval = null;
-/** @type {MutationObserver|null} */
 let pageObserver = null;
-/** @type {number|null} */
 let debounceTimer = null;
 let navigateFailTimer = null;
 let lastNavigateCmdId = null;
 
-// ─── Navigate handler leak fix ─────────────────────────────────────────────────
-
-/** @type {((...args: any[]) => void)|null} */
 let _navLoadHandler = null;
-/** @type {((...args: any[]) => void)|null} */
 let _navPageShowHandler = null;
 
 function clearNavigateHandlers() {
@@ -54,12 +41,8 @@ function clearNavigateHandlers() {
   lastNavigateCmdId = null;
 }
 
-// ─── DOM Reading ───────────────────────────────────────────────────────────────
+// ─── DOM Reading ─────────────────────────────────────────────────────────────
 
-/**
- * Full snapshot — sends complete outerHTML.
- * Uses requestIdleCallback when available to avoid main-thread jank.
- */
 function getFullPageSnapshot() {
   try {
     return {
@@ -79,20 +62,11 @@ function getFullPageSnapshot() {
   }
 }
 
-/**
- * Structural snapshot — element counts + changed text from characterData mutations.
- * Uses requestIdleCallback when page has many elements to avoid blocking.
- * @param {string[]} changedTexts
- */
 function getStructuralSnapshot(changedTexts = []) {
-  const elementCount = (document.querySelectorAll('*').length || 0);
-
-  // P3-18: For large pages, defer to requestIdleCallback
+  const elementCount = document.querySelectorAll('*').length || 0;
   if (elementCount > MAX_STRUCTURAL_ELEMENTS && typeof requestIdleCallback !== 'undefined') {
     return new Promise((resolve) => {
-      requestIdleCallback(() => {
-        resolve(_buildStructuralSnapshot(changedTexts));
-      }, { timeout: 500 });
+      requestIdleCallback(() => resolve(_buildStructuralSnapshot(changedTexts)), { timeout: 500 });
     });
   }
   return Promise.resolve(_buildStructuralSnapshot(changedTexts));
@@ -103,7 +77,6 @@ function _buildStructuralSnapshot(changedTexts = []) {
     return {
       url: window.location.href,
       title: document.title,
-      // No html field in structural snapshots
       structural: {
         total: document.querySelectorAll('*').length,
         forms: document.forms.length,
@@ -129,25 +102,13 @@ function _buildStructuralSnapshot(changedTexts = []) {
   }
 }
 
-// ─── Snapshot Sending ──────────────────────────────────────────────────────────
+// ─── Snapshot Sending ────────────────────────────────────────────────────────
 
-/**
- * P1-4 Fix: Immediately capture and send the current page state synchronously,
- * BEFORE the MutationObserver is attached, so zero initial mutations are missed.
- * Then start the observer.
- */
 function captureInitialSnapshot() {
-  // Synchronous snapshot before observer touches anything
   const snap = getFullPageSnapshot();
   sendToBackground({ type: 'tab_snapshot', ...snap, incremental: false, _initial: true })
-    .then(() => {
-      // Observer starts only after first snapshot is confirmed sent
-      setupMutationObserver();
-    })
-    .catch(() => {
-      // Network hiccup — still start observer so we don't miss mutations
-      setupMutationObserver();
-    });
+    .then(() => setupMutationObserver())
+    .catch(() => setupMutationObserver());
 }
 
 function sendStructuralSnapshot(changedTexts = []) {
@@ -161,25 +122,16 @@ function sendStructuralSnapshot(changedTexts = []) {
   }
 }
 
-// ─── Mutation Observer ─────────────────────────────────────────────────────────
+// ─── Mutation Observer ─────────────────────────────────────────────────────
 
 function setupMutationObserver() {
   if (!document.body) {
     setTimeout(setupMutationObserver, 200);
     return;
   }
+  if (pageObserver) { pageObserver.disconnect(); pageObserver = null; }
+  if (debounceTimer !== null) { clearTimeout(debounceTimer); debounceTimer = null; }
 
-  if (pageObserver) {
-    pageObserver.disconnect();
-    pageObserver = null;
-  }
-
-  if (debounceTimer !== null) {
-    clearTimeout(debounceTimer);
-    debounceTimer = null;
-  }
-
-  /** @type {string[]} */
   const changedTexts = [];
 
   const flush = () => {
@@ -190,9 +142,7 @@ function setupMutationObserver() {
   };
 
   const observer = new MutationObserver((mutations) => {
-    if (debounceTimer !== null) {
-      clearTimeout(debounceTimer);
-    }
+    if (debounceTimer !== null) { clearTimeout(debounceTimer); }
 
     const mutationsData = mutations.map(m => ({
       type: m.type,
@@ -219,7 +169,6 @@ function setupMutationObserver() {
       seq: window._snapshotSeq || 0
     });
 
-    // Major DOM changes trigger full snapshot after debounce
     const major = mutations.some(m =>
       m.type === 'childList' && (m.addedNodes.length > 5 || m.removedNodes.length > 0)
     );
@@ -247,22 +196,42 @@ function setupMutationObserver() {
   }, FULL_SNAPSHOT_INTERVAL_MS);
 }
 
-// ─── Background communication ───────────────────────────────────────────────────
+// ─── Background communication (Chrome: chrome.runtime) ───────────────────────
 
 function sendToBackground(msg) {
-  return browser.runtime.sendMessage(msg).catch((err) => {
+  return chrome.runtime.sendMessage(msg).catch((err) => {
     console.error('[Hermes Bridge] sendToBackground failed:', err.message);
     throw err;
   });
 }
 
-// ─── Command Execution ─────────────────────────────────────────────────────────
+// ─── Command Execution ───────────────────────────────────────────────────────
 
 const CMD_HANDLERS = {
   navigate(cmd) {
-    setupNavigateResolver(cmd.cmdId, cmd.url);
-    sendToBackground({ type: '_navigate', cmdId: cmd.cmdId, url: cmd.url })
-      .catch(() => {});
+    clearNavigateHandlers();
+    lastNavigateCmdId = cmd.cmdId;
+    navigateFailTimer = setTimeout(() => {
+      if (lastNavigateCmdId === cmd.cmdId) {
+        lastNavigateCmdId = null;
+        pendingCommands.delete(cmd.cmdId);
+        sendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, success: false, error: `Navigation to ${cmd.url} was blocked or failed` });
+      }
+    }, 3000);
+
+    _navLoadHandler = () => {
+      clearNavigateHandlers();
+      pendingCommands.delete(cmd.cmdId);
+      sendToBackground({ type: 'cmd_ack', cmdId: cmd.cmdId, success: true, result: `Navigated to ${cmd.url}` });
+    };
+    _navPageShowHandler = () => {
+      clearNavigateHandlers();
+      pendingCommands.delete(cmd.cmdId);
+      sendToBackground({ type: 'cmd_ack', cmdId: cmd.cmdId, success: true, result: `Navigated to ${cmd.url}` });
+    };
+    window.addEventListener('load', _navLoadHandler);
+    window.addEventListener('pageshow', _navPageShowHandler);
+    sendToBackground({ type: '_navigate', cmdId: cmd.cmdId, url: cmd.url }).catch(() => {});
   },
 
   click(cmd) {
@@ -291,16 +260,10 @@ const CMD_HANDLERS = {
       return;
     }
     el.focus();
-    const nativeInputSetter = Object.getOwnPropertyDescriptor(
-      window.HTMLInputElement.prototype, 'value'
-    ) || Object.getOwnPropertyDescriptor(
-      window.HTMLTextAreaElement.prototype, 'value'
-    );
-    if (nativeInputSetter) {
-      nativeInputSetter.set.call(el, cmd.text);
-    } else {
-      el.value = cmd.text;
-    }
+    const nativeInputSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')
+      || Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value');
+    if (nativeInputSetter) { nativeInputSetter.set.call(el, cmd.text); }
+    else { el.value = cmd.text; }
     el.dispatchEvent(new Event('input', { bubbles: true }));
     el.dispatchEvent(new Event('change', { bubbles: true }));
     pendingCommands.delete(cmd.cmdId);
@@ -315,11 +278,8 @@ const CMD_HANDLERS = {
       return;
     }
     const submitBtn = form.querySelector('button[type="submit"], input[type="submit"]');
-    if (submitBtn) {
-      submitBtn.click();
-    } else {
-      form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
-    }
+    if (submitBtn) { submitBtn.click(); }
+    else { form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })); }
     pendingCommands.delete(cmd.cmdId);
     sendToBackground({ type: 'cmd_ack', cmdId: cmd.cmdId, success: true, result: `Submitted form: ${cmd.selector || 'form'}` });
   },
@@ -340,105 +300,64 @@ const CMD_HANDLERS = {
     const snap = getFullPageSnapshot();
     pendingCommands.delete(cmd.cmdId);
     sendToBackground({ type: 'tab_snapshot', ...snap, incremental: false })
-      .then(() => {
-        sendToBackground({ type: 'cmd_ack', cmdId: cmd.cmdId, success: true, result: `Refreshed (seq ${snap.seq})` });
-      })
-      .catch(e => {
-        sendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, success: false, error: e.message });
-      });
+      .then(() => sendToBackground({ type: 'cmd_ack', cmdId: cmd.cmdId, success: true, result: `Refreshed (seq ${snap.seq})` }))
+      .catch(e => sendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, success: false, error: e.message }));
   }
 };
 
-/**
- * P3-17 Fix: Handle cancel command — if this cmdId is pending, remove it
- * and do NOT send any ack/error back to the proxy.
- */
 function handleCancel(cmdId) {
   if (!pendingCommands.has(cmdId)) return;
-  const entry = pendingCommands.get(cmdId);
-  entry.settled = true;
+  pendingCommands.get(cmdId).settled = true;
   pendingCommands.delete(cmdId);
-  // Do NOT send cmd_ack or cmd_error — command was cancelled
 }
 
-// ─── Message listener ───────────────────────────────────────────────────────────
+// ─── Message listener ───────────────────────────────────────────────────────
 
-browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  // P3-17: Handle cancel command type
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'cancel') {
     handleCancel(message.cmdId);
     return true;
   }
-
   if (message.type === 'ping') {
     const snap = getFullPageSnapshot();
     sendResponse({ type: 'pong', ...snap });
     return true;
   }
-
   const handler = CMD_HANDLERS[message.type];
   if (handler) {
     const { cmdId } = message;
     pendingCommands.set(cmdId, { resolve: null, reject: null, settled: false });
     Promise.resolve().then(() => handler(message)).catch((e) => {
-      if (!pendingCommands.get(cmdId)?.settled) {
-        pendingCommands.delete(cmdId);
-      }
+      if (!pendingCommands.get(cmdId)?.settled) pendingCommands.delete(cmdId);
     });
     return true;
   }
-
   return false;
 });
 
-// ─── Cleanup on page unload ────────────────────────────────────────────────────
+// ─── Cleanup ────────────────────────────────────────────────────────────────
 
 window.addEventListener('unload', () => {
-  if (snapshotInterval !== null) {
-    clearInterval(snapshotInterval);
-    snapshotInterval = null;
-  }
-  if (pageObserver) {
-    pageObserver.disconnect();
-    pageObserver = null;
-  }
-  if (debounceTimer !== null) {
-    clearTimeout(debounceTimer);
-    debounceTimer = null;
-  }
+  if (snapshotInterval !== null) { clearInterval(snapshotInterval); snapshotInterval = null; }
+  if (pageObserver) { pageObserver.disconnect(); pageObserver = null; }
+  if (debounceTimer !== null) { clearTimeout(debounceTimer); debounceTimer = null; }
   clearNavigateHandlers();
   for (const [cmdId, pending] of pendingCommands) {
-    if (pending.reject && !pending.settled) {
-      pending.reject(new Error('Tab navigated away'));
-    }
+    if (pending.reject && !pending.settled) pending.reject(new Error('Tab navigated away'));
   }
   pendingCommands.clear();
 });
 
-// ─── Global error handlers (P1-4 / crash recovery) ──────────────────────────────
-
 window.addEventListener('error', (e) => {
-  sendToBackground({
-    type: 'content_error',
-    message: e.message,
-    filename: e.filename,
-    lineno: e.lineno,
-    colno: e.colno
-  }).catch(() => {});
+  sendToBackground({ type: 'content_error', message: e.message, filename: e.filename, lineno: e.lineno, colno: e.colno }).catch(() => {});
 });
 
 window.addEventListener('unhandledrejection', (e) => {
-  sendToBackground({
-    type: 'content_error',
-    message: `unhandledrejection: ${e.reason}`,
-  }).catch(() => {});
+  sendToBackground({ type: 'content_error', message: `unhandledrejection: ${e.reason}` }).catch(() => {});
 });
 
-// ─── Init ─────────────────────────────────────────────────────────────────────
+// ─── Init ─────────────────────────────────────────────────────────────────
 
 window._snapshotSeq = 0;
-
-// P1-4 Fix: Capture initial snapshot SYNCHRONOUSLY before observer starts
-// Use a small delay only to ensure document.body is ready
 const initDelay = document.body ? 0 : 100;
 setTimeout(captureInitialSnapshot, initDelay);

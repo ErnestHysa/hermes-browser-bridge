@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Hermes Browser Bridge</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="container">
+    <!-- Header -->
+    <div class="header">
+      <div class="header-left">
+        <span class="status-dot" id="status-dot"></span>
+        <span class="status-text" id="status-text">Inactive</span>
+      </div>
+      <span class="version" id="version-text">v1.3.0</span>
+    </div>
+
+    <!-- URL display -->
+    <div class="url-row" id="url-display">No tab active</div>
+
+    <!-- Info text -->
+    <p class="info-text" id="info-text">Click "Activate Tab" to give Hermes Agent access to your current page.</p>
+
+    <!-- Error panel -->
+    <div class="error-panel hidden" id="error-panel">
+      <span class="error-text" id="error-text"></span>
+    </div>
+
+    <!-- Command log -->
+    <div class="cmd-log-panel hidden" id="cmd-log-panel">
+      <div class="cmd-log-header">
+        <span>Commands</span>
+        <span class="cmd-count" id="cmd-count">0</span>
+      </div>
+      <ul class="cmd-log-list" id="cmd-log-list"></ul>
+    </div>
+
+    <!-- Buttons -->
+    <div class="button-row">
+      <button class="btn btn-primary" id="activate-btn">Activate Tab</button>
+      <button class="btn btn-secondary hidden" id="disconnect-btn">Disconnect</button>
+      <button class="btn btn-ghost hidden" id="refresh-btn">Refresh</button>
+    </div>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>

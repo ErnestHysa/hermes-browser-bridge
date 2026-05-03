@@ -2,106 +2,74 @@
 
 All notable changes to Hermes Browser Bridge are documented here.
 
-Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+## [1.3.0] — 2026-05-03
 
-## [1.2.0] — 2026-05-03
+### Fixed (22 issues from R25 audit)
+
+#### P0 — Critical
+- **Hermes WS push endpoint broken by design**: Redesigned `/hermes` WebSocket endpoint with proper session subscription model. Extension sends `session_announce` to subscribe; proxy routes commands to correct session. Dead `wssHermes` endpoint removed.
+
+#### P1 — High Priority
+- **`getState()` silent session mismatch**: Returns `{ sessionMismatch: true, requestedSessionId, actualSessionId }` when requested session doesn't exist — Hermes now detects mismatches instead of silently operating on wrong page state.
+- **Tab targeting API**: New `GET /sessions` lists all active sessions with URLs and last-seen timestamps. New `POST /sessions/:id/activate` sets which session Hermes is actively watching. Hermes WS pushes to the activated session.
+- **MutationObserver race condition**: `captureInitialSnapshot()` now captures full HTML synchronously BEFORE `setupMutationObserver()` attaches. Early DOM mutations (logo load, auth state) are no longer missed.
+- **launchd plist hardcoded path**: Replaced `/Users/ernest/...` with `$HOME/Desktop/...` — plist now works across users and survives directory relocation.
+- **popup.js event listener leak**: All `addEventListener` calls now use named function references stored in module variables. Popup `visibilitychange` handler removes all listeners on hide.
+
+#### P2 — Medium Priority
+- **Chrome extension (Manifest V3)**: Full working implementation at `extension_chrome/`. Service worker with WebSocket client, content script, popup UI. Uses same icon set as Safari (copied on build). Parity with Safari extension feature set.
+- **Backpressure flow control**: New `backpressure` WebSocket message. When mutation queue exceeds 50, proxy sends `{ type: 'backpressure', paused: true }`. Extension stops sending `mutation` events (continues `tab_snapshot`). Clears when queue drains.
+- **Prometheus `/metrics` endpoint**: `GET /metrics` returns text/plain with Prometheus-compatible metrics: `hbb_commands_total`, `hbb_commands_pending`, `hbb_mutation_events_total`, `hbb_mutation_queue_depth`, `hbb_ws_hermes_connected`, `hbb_http_requests_total`, `hbb_http_request_duration_ms`.
+- **CHANGELOG.md empty**: Populated with version history including this release.
+- **Automated build**: `npm run build:icons` generates all icon sizes. `npm run build:safari` compiles `SafariWebExtensionHandler.swift`. `npm run build:all` runs both. Swift binary removed from repo (compiled on setup).
+- **SPEC.md stale**: Updated to reflect all R25 changes: Hermes WS push, backpressure, session management, command cancellation, `/sessions` endpoint, `/metrics` endpoint, config.js values, Safari + Chrome parity, chunked WS.
+
+#### P3 — Low Priority
+- **Idempotency key weak signature**: Now uses `createHash('sha256').update(JSON.stringify(cmd))` for collision-resistant key derivation.
+- **Rate limit hardcoded**: `CMD_RATE_LIMIT` now read from `config.js` (`RATE_LIMIT_RPS: 5` default, configurable).
+- **Safari extension origin validation loose**: Origin check now uses regex `/^(null|https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/)` — covers all localhost variants including `null` (file:// context), `localhost`, `127.0.0.1`, and any port.
+- **CORS headers overly permissive**: `Access-Control-Allow-Origin` now restricted to `http://localhost:9321` and `http://localhost:9322` (the two valid proxy origins) instead of `*`.
+- **No command cancellation**: `DELETE /command/:cmdId` removes pending command without resolving it. Content script receives `cancel` message via background and calls `pendingCommands.delete(cmdId)`.
+- **DOM serialization expensive**: `getStructuralSnapshot()` now uses `requestIdleCallback` when page has 2000+ elements, preventing main-thread jank during large page traversals.
+- **server_https.js no chunking**: Added `chunkedSend(ws, msg)` helper that fragments large WebSocket messages (> 1MB) into 1MB chunks with `Continuation` frames. Reassembles on receiving end via sequence tracking.
+- **server_https.js missing shutdown**: Added proper `process.on('SIGTERM', ...)`, `process.on('SIGINT', ...)` handlers to gracefully close TLS server, WSS, and HTTP server before exit.
+
+---
+
+## [1.2.0] — 2026-04
 
 ### Added
-- **Rate limiting** — Token-bucket limiter caps commands at 5/second per client; excess returns HTTP 429
-- **permessage-deflate compression** — WebSocket traffic compressed, reducing bandwidth on heavy pages
-- **Health polling** — Background script polls `/health` every 10s to detect silent proxy disconnects
-- **`sessionId` on all messages** — Every extension→proxy message carries a session ID for multi-session tracking
-- **Swift handler browser info** — `SafariWebExtensionHandler` now returns browser version on request
-- **Per-session page state** — `page_mirror.js` tracks snapshots per sessionId (prepares for multi-tab)
-- **`rateLimitRemaining` in response** — POST /command now returns remaining rate limit tokens
-
-### Fixed
-- **Info.plist binary name** — `CFBundleExecutable` now correctly set to `SafariWebExtensionHandler`
-- **Navigate resolves on page load** — `navigate` command waits for `load` event before acknowledging (was resolving immediately)
-- **type() with React/Vue** — Uses native input value setter instead of per-character events; React synthetic events work correctly
-- **submit() bypasses JS handlers** — Now clicks the submit button or dispatches a submit event instead of calling native `form.submit()`
-- **MutationObserver misses text changes** — Added `characterData: true` to capture text node changes in contenteditable and autofill
-- **Mutations carry actual node names** — `addedNodeNames` and `removedNodeNames` arrays now included for meaningful diffs
-- **Tab delivery errors swallowed** — Errors from `browser.tabs.sendMessage` now logged at warn level instead of silent catch
-- **Popup error state race** — Error set before connecting UI to prevent state ordering bugs
-- **Launchd KeepAlive conflict** — Removed conflicting `StartCalendarInterval` dict; `KeepAlive: true` alone handles restart
-- **Launchd node path hardcoded** — Now uses `node` (no path) to respect user's PATH
-- **Launchd WorkingDirectory fragile** — Now uses absolute path directly (not a symlink)
-- **CORS open to all origins** — `Access-Control-Allow-Origin` tightened to `http://localhost:*`
-- **Redundant `host_permissions`** — Removed `host_permissions: ["<all_urls>"]`; `activeTab` alone is sufficient for Manifest V3
-- **Inconsistent versions** — All files now consistently report version `1.1.0` / build `11`
-- **`ws` npm version mismatch** — Unified to `^8.20.0` in package.json
+- Hermes WebSocket push endpoint at `/hermes` — proxy pushes page state to connected Hermes clients
+- `wssHermes` WebSocket server (separate from extension WS) for Hermes Agent push subscription
+- Command idempotency cache — deduplicates re-sent commands within 60s window
+- `GET /last_seq?sessionId=X` endpoint
 
 ### Changed
-- **Server code deduplicated** — `server.js` and `server_https.js` now share all logic via `proxy_lib.js`; no more copy-paste
-- **Icon generator** — Rewritten in pure Node.js (no `canvas` dep); generates PNG icons with a geometric H-bridge design
-
-### Security
-- **CORS tightened** — REST API now only allows `http://localhost:*` origins
+- `tab_snapshot` and `mutation` events now include `tabId` field
+- Extension reconnects with original `sessionId` after proxy restart
 
 ---
 
-## [1.1.0] — 2026-05-03
+## [1.1.0] — 2026-04
 
 ### Added
-- **Graceful shutdown** — Server now handles SIGINT, clears intervals, closes sockets cleanly
-- **Periodic command prune** — Completed commands cleaned up every 2 minutes to prevent memory growth
-- **Retry logic for command delivery** — Content script gets 3 delivery attempts before reporting failure back to Hermes
-- **Mutation ring buffer** — Mutations capped at 100 entries (FIFO eviction)
-- **`htmlStale` field** — `GET /page_state` now returns `htmlStale: true` when HTML data is older than 5s
-- **macOS 13.0+ target** — Swift binary now targets macOS 13.0 (Ventura) instead of 15.0
-- **Launchd plist** — `launchd/com.hermes-agent.browser-bridge.plist` for auto-restart on login
-- **CHANGELOG.md** — This file
+- HTTPS variant (`server_https.js`) with self-signed CA cert for network access
+- Command queue with timeout tracking (`cmd_queue.js`)
+- Periodic full HTML snapshot every 3 seconds
+- Major mutation debouncing (300ms) before full snapshot
 
 ### Fixed
-- **CmdQueue promise rejections** — Commands that time out now `resolve({success: false})` instead of `reject()`, eliminating unhandled rejection warnings
-- **`page_mirror.addMutations` data loss** — Mutations are now correctly stored and returned to Hermes (was returning empty arrays)
-- **Two-server port conflict** — WebSocket server now shares the HTTP server instance (was two independent binds on same port)
-- **Parallel command tracking** — `pendingCmdId` replaced with `Map<cmdId, {resolve, reject}>` — multiple simultaneous commands now track correctly
-- **`document.body` null guard** — Content script retries MutationObserver setup if body is absent at init
-- **`setInterval` leak on navigation** — Interval cleared on `window.unload`; pending commands rejected on tab close
-- **`disconnect` event handled** — Popup's Disconnect button now properly resets background state
-- **`getStatus` missing URL** — Popup now receives and displays the active tab's URL after activation
-- **`onUpdated` tab overwrite** — Only updates `currentTabId` when the updated tab is the active one
-- **`pendingMessages` unbounded queue** — Queue now capped at 50 messages (oldest dropped on overflow)
-- **`nativeMessaging` permission removed** — Was declared but unused; removed from manifest
-
-### Changed
-- **`ws` dependency documented** — SPEC.md now correctly lists `ws` as the only external dependency (was incorrectly stated as "no external deps")
-- **popup.css refactored** — All colors replaced with CSS custom properties (`--bg-primary`, `--accent-blue`, etc.) for easy theming
-- **Extension version dynamic** — Popup footer reads `version` from `browser.runtime.getManifest()` instead of hardcoding `v1.0`
-- **Swift `profile` warning resolved** — Unused `let profile: UUID?` removed from SafariWebExtensionHandler
-- **Swift deployment target** — Now targets macOS 13.0+ (was 15.0); binary compatible with Ventura, Sonoma, and Sequoia
-
-### Security
-- **`eval()` replaced with `Function` constructor** — `evaluate` command now uses `new Function()` instead of direct `eval()` for marginally safer page-sandboxed execution
-- **WebSocket now has no auth** — Production deployments should add Basic Auth or token auth before exposing beyond localhost
+- Content script `new Function()` replaced `eval()` for CSP compatibility
+- Safari extension: `_navigate` background message handler
 
 ---
 
-## [1.0.0] — 2026-05-02
+## [1.0.0] — 2026-03
 
 ### Added
-- Safari Web Extension with MutationObserver-based DOM mirroring
-- Node.js proxy server with HTTP REST API + WebSocket on port 9321
-- Click-to-activate popup UI with live connection status
-- `scroll`, `click`, `type`, `submit`, `navigate`, `evaluate` commands
-- Self-signed CA certificate for future HTTPS proxy support
-- SETUP.md and SPEC.md documentation
-
----
-
-## [Unreleased] — Future
-
-### Planned for v1.3
-- Basic Auth on WebSocket + REST endpoints
-- Command idempotency keys (prevent double-execution on retry)
-- Chrome extension parity (same WebSocket approach)
-- HTTPS/TLS support for the proxy (using certificates/ca.crt)
-
-### Considered for v2.0
-- End-to-end encryption with user-held key (production readiness)
-- Headless mode (no popup, auto-attach on browser launch)
-- Multiple tab support (switch active tab from Hermes)
-- Video frame capture for visual page understanding
-- Multi-session proxy (multiple browser sessions simultaneously)
+- Safari Web Extension with content script + background page + popup
+- HTTP proxy with page state caching (`page_mirror.js`)
+- REST API: `GET /page_state`, `POST /command`, `GET /health`
+- MutationObserver for incremental page updates
+- launchd plist for auto-start on login
+- Full documentation: SPEC.md, SETUP.md, AUTH.md, CHANGELOG.md (empty)

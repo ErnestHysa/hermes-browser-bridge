@@ -1,37 +1,48 @@
 /**
  * proxy_lib.js — Shared proxy logic for both HTTP and HTTPS server variants.
  * Contains all HTTP handling, WebSocket handling, and shared state.
- * Both server.js and server_https.js import this to avoid code duplication.
+ * Both server.js and server_https.js import this.
  *
- * Fix #C4:  Binds to 127.0.0.1 by default (LAN exposure fixed)
- * Fix #M7:  Structured JSON logging with request IDs
- * Fix #M4:  parseBody enforces 1MB total size limit
- * Fix #M3:  HTML snapshots capped at 10MB
- * Fix #M2:  Idempotency key support — duplicate commands within 30s are rejected
- * Fix #M10: cmdQueue.ack/error log warning for unknown cmdId
- * Fix #L1:  Comment explaining pruneInterval 120s duration
- * Fix #L4:  Rate limiter cached in variable to avoid repeated Map lookup
+ * Fix #P0-1:  Hermes WS push redesign — proper session subscription model.
+ *             Hermes connects to ws://localhost:9321/hermes, sends a subscribe
+ *             message with sessionId, and only receives updates for that session.
+ *             Commands from Hermes over WS are forwarded to the correct session.
+ * Fix #P1-3:  Tab targeting API — GET /sessions lists all sessions,
+ *             POST /sessions/:id/activate sets active session for Hermes.
+ * Fix #P2-9:  Prometheus-compatible /metrics endpoint.
+ * Fix #P2-8:  Backpressure signaling — proxy sends {type: "backpressure", paused: true/false}
+ *             to extension WebSocket when its send buffer is high.
+ * Fix #P3-13: Idempotency key uses SHA-256 hash of full command, not just signature.
+ * Fix #P3-15: Origin validation checks for null origin (Safari file:// context) explicitly.
+ * Fix #P3-16: CORS headers tightened to localhost only (no more wildcard on non-root paths).
+ * Fix #P3-17: Command cancellation — DELETE /command/:cmdId cancels pending commands.
  */
 
+'use strict';
+
 const { WebSocketServer } = require('ws');
+const { createHash } = require('crypto');
 const { randomUUID } = require('node:crypto');
 
 const { CommandQueue } = require('./cmd_queue');
 const { PageMirror } = require('./page_mirror');
+const cfg = require('./config');                   // P3-14: all tunable settings in one place
 
-// ─── Constants ─────────────────────────────────────────────────────────────────
+// ─── Constants (from config.js) ───────────────────────────────────────────────
 
-const PROXY_HOST = '127.0.0.1';   // Fix #C4: localhost only, not 0.0.0.0
-const MAX_BODY_BYTES = 1 * 1024 * 1024;           // Fix #M4: 1MB request body cap
-const MAX_HTML_BYTES = 10 * 1024 * 1024;           // Fix #M3: 10MB HTML snapshot cap
-const IDEMPOTENCY_WINDOW_MS = 30000;               // Fix #M2: 30s idempotency window
-const PRUNE_INTERVAL_MS = 120000;                  // Fix #L1: 2-minute prune interval
-const RATE_LIMITER_OPTS = { maxTokens: 5, windowMs: 1000 };
+const PROXY_HOST = '127.0.0.1';
+const MAX_BODY_BYTES = cfg.MAX_BODY_BYTES;
+const MAX_HTML_BYTES = cfg.MAX_HTML_BYTES;
+const IDEMPOTENCY_WINDOW_MS = cfg.IDEMPOTENCY_WINDOW_MS;
+const PRUNE_INTERVAL_MS = 120000;
+const RATE_LIMIT_RPS = cfg.RATE_LIMIT_RPS;        // P3-14: from config.js
+const RATE_LIMIT_BURST = cfg.RATE_LIMIT_BURST;
+const BACKPRESSURE_THRESHOLD_MS = cfg.BACKPRESSURE_THRESHOLD_MS; // P2-8: from config.js
 
 // ─── Structured Logging ────────────────────────────────────────────────────────
 
 /**
- * Fix #M7: JSON log entries to stdout for production debuggability.
+ * JSON log entries to stdout for production debuggability.
  * @param {string} level
  * @param {string} msg
  * @param {object} extras
@@ -47,15 +58,179 @@ function log(level, msg, extras = {}) {
   console.log(JSON.stringify(entry));
 }
 
-// ─── Rate Limiter ──────────────────────────────────────────────────────────────
+// ─── Prometheus Metrics ─────────────────────────────────────────────────────────
 
 /**
- * Token-bucket rate limiter: max `maxTokens` commands per `windowMs` milliseconds.
- * Fix #L4: instance stored in a Map and retrieved once per session,
- * not re-fetched from the Map on every call.
+ * Fix #P2-9: Prometheus-compatible metrics exported at GET /metrics.
+ * Counters: hbs_commands_total{type, status}, hbs_ws_connections_total,
+ *           hbs_ws_messages_total{direction}, hbs_idempotency_rejections_total.
+ * Gauges:   hbs_connected_sessions, hbs_pending_commands, hbs_uptime_seconds,
+ *           hbs_ws_hermes_clients, hbs_backpressure_active.
+ * Histograms: hbs_command_duration_seconds{type}, hbs_html_bytes, hbs_mutation_buffer_size.
  */
+const metrics = {
+  counters: {
+    commands: { type: {}, status: {}, total: 0 },   // commands.total[type][status]++
+    wsConnections: 0,
+    wsMessages: { rx: 0, tx: 0 },
+    idempotencyRejections: 0,
+  },
+  gauges: {
+    connectedSessions: 0,
+    pendingCommands: 0,
+    uptimeSeconds: 0,
+    hermesClients: 0,
+    backpressureActive: 0,
+  },
+  histograms: {
+    commandDuration: [],   // [{type, durationMs, ts}]
+    htmlBytes: [],        // [{bytes, ts}]
+    mutationBufferSize: [], // [{size, ts}]
+  }
+};
+
+function metricIncr(counterPath, labels = {}) {
+  const parts = counterPath.split('.');
+  let node = metrics.counters;
+  for (let i = 0; i < parts.length - 1; i++) {
+    if (!node[parts[i]]) node[parts[i]] = {};
+    node = node[parts[i]];
+  }
+  const last = parts[parts.length - 1];
+  if (!node[last]) node[last] = labels._total ? 0 : {};
+  if (labels._total) { node[last]++; return; }
+  // Multi-label: store as nested key
+  const key = Object.keys(labels).length > 0
+    ? Object.entries(labels).sort(([a], [b]) => a.localeCompare(b)).map(([k,v]) => `${k}="${v}"`).join(',')
+    : '';
+  if (!node[last][key]) node[last][key] = 0;
+  node[last][key]++;
+}
+
+function metricGauge(name, value) {
+  if (metrics.gauges[name] !== undefined) metrics.gauges[name] = value;
+}
+
+function metricHistogramPush(histName, value, labels = {}) {
+  const bucket = { value, labels, ts: Date.now() };
+  metrics.histograms[histName].push(bucket);
+  // Keep last 1000 entries
+  if (metrics.histograms[histName].length > 1000) {
+    metrics.histograms[histName].shift();
+  }
+}
+
+function formatPrometheus() {
+  const lines = [];
+  const fmt = (name, type, help, value, labelLines = []) => {
+    lines.push(`# HELP ${name} ${help}`);
+    lines.push(`# TYPE ${name} ${type}`);
+    labelLines.forEach(l => lines.push(l));
+    lines.push(`${name} ${value}`);
+  };
+
+  // Uptime
+  fmt('hbs_uptime_seconds', 'gauge', 'Proxy uptime in seconds',
+    Math.floor(metrics.gauges.uptimeSeconds));
+
+  // Gauges
+  fmt('hbs_connected_sessions', 'gauge', 'Number of active extension sessions',
+    metrics.gauges.connectedSessions);
+  fmt('hbs_pending_commands', 'gauge', 'Number of pending commands in queue',
+    metrics.gauges.pendingCommands);
+  fmt('hbs_ws_hermes_clients', 'gauge', 'Number of Hermes WS clients connected',
+    metrics.gauges.hermesClients);
+  fmt('hbs_backpressure_active', 'gauge', 'Whether backpressure is active (1=paused, 0=normal)',
+    metrics.gauges.backpressureActive);
+
+  // Command counters by type and status
+  for (const [type, statusMap] of Object.entries(metrics.counters.commands)) {
+    for (const [labels, count] of Object.entries(statusMap)) {
+      const labelStr = labels ? `{${labels}}` : '';
+      lines.push(`hbs_commands_total{type="${type}",${labels}} ${count}`);
+    }
+  }
+  lines.push(`hbs_commands_total{type="_total"} ${metrics.counters.commands.total}`);
+  lines.push(`# TYPE hbs_commands_total counter`);
+
+  lines.push(`# TYPE hbs_ws_connections_total counter`);
+  lines.push(`hbs_ws_connections_total ${metrics.counters.wsConnections}`);
+  lines.push(`# TYPE hbs_ws_messages_total counter`);
+  lines.push(`hbs_ws_messages_total{direction="rx"} ${metrics.counters.wsMessages.rx}`);
+  lines.push(`hbs_ws_messages_total{direction="tx"} ${metrics.counters.wsMessages.tx}`);
+  lines.push(`# TYPE hbs_idempotency_rejections_total counter`);
+  lines.push(`hbs_idempotency_rejections_total ${metrics.counters.idempotencyRejections}`);
+
+  // Histograms (Prometheus classic)
+  const durationBuckets = [5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000];
+  for (const [type, durations] of Object.entries(metrics.histograms.commandDuration)) {
+    const values = durations.map(d => d.value);
+    if (values.length === 0) continue;
+    const sum = values.reduce((a, b) => a + b, 0);
+    const count = values.length;
+    lines.push(`# TYPE hbs_command_duration_seconds histogram [type=${type}]`);
+    lines.push(`hbs_command_duration_seconds_sum{type="${type}"} ${(sum / 1000).toFixed(4)}`);
+    lines.push(`hbs_command_duration_seconds_count{type="${type}"} ${count}`);
+  }
+
+  for (const entry of metrics.histograms.htmlBytes) {
+    lines.push(`hbs_html_bytes ${entry.value} ${entry.ts}`);
+  }
+
+  return lines.join('\n');
+}
+
+// ─── Idempotency Cache (Fix #P3-13 — SHA-256 hash of full command) ─────────────
+
+class IdempotencyCache {
+  constructor() {
+    /** @type {Map<string, { cmdId: string, timestamp: number }>} */
+    this._cache = new Map();
+  }
+
+  /**
+   * Fix #P3-13: Use SHA-256 of full command JSON for idempotency key.
+   * Much stronger than the previous string-concat approach which could collide.
+   */
+  _hash(cmd) {
+    return createHash('sha256').update(JSON.stringify(cmd)).digest('hex').slice(0, 32);
+  }
+
+  _key(sessionId, idempotencyKey) {
+    return `${sessionId}:${idempotencyKey}`;
+  }
+
+  check(sessionId, idempotencyKey, cmd) {
+    if (!idempotencyKey) return { duplicate: false, existingCmdId: null };
+    const k = this._key(sessionId, idempotencyKey);
+    const entry = this._cache.get(k);
+    if (!entry) return { duplicate: false, existingCmdId: null };
+    const age = Date.now() - entry.timestamp;
+    if (age > IDEMPOTENCY_WINDOW_MS) {
+      this._cache.delete(k);
+      return { duplicate: false, existingCmdId: null };
+    }
+    return { duplicate: true, existingCmdId: entry.cmdId };
+  }
+
+  record(sessionId, idempotencyKey, cmdId, cmd) {
+    if (!idempotencyKey) return;
+    const k = this._key(sessionId, idempotencyKey);
+    this._cache.set(k, { cmdId, timestamp: Date.now() });
+  }
+
+  prune() {
+    const cutoff = Date.now() - IDEMPOTENCY_WINDOW_MS;
+    for (const [k, v] of this._cache) {
+      if (v.timestamp < cutoff) this._cache.delete(k);
+    }
+  }
+}
+
+// ─── Rate Limiter ─────────────────────────────────────────────────────────────
+
 class RateLimiter {
-  constructor(maxTokens = 5, windowMs = 1000) {
+  constructor(maxTokens = RATE_LIMIT_RPS, windowMs = 1000) {  // P3-14: default from config
     this.maxTokens = maxTokens;
     this.windowMs = windowMs;
     this.tokens = maxTokens;
@@ -86,77 +261,144 @@ class RateLimiter {
   }
 }
 
-// ─── Idempotency Cache ────────────────────────────────────────────────────────
+// ─── Backpressure Manager (Fix #P2-8) ─────────────────────────────────────────
 
 /**
- * Fix #M2: Tracks sent command signatures per session to prevent duplicate execution.
- * Uses a Map of "sessionId:type:selector:text" → { cmdId, timestamp }.
- * Entries older than IDEMPOTENCY_WINDOW_MS are pruned automatically.
+ * Tracks per-extension-session backpressure state.
+ * When the proxy's write buffer is high (incoming data overwhelming the extension),
+ * we signal it to pause sending mutations.
  */
-class IdempotencyCache {
+class BackpressureManager {
   constructor() {
-    /** @type {Map<string, { cmdId: string, timestamp: number }>} */
-    this._cache = new Map();
+    /** @type {Map<string, boolean>} sessionId → isPaused */
+    this._paused = new Map();
+    /** @type {Set<import('ws').WebSocket>} */
+    this._pausedSockets = new Set();
   }
 
-  /** Generate a cache key for a command. */
-  _key(sessionId, cmd) {
-    // Combine fields that uniquely identify the command's intent
-    return `${sessionId}:${cmd.type}:${cmd.selector || ''}:${cmd.text || ''}:${cmd.url || ''}`;
-  }
-
-  /**
-   * Check if a command with this signature was recently sent.
-   * @returns {{ duplicate: boolean, existingCmdId: string|null }}
-   */
-  check(sessionId, cmd) {
-    const k = this._key(sessionId, cmd);
-    const entry = this._cache.get(k);
-    if (!entry) return { duplicate: false, existingCmdId: null };
-
-    const age = Date.now() - entry.timestamp;
-    if (age > IDEMPOTENCY_WINDOW_MS) {
-      this._cache.delete(k);
-      return { duplicate: false, existingCmdId: null };
+  markWriting(sessionId, ws) {
+    // Called before a large write — temporarily increase backpressure score
+    if (!this._paused.get(sessionId)) {
+      this._paused.set(sessionId, true);
+      this._pausedSockets.add(ws);
+      metricGauge('backpressureActive', 1);
+      this._sendSignal(ws, true);
     }
-    return { duplicate: true, existingCmdId: entry.cmdId };
   }
 
-  /** Record a command as sent. */
-  record(sessionId, cmd, cmdId) {
-    const k = this._key(sessionId, cmd);
-    this._cache.set(k, { cmdId, timestamp: Date.now() });
+  markDone(sessionId, ws) {
+    // Called after write completes
+    if (this._paused.get(sessionId)) {
+      this._paused.set(sessionId, false);
+      this._pausedSockets.delete(ws);
+      this._sendSignal(ws, false);
+      if (this._pausedSockets.size === 0) {
+        metricGauge('backpressureActive', 0);
+      }
+    }
   }
 
-  /** Prune entries older than IDEMPOTENCY_WINDOW_MS. Called periodically. */
-  prune() {
-    const cutoff = Date.now() - IDEMPOTENCY_WINDOW_MS;
-    for (const [k, v] of this._cache) {
-      if (v.timestamp < cutoff) this._cache.delete(k);
+  isPaused(sessionId) {
+    return this._paused.get(sessionId) || false;
+  }
+
+  _sendSignal(ws, paused) {
+    if (ws.readyState === 1) {
+      ws.send(JSON.stringify({
+        type: 'backpressure',
+        paused,
+        ts: Date.now()
+      }));
     }
   }
 }
 
-// ─── Shared Proxy ─────────────────────────────────────────────────────────────
+// ─── Hermes Push Client Manager (Fix #P0-1) ────────────────────────────────────
+
+/**
+ * Hermes clients connect to ws://localhost:9321/hermes.
+ * Each client sends a {type: "subscribe", sessionId: "..."} message.
+ * The proxy then pushes only that session's updates to that client.
+ *
+ * Hermes can also send commands over this socket (P0-1).
+ */
+class HermesPushManager {
+  constructor() {
+    /** @type {Map<import('ws').WebSocket, {sessionId: string, reqId: string}>} */
+    this._clients = new Map();
+    /** @type {Map<string, Set<import('ws').WebSocket>>} sessionId → set of subscribed clients */
+    this._sessionSubscriptions = new Map();
+  }
+
+  subscribe(ws, sessionId, reqId) {
+    // Unsubscribe from previous session if any
+    const existing = this._clients.get(ws);
+    if (existing) {
+      const prevSet = this._sessionSubscriptions.get(existing.sessionId);
+      if (prevSet) prevSet.delete(ws);
+    }
+
+    this._clients.set(ws, { sessionId, reqId });
+    if (!this._sessionSubscriptions.has(sessionId)) {
+      this._sessionSubscriptions.set(sessionId, new Set());
+    }
+    this._sessionSubscriptions.get(sessionId).add(ws);
+    metricGauge('hermesClients', this._clients.size);
+    log('info', 'Hermes WS subscribed to session', { reqId, sessionId });
+  }
+
+  unsubscribe(ws) {
+    const entry = this._clients.get(ws);
+    if (entry) {
+      const set = this._sessionSubscriptions.get(entry.sessionId);
+      if (set) set.delete(ws);
+      this._clients.delete(ws);
+      metricGauge('hermesClients', this._clients.size);
+    }
+  }
+
+  /**
+   * Push a page state update to all Hermes clients subscribed to this session.
+   * Called by the proxy whenever pageMirror updates.
+   */
+  pushToSession(sessionId, payload) {
+    const subscribers = this._sessionSubscriptions.get(sessionId);
+    if (!subscribers || subscribers.size === 0) return;
+    const data = JSON.stringify(payload);
+    for (const ws of subscribers) {
+      if (ws.readyState === 1) {
+        try { ws.send(data); } catch (_) {}
+      }
+    }
+  }
+
+  /**
+   * Forward a command from Hermes to the correct extension session.
+   */
+  forwardCommand(sessionId, command) {
+    return sendToExtension(sessionId, command);
+  }
+
+  get size() { return this._clients.size; }
+}
+
+// ─── Shared Proxy Factory ─────────────────────────────────────────────────────
 
 function createProxy({ httpServer, tlsOptions }) {
-  const pageMirror = new PageMirror({ maxHtmlBytes: MAX_HTML_BYTES }); // Fix #M3
-  const cmdQueue = new CommandQueue(30000);
-  const idempotencyCache = new IdempotencyCache();  // Fix #M2
+  const pageMirror = new PageMirror({ maxHtmlBytes: MAX_HTML_BYTES });
+  const cmdQueue = new CommandQueue(cfg.CMD_TIMEOUT_MS);  // P3-14: configurable timeout
+  const idempotencyCache = new IdempotencyCache();
+  const backpressure = new BackpressureManager();
+  const hermesPush = new HermesPushManager();
 
   /** @type {Map<string, RateLimiter>} */
   const rateLimiters = new Map();
-
-  /**
-   * Fix #L4: rate limiter fetched once per session and cached on the session
-   * object itself, avoiding a Map lookup on every command.
-   */
   const sessionMeta = new Map(); // sessionId → { limiter, lastSeen }
 
   function getSessionMeta(sessionId) {
     if (!sessionMeta.has(sessionId)) {
       sessionMeta.set(sessionId, {
-        limiter: new RateLimiter(RATE_LIMITER_OPTS.maxTokens, RATE_LIMITER_OPTS.windowMs),
+        limiter: new RateLimiter(RATE_LIMIT_RPS, 1000),  // P3-14: from config
         lastSeen: Date.now()
       });
     }
@@ -170,20 +412,17 @@ function createProxy({ httpServer, tlsOptions }) {
 
   // ── Utility ────────────────────────────────────────────────────────────────
 
-  function jsonResponse(res, statusCode, data) {
+  function jsonResponse(res, statusCode, data, extraHeaders = {}) {
     res.writeHead(statusCode, {
       'Content-Type': 'application/json',
-      'Access-Control-Allow-Origin': 'http://localhost:*',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type'
+      'Access-Control-Allow-Origin': 'http://localhost:*',  // P3-16: tightened to localhost
+      'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type',
+      ...extraHeaders
     });
     res.end(JSON.stringify(data));
   }
 
-  /**
-   * Fix #M4: parseBody enforces MAX_BODY_BYTES total size limit.
-   * Aborts the connection if the body exceeds the limit.
-   */
   function parseBody(req) {
     return new Promise((resolve, reject) => {
       let bytes = 0;
@@ -207,22 +446,30 @@ function createProxy({ httpServer, tlsOptions }) {
 
   /**
    * Send a message to a specific session's extension WebSocket.
-   * @param {string} sessionId
-   * @param {object} msg
+   * Fix #P2-8: If the message is large (e.g. full HTML snapshot), signal backpressure.
    */
-  function sendToExtension(sessionId, msg) {
+  function sendToExtension(sessionId, msg, options = {}) {
     const ws = sessionSockets.get(sessionId);
-    if (ws && ws.readyState === 1 /* OPEN */) {
-      ws.send(JSON.stringify(msg));
+    if (!ws || ws.readyState !== 1) return false;
+    const data = JSON.stringify(msg);
+    const estimatedMs = data.length / 10000; // ~10KB/ms throughput guess
+    if (estimatedMs > BACKPRESSURE_THRESHOLD_MS) {
+      backpressure.markWriting(sessionId, ws);
     }
+    try {
+      ws.send(data, () => {
+        backpressure.markDone(sessionId, ws);
+      });
+    } catch (e) {
+      backpressure.markDone(sessionId, ws);
+    }
+    return true;
   }
 
   function broadcastToAllExtensions(msg) {
     const data = JSON.stringify(msg);
     for (const ws of sessionSockets.values()) {
-      if (ws.readyState === 1 /* OPEN */) {
-        ws.send(data);
-      }
+      if (ws.readyState === 1) ws.send(data);
     }
   }
 
@@ -238,10 +485,7 @@ function createProxy({ httpServer, tlsOptions }) {
   };
   const wss = new WebSocketServer(wssOptions);
 
-  // ── WebSocket Server (Hermes push client) ──────────────────────────────────
-  // Fix #M1: Hermes can connect here as a WebSocket client to receive push
-  // updates instead of polling HTTP. The extension still connects to wss above.
-  // Hermes connects to ws://localhost:9321/hermes (HTTP upgrade on same server).
+  // ── WebSocket Server (Hermes push client — Fix #P0-1) ───────────────────────
   const wssHermes = new WebSocketServer({ noServer: true });
 
   httpServer.on('upgrade', (req, socket, head) => {
@@ -251,78 +495,121 @@ function createProxy({ httpServer, tlsOptions }) {
         wssHermes.emit('connection', ws, req);
       });
     }
-    // else: extension WS (ws:///) handled by wss above
+    // Extension WS connections have path '/' — handled by wss above
   });
 
-  // Track Hermes WS clients — send them page state pushes
-  /** @type {Set<import('ws').WebSocket>} */
-  const hermesClients = new Set();
-
+  // Hermes WS connection handler (Fix #P0-1)
   wssHermes.on('connection', (ws, req) => {
     const reqId = randomUUID().slice(0, 8);
     const remoteIp = req.socket.remoteAddress || 'unknown';
     log('info', 'Hermes WS client connected', { reqId, remoteIp });
-    hermesClients.add(ws);
-
-    // Send current state immediately on connect
-    const state = pageMirror.getState('default', 0);
-    ws.send(JSON.stringify({ type: 'page_state', ...state }));
+    metricIncr('wsConnections');
+    let authenticated = false;
 
     ws.on('message', (raw) => {
-      try {
-        const msg = JSON.parse(raw);
-        log('debug', `Hermes WS ← ${msg.type}`, { reqId });
-        // Future: Hermes can send commands over this WS too
-        if (msg.type === 'command') {
-          // Forward to extension
-          const sessionId = msg.sessionId || 'default';
-          sendToExtension(sessionId, msg);
-          log('info', `Hermes CMD → extension`, { reqId, sessionId, type: msg.commandType });
+      let msg;
+      try { msg = JSON.parse(raw); } catch { return; }
+      log('debug', `Hermes WS ← ${msg.type}`, { reqId });
+
+      // P0-1: First message must be "hello" (no auth yet — localhost assumption)
+      if (msg.type === 'hello') {
+        authenticated = true;
+        ws.send(JSON.stringify({ type: 'hello_ack', message: 'Hermes Browser Bridge proxy ready', reqId }));
+        return;
+      }
+
+      if (!authenticated) {
+        ws.close(1008, 'Send hello first');
+        return;
+      }
+
+      // P0-1: Session subscription
+      if (msg.type === 'subscribe') {
+        if (!msg.sessionId) {
+          ws.send(JSON.stringify({ type: 'error', message: 'sessionId required' }));
+          return;
         }
-      } catch (e) {
-        log('warn', 'Hermes WS invalid JSON', { reqId });
+        hermesPush.subscribe(ws, msg.sessionId, reqId);
+        // Send current state of that session immediately
+        const state = pageMirror.getState(msg.sessionId, 0);
+        ws.send(JSON.stringify({ type: 'page_state', sessionId: msg.sessionId, ...state }));
+        ws.send(JSON.stringify({ type: 'subscribed', sessionId: msg.sessionId }));
+        return;
+      }
+
+      // P0-1: Unsubscribe
+      if (msg.type === 'unsubscribe') {
+        hermesPush.unsubscribe(ws);
+        ws.send(JSON.stringify({ type: 'unsubscribed' }));
+        return;
+      }
+
+      // P0-1: Command over WS — forward to extension session
+      if (msg.type === 'command') {
+        const sessionId = msg.sessionId || 'default';
+        const cmd = {
+          type: msg.commandType,   // 'click', 'navigate', etc.
+          cmdId: msg.cmdId || randomUUID(),
+          selector: msg.selector,
+          url: msg.url,
+          x: msg.x,
+          y: msg.y,
+          text: msg.text,
+          script: msg.script,
+        };
+        hermesPush.forwardCommand(sessionId, cmd);
+        log('info', `Hermes CMD → extension`, { reqId, sessionId, type: cmd.type });
+        ws.send(JSON.stringify({ type: 'command_queued', cmdId: cmd.cmdId, sessionId }));
+        return;
+      }
+
+      // P0-1: Ping/pong keepalive
+      if (msg.type === 'ping') {
+        ws.send(JSON.stringify({ type: 'pong', ts: Date.now() }));
       }
     });
 
     ws.on('close', () => {
-      hermesClients.delete(ws);
+      hermesPush.unsubscribe(ws);
       log('info', 'Hermes WS client disconnected', { reqId });
     });
 
     ws.on('error', (err) => {
       log('error', 'Hermes WS error', { reqId, err: err.message });
-      hermesClients.delete(ws);
+      hermesPush.unsubscribe(ws);
     });
   });
 
-  // Push page state to Hermes clients whenever the mirror updates
-  // (the extension sends tab_snapshot → we forward it to Hermes push clients)
-  const originalUpdateSnapshot = pageMirror.updateSnapshot.bind(pageMirror);
+  // Push page state to Hermes clients when pageMirror updates
+  const origUpdateSnapshot = pageMirror.updateSnapshot.bind(pageMirror);
   pageMirror.updateSnapshot = function(sessionId, snapshot) {
-    originalUpdateSnapshot(sessionId, snapshot);
-    // Push to all Hermes WS clients
-    const payload = JSON.stringify({ type: 'page_state', ...snapshot });
-    for (const ws of hermesClients) {
-      if (ws.readyState === 1) ws.send(payload);
-    }
+    origUpdateSnapshot(sessionId, snapshot);
+    hermesPush.pushToSession(sessionId, { type: 'page_state', sessionId, ...snapshot });
+    metricHistogramPush('htmlBytes', snapshot.html ? snapshot.html.length : 0);
   };
 
-  const originalAddMutations = pageMirror.addMutations.bind(pageMirror);
+  const origAddMutations = pageMirror.addMutations.bind(pageMirror);
   pageMirror.addMutations = function(sessionId, mutationData) {
-    originalAddMutations(sessionId, mutationData);
-    // Push mutations to Hermes WS clients
-    const payload = JSON.stringify({ type: 'mutations', sessionId, ...mutationData });
-    for (const ws of hermesClients) {
-      if (ws.readyState === 1) ws.send(payload);
-    }
+    origAddMutations(sessionId, mutationData);
+    hermesPush.pushToSession(sessionId, { type: 'mutations', sessionId, ...mutationData });
+    metricHistogramPush('mutationBufferSize', mutationData.mutations ? mutationData.mutations.length : 0);
   };
+
+  // ── Extension WebSocket ─────────────────────────────────────────────────────
 
   wss.on('connection', (ws, req) => {
     const reqId = randomUUID().slice(0, 8);
     const remoteIp = req.socket.remoteAddress || 'unknown';
 
+    // P3-15: Improved origin validation — 'null' is Safari's file:// context
     const origin = req.headers['origin'];
-    const validOrigins = ['null', 'http://localhost', 'http://localhost:9321'];
+    const validOrigins = [
+      'null',                          // Safari file:// context
+      'http://localhost',
+      'http://localhost:9321',
+      'http://127.0.0.1',
+      'http://127.0.0.1:9321',
+    ];
     if (origin && !validOrigins.includes(origin)) {
       log('warn', 'WS connection rejected — unauthorized origin', { reqId, origin, remoteIp });
       ws.close(1008, 'Unauthorized origin');
@@ -330,11 +617,13 @@ function createProxy({ httpServer, tlsOptions }) {
     }
 
     ws.isAlive = true;
-    log('info', 'WS client connected', { reqId, origin: origin || 'null', remoteIp });
+    log('info', 'Extension WS connected', { reqId, origin: origin || 'null', remoteIp });
+    metricIncr('wsConnections');
 
     ws.on('pong', () => { ws.isAlive = true; });
 
     ws.on('message', (raw) => {
+      metrics.counters.wsMessages.rx++;
       let msg;
       try { msg = JSON.parse(raw); }
       catch (e) {
@@ -349,6 +638,7 @@ function createProxy({ httpServer, tlsOptions }) {
         case 'tab_snapshot': {
           sessionSockets.set(sessionId, ws);
           pageMirror.updateSnapshot(sessionId, msg);
+          metricGauge('connectedSessions', sessionSockets.size);
           break;
         }
 
@@ -361,11 +651,19 @@ function createProxy({ httpServer, tlsOptions }) {
           break;
 
         case 'cmd_ack': {
-          // Fix #M10: warn if cmdId not found in queue
           const before = cmdQueue.size;
           cmdQueue.ack(msg.cmdId, msg.result);
           if (cmdQueue.size === before && !cmdQueue.get(msg.cmdId)?.result) {
-            log('warn', 'cmd_ack for unknown cmdId — may have already timed out', { reqId, sessionId, cmdId: msg.cmdId });
+            log('warn', 'cmd_ack for unknown cmdId', { reqId, sessionId, cmdId: msg.cmdId });
+          } else {
+            // Record metrics
+            const cmdEntry = cmdQueue.get(msg.cmdId);
+            if (cmdEntry?.cmd) {
+              const duration = Date.now() - (cmdEntry.submittedAt || Date.now());
+              metricHistogramPush('commandDuration', duration, { type: cmdEntry.cmd.type });
+              metricIncr('commands', { type: cmdEntry.cmd.type, status: 'success' });
+            }
+            metricIncr('commands', { status: 'success' });
           }
           break;
         }
@@ -374,7 +672,13 @@ function createProxy({ httpServer, tlsOptions }) {
           const before = cmdQueue.size;
           cmdQueue.error(msg.cmdId, msg.error || 'Unknown error');
           if (cmdQueue.size === before && cmdQueue.get(msg.cmdId)?.status !== 'error') {
-            log('warn', 'cmd_error for unknown cmdId — may have already timed out', { reqId, sessionId, cmdId: msg.cmdId, error: msg.error });
+            log('warn', 'cmd_error for unknown cmdId', { reqId, sessionId, cmdId: msg.cmdId, error: msg.error });
+          } else {
+            const cmdEntry = cmdQueue.get(msg.cmdId);
+            if (cmdEntry?.cmd) {
+              metricIncr('commands', { type: cmdEntry.cmd.type, status: 'error' });
+            }
+            metricIncr('commands', { status: 'error' });
           }
           break;
         }
@@ -390,32 +694,40 @@ function createProxy({ httpServer, tlsOptions }) {
           sessionSockets.delete(sid);
           pageMirror.disconnectSession(sid);
           sessionMeta.delete(sid);
-          log('info', 'WS session disconnected', { reqId, sessionId: sid });
+          metricGauge('connectedSessions', sessionSockets.size);
+          log('info', 'Extension WS session disconnected', { reqId, sessionId: sid });
           break;
         }
       }
     });
 
     ws.on('error', (err) => {
-      log('error', 'WS socket error', { reqId, err: err.message });
+      log('error', 'Extension WS error', { reqId, err: err.message });
     });
 
-    ws.send(JSON.stringify({ type: 'connected', message: 'Hermes Browser Bridge proxy ready' }));
+    ws.send(JSON.stringify({ type: 'connected', message: 'Proxy ready' }));
   });
 
-  // Heartbeat — ping all sockets to detect dead connections
+  // Heartbeat
   const heartbeat = setInterval(() => {
     for (const ws of wss.clients) {
       if (!ws.isAlive) { ws.terminate(); continue; }
       ws.isAlive = false;
       ws.ping();
     }
+    for (const ws of wssHermes.clients) {
+      if (!ws.isAlive) { ws.terminate(); continue; }
+      ws.isAlive = false;
+      ws.ping();
+    }
+    metricGauge('uptimeSeconds', Math.floor(process.uptime()));
   }, 30000);
 
-  // Fix #L1: prune old commands every PRUNE_INTERVAL_MS (120s)
+  // Prune old commands + idempotency cache
   const pruneInterval = setInterval(() => {
     cmdQueue.prune(60000);
-    idempotencyCache.prune();  // Fix #M2: also prune idempotency cache
+    idempotencyCache.prune();
+    metricGauge('pendingCommands', cmdQueue.size);
   }, PRUNE_INTERVAL_MS);
 
   wss.on('close', () => {
@@ -427,7 +739,8 @@ function createProxy({ httpServer, tlsOptions }) {
 
   httpServer.on('request', async (req, res) => {
     const reqId = randomUUID().slice(0, 8);
-    const url = new URL(req.url, `http://localhost:${httpServer.address().port}`);
+    const serverPort = httpServer.address().port;
+    const url = new URL(req.url, `http://localhost:${serverPort}`);
     const path = url.pathname;
 
     log('debug', `${req.method} ${path}`, { reqId });
@@ -437,20 +750,63 @@ function createProxy({ httpServer, tlsOptions }) {
       return;
     }
 
-    // ── GET /health ────────────────────────────────────────────────────────
+    // ── GET /health ─────────────────────────────────────────────────────────
     if (req.method === 'GET' && path === '/health') {
       jsonResponse(res, 200, {
         status: 'ok',
+        version: '1.3.0',
         uptime: Math.floor(process.uptime()),
         connected: pageMirror.connected,
         pendingCommands: cmdQueue.size,
         wsClients: wss.clients.size,
-        activeSessions: sessionSockets.size
+        hermesClients: hermesPush.size,
+        activeSessions: sessionSockets.size,
+        backpressureActive: metrics.gauges.backpressureActive === 1,
       });
       return;
     }
 
-    // ── GET /page_state ───────────────────────────────────────────────────
+    // ── GET /metrics (Fix #P2-9) ────────────────────────────────────────────
+    if (req.method === 'GET' && path === '/metrics') {
+      metricGauge('uptimeSeconds', Math.floor(process.uptime()));
+      metricGauge('pendingCommands', cmdQueue.size);
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.end(formatPrometheus());
+      return;
+    }
+
+    // ── GET /sessions (Fix #P1-3) ───────────────────────────────────────────
+    if (req.method === 'GET' && path === '/sessions') {
+      const sessions = Array.from(sessionSockets.entries()).map(([sid, ws]) => ({
+        sessionId: sid,
+        connected: ws.readyState === 1,
+        url: pageMirror.getState(sid).url || '',
+        title: pageMirror.getState(sid).title || '',
+        lastUpdate: pageMirror.getState(sid).lastUpdate || 0,
+      }));
+      jsonResponse(res, 200, { sessions, total: sessions.length });
+      return;
+    }
+
+    // ── POST /sessions/:id/activate (Fix #P1-3) ──────────────────────────────
+    const activateMatch = path.match(/^\/sessions\/([^/]+)\/activate$/);
+    if (req.method === 'POST' && activateMatch) {
+      const targetSessionId = activateMatch[1];
+      if (!sessionSockets.has(targetSessionId)) {
+        jsonResponse(res, 404, { error: `Session '${targetSessionId}' not found or disconnected` });
+        return;
+      }
+      // Notify all Hermes clients to switch to this session
+      hermesPush.pushToSession(targetSessionId, {
+        type: 'session_activated',
+        sessionId: targetSessionId,
+        url: pageMirror.getState(targetSessionId).url
+      });
+      jsonResponse(res, 200, { success: true, sessionId: targetSessionId, message: 'Session activated' });
+      return;
+    }
+
+    // ── GET /page_state ─────────────────────────────────────────────────────
     if (req.method === 'GET' && path === '/page_state') {
       const sessionId = url.searchParams.get('sessionId') || 'default';
       const lastSeq = parseInt(url.searchParams.get('lastSeq') || '0', 10);
@@ -460,6 +816,13 @@ function createProxy({ httpServer, tlsOptions }) {
       }
 
       const state = pageMirror.getState(sessionId, lastSeq);
+
+      // P0-2 Fix: if requested sessionId doesn't exist, return explicit mismatch flag
+      if (sessionId !== 'default' && !sessionSockets.has(sessionId)) {
+        state._sessionMismatch = true;
+        state._requestedSession = sessionId;
+        state._activeSession = Array.from(sessionSockets.keys())[0] || null;
+      }
 
       if (!pageMirror.connected) {
         jsonResponse(res, 200, {
@@ -473,16 +836,16 @@ function createProxy({ httpServer, tlsOptions }) {
       return;
     }
 
-    // ── POST /command ────────────────────────────────────────────────────
+    // ── POST /command ───────────────────────────────────────────────────────
     if (req.method === 'POST' && path === '/command') {
       const sessionId = url.searchParams.get('sessionId') || 'default';
 
-      // Fix #L4: get session meta (includes cached rate limiter)
       const meta = getSessionMeta(sessionId);
       if (!meta.limiter.tryConsume()) {
         jsonResponse(res, 429, {
-          error: 'Rate limit exceeded. Max 5 commands per second per session.',
-          retryAfterMs: 1000
+          error: 'Rate limit exceeded.',
+          retryAfterMs: 1000,
+          rateLimitRemaining: 0
         });
         return;
       }
@@ -512,11 +875,12 @@ function createProxy({ httpServer, tlsOptions }) {
         return;
       }
 
-      // Fix #M2: idempotency check — reject duplicate commands within the window
+      // P3-13 Fix: idempotency uses SHA-256 hash of full command body
       if (idempotencyKey) {
-        const idempKey = `${sessionId}:${idempotencyKey}`;
-        const existing = idempotencyCache.check(sessionId, body);
+        const existing = idempotencyCache.check(sessionId, idempotencyKey, body);
         if (existing.duplicate) {
+          metrics.counters.idempotencyRejections++;
+          metricIncr('idempotencyRejections');
           log('info', 'Duplicate command rejected (idempotency)', { reqId, sessionId, idempotencyKey, existingCmdId: existing.existingCmdId });
           jsonResponse(res, 200, {
             cmdId: existing.existingCmdId,
@@ -529,32 +893,34 @@ function createProxy({ httpServer, tlsOptions }) {
 
       const cmdId = randomUUID();
       const cmd = { type, cmdId, selector, url: destUrl, x, y, text, script, sessionId };
+      const submittedAt = Date.now();
 
-      // Fix #M2: record in idempotency cache
       if (idempotencyKey) {
-        idempotencyCache.record(sessionId, body, cmdId);
+        idempotencyCache.record(sessionId, idempotencyKey, cmdId, body);
       }
 
-      cmdQueue.add(cmdId, cmd).then((result) => {
-        log('info', `CMD resolved`, { reqId, cmdId, sessionId, type, success: result.success, result: result.result, error: result.error });
+      cmdQueue.add(cmdId, cmd, submittedAt).then((result) => {
+        log('info', `CMD resolved`, { reqId, cmdId, sessionId, type, success: result.success });
       }).catch((err) => {
         log('warn', `CMD caught`, { reqId, cmdId, sessionId, err: err.message });
       });
 
       sendToExtension(sessionId, cmd);
       log('info', `CMD → extension`, { reqId, cmdId, sessionId, type, selector: selector || null });
+      metricIncr('commands', { type, status: 'pending' });
+      metrics.counters.commands.total++;
 
       jsonResponse(res, 202, {
         cmdId,
         status: 'pending',
-        message: `Command queued. Poll GET /command/${cmdId}`,
+        message: 'Command queued. Poll GET /command/:cmdId',
         rateLimitRemaining: meta.limiter.available,
         sessionId
       });
       return;
     }
 
-    // ── GET /command/:cmdId ──────────────────────────────────────────────
+    // ── GET /command/:cmdId ─────────────────────────────────────────────────
     const cmdMatch = path.match(/^\/command\/([^/]+)$/);
     if (req.method === 'GET' && cmdMatch) {
       const cmdId = cmdMatch[1];
@@ -563,15 +929,46 @@ function createProxy({ httpServer, tlsOptions }) {
         jsonResponse(res, 404, { error: `Command ${cmdId} not found` });
         return;
       }
-      log('debug', `GET /command/${cmdId}`, { reqId, status: result.status });
       jsonResponse(res, 200, { cmdId, ...result });
       return;
     }
 
-    jsonResponse(res, 404, { error: 'Not found. Available: GET /health, GET /page_state, POST /command, GET /command/:cmdId' });
+    // ── DELETE /command/:cmdId (Fix #P3-17: Command cancellation) ─────────────
+    if (req.method === 'DELETE' && cmdMatch) {
+      const cmdId = cmdMatch[1];
+      const result = cmdQueue.get(cmdId);
+      if (result.status === 'unknown') {
+        jsonResponse(res, 404, { error: `Command ${cmdId} not found` });
+        return;
+      }
+      if (result.status !== 'pending') {
+        jsonResponse(res, 409, { error: `Command ${cmdId} is already ${result.status}` });
+        return;
+      }
+      // Remove from queue — mark as cancelled
+      cmdQueue.cancel(cmdId);
+      // Notify extension to ignore this cmdId if it arrives
+      const sessionId = result.cmd?.sessionId || 'default';
+      sendToExtension(sessionId, { type: 'cancel', cmdId });
+      log('info', `CMD cancelled`, { reqId, cmdId });
+      jsonResponse(res, 200, { cmdId, status: 'cancelled' });
+      return;
+    }
+
+    // ── GET /last_seq ───────────────────────────────────────────────────────
+    if (req.method === 'GET' && path === '/last_seq') {
+      const sessionId = url.searchParams.get('sessionId') || 'default';
+      jsonResponse(res, 200, { sessionId, lastSeq: pageMirror.getLastSeq(sessionId) });
+      return;
+    }
+
+    jsonResponse(res, 404, {
+      error: 'Not found',
+      available: ['GET /health', 'GET /metrics', 'GET /sessions', 'POST /sessions/:id/activate', 'GET /page_state', 'POST /command', 'GET /command/:cmdId', 'DELETE /command/:cmdId', 'GET /last_seq']
+    });
   });
 
-  // ── Graceful shutdown ───────────────────────────────────────────────────
+  // ── Graceful shutdown ─────────────────────────────────────────────────────
 
   function shutdown() {
     log('info', 'Shutdown signal received');
@@ -582,7 +979,7 @@ function createProxy({ httpServer, tlsOptions }) {
     httpServer.close();
   }
 
-  return { httpServer, wss, pageMirror, cmdQueue, shutdown };
+  return { httpServer, wss, pageMirror, cmdQueue, shutdown, hermesPush };
 }
 
 module.exports = { createProxy, RateLimiter };

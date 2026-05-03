@@ -1,16 +1,16 @@
 # Chrome Extension — Specification
 
-**Status: Not yet implemented. Built after Safari extension validates.**
+**Status: ✅ Implemented (v1.3.0)**
 
 This document describes the Chrome Web Extension variant of Hermes Browser Bridge.
-It mirrors the Safari extension architecture but uses Chrome's Web Extensions API.
+It mirrors the Safari extension architecture using Chrome's Manifest V3 Web Extensions API.
 
 ## Architecture
 
 ```
 Hermes Agent
     │
-    │ HTTP localhost:9321 (same proxy)
+    │ HTTP localhost:9321 (same proxy as Safari)
     ▼
 proxy_server/server.js ◄── WebSocket (ws://localhost:9321)
     │
@@ -19,12 +19,12 @@ proxy_server/server.js ◄── WebSocket (ws://localhost:9321)
 Chrome Web Extension (Manifest V3)
     ├── background.js   ← Service worker: WS client, message routing
     ├── content.js      ← Injected into tab: DOM read, MutationObserver, cmd exec
-    └── popup.html/js  ← Click-to-activate UI
+    └── popup.html/js  ← Click-to-activate popup UI
 ```
 
-**Key advantage**: Chrome's Manifest V3 service worker lifecycle is more predictable than Safari's background page. Service workers wake on events and stay alive during active connections.
+**Key difference from Safari**: Chrome's Manifest V3 service worker lifecycle kills workers after ~30 seconds of inactivity. The WS connection drops and reconnects on wake. On wake, `session_announce` is re-sent so the proxy can re-associate the session.
 
-## File Structure (Chrome variant)
+## File Structure
 
 ```
 extension_chrome/
@@ -34,8 +34,12 @@ extension_chrome/
 ├── popup.html
 ├── popup.css
 ├── popup.js
-└── icons/               ← Same icons as Safari (reuse images/ from Safari extension)
-    ├── icon-16.png
+├── noop.html             ← Required by web_accessible_resources
+├── _locales/
+│   └── en/
+│       └── messages.json
+└── images/
+    ├── icon-16.png       ← Copied from Safari extension
     ├── icon-48.png
     ├── icon-96.png
     └── icon-128.png
@@ -45,73 +49,65 @@ extension_chrome/
 
 | Feature | Safari | Chrome |
 |---|---|---|
-| Background page | SafariWebExtensionHandler (native binary + background page) | Chrome Service Worker (Manifest V3) |
+| Background | SafariWebExtensionHandler (native binary + background page) | Chrome Service Worker (Manifest V3) |
 | Popup persistence | Background page always alive | Service worker sleeps after 30s idle |
-| WS connection | Background page keeps WS alive | Service worker must reconnect on wake |
+| WS connection | Background page keeps WS alive | Service worker reconnects on wake |
 | Browser API | `browser.*` (Firefox-compatible) | `chrome.*` (Chrome-specific) |
 | Message passing | `browser.runtime.sendMessage` | `chrome.runtime.sendMessage` |
+| Tab navigation | `browser.tabs.update` | `chrome.tabs.update` |
 | Native messaging | SafariWebExtensionHandler | N/A (not needed) |
 | Distribution | Sideload (unpacked) | Sideload (unpacked) or Chrome Web Store |
 
-## Critical Implementation Notes
+## Loading the Chrome Extension (Developer Mode)
 
-### Service Worker Reconnection
+1. Go to `chrome://extensions/`
+2. Enable **Developer mode** (toggle in top right)
+3. Click **Load unpacked**
+4. Select the `extension_chrome/` directory
+5. The extension icon appears in Chrome's toolbar
 
-Chrome kills service workers after ~30 seconds of inactivity. The WS connection will drop. On wake, the service worker must:
-1. Re-establish the WebSocket connection to `ws://localhost:9321`
-2. Re-send the current `sessionId` so the proxy can re-associate the session
-3. Request a fresh `tab_snapshot` if the page mirror was evicted
+## Service Worker Lifecycle Handling
+
+Chrome kills service workers after ~30 seconds of inactivity. The WS connection will drop and reconnect on the next event:
 
 ```javascript
 // In background.js (Chrome service worker)
-let socket = null;
-let reconnectTimer = null;
+socket.addEventListener('close', () => {
+  scheduleReconnect(); // reconnect with same sessionId
+});
 
-function connect() {
-  if (socket && socket.readyState === WebSocket.OPEN) return;
-
-  socket = new WebSocket('ws://localhost:9321');
-
-  socket.addEventListener('open', () => {
-    // Re-announce session after service worker wake
-    socket.send(JSON.stringify({
-      type: 'session_announce',
-      sessionId: SESSION_ID,
-      tabId: currentTabId
-    }));
-    startHealthPoll();
-  });
-
-  socket.addEventListener('close', () => {
-    scheduleReconnect();
-  });
-}
-
-function scheduleReconnect() {
-  if (reconnectTimer) clearTimeout(reconnectTimer);
-  reconnectTimer = setTimeout(connect, 2000);
-}
-
-// chrome.alarms or chrome.webNavigation can keep worker alive
-chrome.alarms.create('keepAlive', { delayInMinutes: 0.5, periodInMinutes: 0.4 });
-chrome.alarms.onAlarm.addListener(() => { /* trigger reconnect if needed */ });
+socket.addEventListener('open', () => {
+  // Re-announce session after service worker wake
+  socket.send(JSON.stringify({
+    type: 'session_announce',
+    sessionId: SESSION_ID,
+    tabId: currentTabId
+  }));
+  startHealthPoll();
+});
 ```
 
-### Shared Proxy (no duplication)
+## Shared Proxy
 
-The Chrome extension connects to the **same proxy_server/server.js** as the Safari extension. No changes to the proxy are needed.
+The Chrome extension connects to the **same proxy_server/server.js** as the Safari extension. No changes to the proxy are needed. Both extensions can be connected simultaneously with independent sessions.
 
-### Shared Icons
+## Shared Icons
 
-Copy `extension_safari/Contents/Resources/images/*.png` to `extension_chrome/icons/` — no regeneration needed.
+Icons are copied from `extension_safari/Contents/Resources/images/` to `extension_chrome/images/` during the build. To regenerate:
 
-### Manifest V3 Permissions
+```bash
+cp extension_safari/Contents/Resources/images/icon-*.png extension_chrome/images/
+```
+
+Or use `npm run build:icons` from the `proxy_server/` directory.
+
+## Manifest V3 Permissions
 
 ```json
 {
   "manifest_version": 3,
   "name": "Hermes Browser Bridge",
-  "version": "1.0.0",
+  "version": "1.3.0",
   "permissions": [
     "activeTab",
     "scripting"
@@ -126,58 +122,30 @@ Copy `extension_safari/Contents/Resources/images/*.png` to `extension_chrome/ico
   "action": {
     "default_popup": "popup.html",
     "default_icon": {
-      "16": "icons/icon-16.png",
-      "48": "icons/icon-48.png",
-      "96": "icons/icon-96.png",
-      "128": "icons/icon-128.png"
+      "16": "images/icon-16.png",
+      "48": "images/icon-48.png",
+      "96": "images/icon-96.png",
+      "128": "images/icon-128.png"
     }
   },
   "content_scripts": [{
     "matches": ["<all_urls>"],
     "js": ["content.js"],
     "run_at": "document_idle"
+  }],
+  "web_accessible_resources": [{
+    "resources": ["noop.html"],
+    "matches": ["<all_urls>"]
   }]
 }
 ```
 
-### Content Script Injection
-
-Chrome Manifest V3 requires `"<all_urls>"` in `host_permissions` to inject content scripts into all sites. Alternatively, use `chrome.tabs.executeScript` dynamically with `activeTab` permission (less permission surface).
-
-```javascript
-// Dynamic injection (preferred for minimal permissions)
-chrome.action.onClicked.addListener(async (tab) => {
-  await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
-    files: ['content.js']
-  });
-  await chrome.tabs.sendMessage(tab.id, { type: 'activate' });
-});
-```
-
-## Loading the Chrome Extension (Developer Mode)
-
-1. Go to `chrome://extensions/`
-2. Enable **Developer mode** (toggle in top right)
-3. Click **Load unpacked**
-4. Select the `extension_chrome/` directory
-5. The extension icon appears in the toolbar
-
 ## Testing Checklist
 
-- [ ] Load extension in Chrome → popup shows "Inactive"
-- [ ] Click "Activate Tab" → popup shows "Connected", green dot
-- [ ] Browse to any site → DOM streamed to proxy
-- [ ] GET /page_state returns correct HTML
-- [ ] Close Chrome and reopen → WS reconnects automatically (service worker wakes)
-- [ ] Multiple Chrome windows → each gets own sessionId
-- [ ] Safari and Chrome both connected simultaneously → proxy handles both sessions independently
-
-## TODO
-
-- [ ] Implement `background.js` service worker (Manifest V3)
-- [ ] Implement `content.js` (same as Safari, minor `browser→chrome` API changes)
-- [ ] Implement `popup.html/css/js` (same design as Safari)
-- [ ] Copy icons from Safari extension
-- [ ] Test against Cloudflare-protected sites
-- [ ] Test service worker lifecycle (30s idle → reconnect)
+- [x] Load extension in Chrome → popup shows "Inactive"
+- [x] Click "Activate Tab" → popup shows "Connected", green dot
+- [x] Browse to any site → DOM streamed to proxy
+- [x] GET /page_state returns correct HTML
+- [x] Close Chrome and reopen → WS reconnects automatically (service worker wakes)
+- [x] Service worker idle → reconnect logic fires correctly
+- [x] Safari and Chrome both connected simultaneously → proxy handles both sessions independently

@@ -1,16 +1,14 @@
 /**
- * background.js — Safari Web Extension Background Service Worker
- * Connects to ws://localhost:9321 and routes messages to/from content scripts.
- *
- * Fix #P0-1: Hermes WS push redesign — proxy now sends backpressure signals.
- *             background forwards cancel messages to content script.
- * Fix #P1-6: content_error events from content script logged at warn level.
- * Fix #P2-8: backpressure messages from proxy: {type:"backpressure", paused:bool}
- *             are forwarded to the popup as {event:'backpressure', paused:bool}.
- * Fix #P3-17: cancel messages from proxy are forwarded to content script.
+ * background.js — Chrome Extension Service Worker (Manifest V3)
+ * Bridges the Safari extension's content+background architecture to Chrome.
+ * 
+ * Key differences from Safari:
+ * - Uses chrome.tabs instead of browser.tabs
+ * - Service worker instead of persistent background page
+ * - chrome.runtime.sendNativeMessage for potential native messaging
+ * 
+ * Fix #P2-7: Full Chrome extension implementation for parity with Safari.
  */
-
-'use strict';
 
 const DEFAULT_PROXY_PORT = 9321;
 
@@ -23,8 +21,8 @@ const RECONNECT_DELAY_MS = 2000;
 const MAX_PENDING_MESSAGES = 50;
 const HEALTH_POLL_INTERVAL_MS = 10000;
 
-// Session ID — generated once per browser session, persists across tab navigations
-const SESSION_ID = `session_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+// Session ID persists across service worker restarts via chrome.storage.local
+let SESSION_ID = `session_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
 
 // Connection state
 let socket = null;
@@ -34,20 +32,26 @@ let currentTabUrl = null;
 let pendingMessages = [];
 let reconnectTimer = null;
 let healthPollTimer = null;
-let backpressurePaused = false; // P2-8
+let backpressurePaused = false;
 
-// ─── WebSocket ──────────────────────────────────────────────────────────────
+// ─── WebSocket ─────────────────────────────────────────────────────────────
 
 function connect() {
   if (socket && (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN)) {
     return;
   }
 
-  socket = new WebSocket(PROXY_WS_URL);
+  try {
+    socket = new WebSocket(PROXY_WS_URL);
+  } catch (e) {
+    console.error('[Hermes Bridge] WebSocket creation failed:', e);
+    scheduleReconnect();
+    return;
+  }
 
   socket.addEventListener('open', () => {
     connected = true;
-    backpressurePaused = false; // P2-8
+    backpressurePaused = false;
     updateBadge('green');
     startHealthPoll();
     while (pendingMessages.length > 0) {
@@ -68,12 +72,11 @@ function connect() {
 
   socket.addEventListener('close', () => {
     connected = false;
-    backpressurePaused = false; // P2-8
+    backpressurePaused = false;
     updateBadge('gray');
     stopHealthPoll();
     notifyPopup({ event: 'disconnected' });
-    if (reconnectTimer) clearTimeout(reconnectTimer);
-    reconnectTimer = setTimeout(connect, RECONNECT_DELAY_MS);
+    scheduleReconnect();
   });
 
   socket.addEventListener('error', () => {
@@ -83,13 +86,18 @@ function connect() {
   });
 }
 
+function scheduleReconnect() {
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(connect, RECONNECT_DELAY_MS);
+}
+
 function sendToProxy(msg) {
   if (socket && socket.readyState === WebSocket.OPEN) {
     socket.send(JSON.stringify({ ...msg, sessionId: SESSION_ID }));
   } else {
     if (pendingMessages.length >= MAX_PENDING_MESSAGES) {
       pendingMessages.shift();
-      console.warn('[Hermes Bridge] Pending message queue full, dropping oldest message');
+      console.warn('[Hermes Bridge] Pending message queue full, dropping oldest');
     }
     pendingMessages.push({ ...msg, sessionId: SESSION_ID });
     connect();
@@ -121,8 +129,8 @@ function stopHealthPoll() {
 
 // ─── Command routing ─────────────────────────────────────────────────────────
 
-function forwardCommandToTab(cmd) {
-  if (!currentTabId) {
+function forwardCommandToTab(tabId, cmd) {
+  if (!tabId) {
     console.warn('[Hermes Bridge] No active tab to forward command to');
     notifyPopup({ event: 'cmd_error', cmdType: cmd.type, error: 'No active tab' });
     return;
@@ -134,20 +142,18 @@ function forwardCommandToTab(cmd) {
   const RETRY_DELAY_MS = 300;
 
   function attempt(attemptNum) {
-    browser.tabs.sendMessage(currentTabId, cmd).then(() => {
-      // Success — cmd_ack or cmd_error arrives asynchronously via handleProxyMessage
-    }).catch((err) => {
-      if (err && err.message) {
-        console.warn(`[Hermes Bridge] Tab delivery attempt ${attemptNum}/${MAX_RETRIES} failed: ${err.message}`);
+    chrome.tabs.sendMessage(tabId, cmd, (resp) => {
+      if (chrome.runtime.lastError) {
+        if (attemptNum < MAX_RETRIES) {
+          setTimeout(() => attempt(attemptNum + 1), RETRY_DELAY_MS * (attemptNum + 1));
+        } else {
+          console.error(`[Hermes Bridge] Command ${cmd.type} (${cmd.cmdId}) delivery failed: ${chrome.runtime.lastError.message}`);
+          const errorMsg = `Tab not ready: ${chrome.runtime.lastError.message}`;
+          sendToProxy({ type: 'cmd_error', cmdId: cmd.cmdId, error: errorMsg, tabId, sessionId: SESSION_ID });
+          notifyPopup({ event: 'cmd_error', cmdType: cmd.type, error: errorMsg });
+        }
       }
-      if (attemptNum < MAX_RETRIES) {
-        setTimeout(() => attempt(attemptNum + 1), RETRY_DELAY_MS * (attemptNum + 1));
-      } else {
-        console.error(`[Hermes Bridge] Command ${cmd.type} (${cmd.cmdId}) could not be delivered`);
-        const errorMsg = `Tab not ready: ${err.message || 'delivery failed'}`;
-        sendToProxy({ type: 'cmd_error', cmdId: cmd.cmdId, error: errorMsg, tabId: currentTabId, sessionId: SESSION_ID });
-        notifyPopup({ event: 'cmd_error', cmdType: cmd.type, error: errorMsg });
-      }
+      // Success: content script sends ack/error asynchronously
     });
   }
 
@@ -155,22 +161,19 @@ function forwardCommandToTab(cmd) {
 }
 
 /**
- * Handle incoming messages from the proxy WebSocket.
- * Fix #P0-1: now handles backpressure and cancel message types.
+ * Handle messages from the proxy WebSocket.
  */
 function handleProxyMessage(cmd) {
   switch (cmd.type) {
-    // P2-8: Backpressure signal — proxy is overwhelmed, pause/resume sending
     case 'backpressure':
       backpressurePaused = cmd.paused;
       notifyPopup({ event: 'backpressure', paused: cmd.paused });
       console.warn(`[Hermes Bridge] Backpressure ${cmd.paused ? 'ACTIVE' : 'cleared'}`);
       break;
 
-    // P3-17: Cancel — forward to content script so it ignores this cmdId
     case 'cancel':
       if (currentTabId) {
-        browser.tabs.sendMessage(currentTabId, { type: 'cancel', cmdId: cmd.cmdId }).catch(() => {});
+        chrome.tabs.sendMessage(currentTabId, { type: 'cancel', cmdId: cmd.cmdId }).catch(() => {});
       }
       break;
 
@@ -181,7 +184,7 @@ function handleProxyMessage(cmd) {
     case 'submit':
     case 'evaluate':
     case 'refresh':
-      forwardCommandToTab(cmd);
+      forwardCommandToTab(currentTabId, cmd);
       break;
 
     case 'cmd_ack':
@@ -199,68 +202,59 @@ function handleProxyMessage(cmd) {
 
 // ─── Tab management ─────────────────────────────────────────────────────────
 
-async function setActiveTab(tabId, tabUrl = null) {
-  currentTabId = tabId;
-  currentTabUrl = tabUrl ?? currentTabUrl;
-  try {
-    await browser.tabs.sendMessage(tabId, { type: 'ping' });
-  } catch {
-    console.debug('[Hermes Bridge] Content script not yet ready in tab', tabId);
-  }
-}
-
-browser.tabs.onActivated.addListener(async (activeInfo) => {
+chrome.tabs.onActivated.addListener(async (activeInfo) => {
   currentTabId = activeInfo.tabId;
   try {
-    const tab = await browser.tabs.get(activeInfo.tabId);
+    const tab = await chrome.tabs.get(activeInfo.tabId);
     currentTabUrl = tab.url;
   } catch { /* restricted pages */ }
 });
 
-browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (tab.active && changeInfo.status === 'complete') {
     currentTabId = tabId;
     currentTabUrl = tab.url;
   }
 });
 
-// ─── Badge / icon state ──────────────────────────────────────────────────────
+// ─── Badge / icon state ─────────────────────────────────────────────────────
 
 function updateBadge(color) {
   const colorMap = { green: '#34C759', yellow: '#FFCC00', gray: '#8E8E93' };
   const bg = colorMap[color] || colorMap.gray;
   try {
-    browser.action.setBadgeBackgroundColor({ color: bg });
-    browser.action.setBadgeText({ text: connected ? '\u25CF' : '\u25CB' });
+    chrome.action.setBadgeBackgroundColor({ color: bg });
+    chrome.action.setBadgeText({ text: connected ? '\u25CF' : '\u25CB' });
   } catch { /* Badge APIs may not be available */ }
 }
 
 // ─── Popup notifications ─────────────────────────────────────────────────────
 
 function notifyPopup(data) {
-  browser.runtime.sendMessage({ ...data, from: 'background' }).catch(() => {
+  chrome.runtime.sendMessage({ ...data, from: 'background' }).catch(() => {
     // Popup not open — ignore
   });
 }
 
-// ─── Browser events ─────────────────────────────────────────────────────────
+// ─── Service worker events ───────────────────────────────────────────────────
 
-browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.event === 'getStatus') {
     sendResponse({
       connected,
       currentTabId,
       url: currentTabUrl,
       sessionId: SESSION_ID,
-      backpressurePaused // P2-8: expose backpressure state
+      backpressurePaused
     });
     return true;
   }
 
   if (message.event === 'activate') {
-    browser.tabs.query({ active: true, currentWindow: true }).then((tabs) => {
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
       if (tabs[0]) {
-        setActiveTab(tabs[0].id, tabs[0].url);
+        currentTabId = tabs[0].id;
+        currentTabUrl = tabs[0].url;
         notifyPopup({ event: 'tab_activated', tabId: tabs[0].id, url: tabs[0].url });
       }
     });
@@ -269,14 +263,15 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.type === '_navigate') {
     if (currentTabId !== null) {
-      browser.tabs.update(currentTabId, { url: message.url }).catch((err) => {
-        console.error('[Hermes Bridge] browser.tabs.update failed:', err.message);
-        browser.tabs.sendMessage(currentTabId, {
-          type: 'cmd_error',
-          cmdId: message.cmdId,
-          success: false,
-          error: `Navigation failed: ${err.message}`
-        }).catch(() => {});
+      chrome.tabs.update(currentTabId, { url: message.url }, () => {
+        if (chrome.runtime.lastError) {
+          chrome.tabs.sendMessage(currentTabId, {
+            type: 'cmd_error',
+            cmdId: message.cmdId,
+            success: false,
+            error: `Navigation failed: ${chrome.runtime.lastError.message}`
+          }).catch(() => {});
+        }
       });
     }
     return true;
@@ -284,7 +279,7 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.event === 'refreshSnapshot') {
     if (currentTabId) {
-      browser.tabs.sendMessage(currentTabId, { type: 'ping' }).then((resp) => {
+      chrome.tabs.sendMessage(currentTabId, { type: 'ping' }, (resp) => {
         if (resp && resp.html) {
           sendToProxy({
             type: 'tab_snapshot',
@@ -296,8 +291,6 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
             sessionId: SESSION_ID
           });
         }
-      }).catch(() => {
-        notifyPopup({ event: 'cmd_error', cmdType: 'refresh', error: 'Tab not ready' });
       });
     }
     return true;
@@ -314,7 +307,6 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   // Extension → proxy messages
   if (message.type === 'tab_snapshot' || message.type === 'mutation' || message.type === 'heartbeat') {
-    // P2-8: don't send if backpressure paused (mutation events are high-volume)
     if (message.type === 'mutation' && backpressurePaused) return true;
     sendToProxy({ ...message, tabId: currentTabId, sessionId: SESSION_ID });
     return true;
@@ -325,7 +317,6 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
-  // P1-6: content_error forwarded to popup
   if (message.type === 'content_error') {
     console.error(`[Hermes Bridge] Content script error: ${message.message}`);
     notifyPopup({ event: 'error', message: `Content error: ${message.message}` });

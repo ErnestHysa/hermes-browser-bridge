@@ -1,188 +1,268 @@
-# Hermes Browser Bridge — v1.3 Specification
+# Hermes Browser Bridge — Architecture Specification v1.3.0
 
-## Overview
+> Hermes Browser Bridge gives the Hermes Agent full read and control of a live browser tab
+> running in the user's own browser session. Since the extension runs inside the user's
+> authenticated browser, it naturally bypasses Cloudflare, CORS restrictions, and
+> login walls without any credential sharing.
 
-A two-part local stack: a Safari Web Extension that reads and controls your open tab, and a Node.js proxy server that bridges it to Hermes Agent. All traffic stays on localhost — your browser session, cookies, and TLS fingerprint are fully respected by Cloudflare and other anti-bot systems.
+---
 
-## Architecture
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│  Hermes Agent                                                │
-│       │                                                        │
-│       │ HTTP GET/POST localhost:9321                        │
-│       ▼                                                        │
-│  ┌────────────────────────────────────────────────────────┐  │
-│  │  proxy_server/server.js  (Node.js, port 9321)          │  │
-│  │   - HTTP REST API (Hermes queries page state)           │  │
-│  │   - WebSocket server (extension connects here)          │  │
-│  │   - Page mirror cache (per-session DOM + mutations)     │  │
-│  │   - Command queue with ack/error tracking               │  │
-│  │   - Per-client rate limiter (5 commands/sec/session)    │  │
-│  │   - permessage-deflate compression                     │  │
-│  │   - Shared base: proxy_lib.js                          │  │
-│  └────────────┬───────────────────────────────────────────┘  │
-│               │ WebSocket (localhost, no CORS)               │
-│               ▼                                               │
-│  ┌────────────────────────────────────────────────────────┐  │
-│  │  Safari Web Extension                                  │  │
-│  │   - content.js: MutationObserver, DOM reader, cmd exec │  │
-│  │   - background.js: WS client, message routing, health │  │
-│  │   - popup.html: click-to-activate + refresh + log     │  │
-│  └────────────────────────────────────────────────────────┘  │
-└──────────────────────────────────────────────────────────────┘
-```
-
-## File Structure
+## 1. Overview
 
 ```
-hermes-browser-bridge/
-├── proxy_server/
-│   ├── server.js           ← HTTP + WebSocket entry (thin wrapper)
-│   ├── server_https.js    ← HTTPS + WSS variant (thin wrapper)
-│   ├── proxy_lib.js       ← Shared proxy logic (all real code lives here)
-│   ├── page_mirror.js     ← Per-session DOM cache + mutation ring buffer
-│   ├── cmd_queue.js       ← Command queue with timeout + ack/error tracking
-│   └── package.json       ← ws@^8.20.0 (only external dependency)
-├── extension_safari/
-│   ├── Contents/
-│   │   ├── Info.plist
-│   │   ├── MacOS/
-│   │   │   ├── SafariWebExtensionHandler    ← Compiled native binary
-│   │   │   └── SafariWebExtensionHandler.swift
-│   │   └── Resources/
-│   │       ├── manifest.json   ← Manifest V3 (activeTab only)
-│   │       ├── background.js  ← WebSocket client + message routing + health poll
-│   │       ├── content.js    ← MutationObserver, DOM reader, cmd executor
-│   │       ├── popup.html/js/css  ← Click-to-activate + refresh + cmd log
-│   │       ├── _locales/en/messages.json
-│   │       └── images/        ← Extension icons (16,48,96,128 PNG)
-├── certificates/
-│   ├── ca.crt              ← Self-signed CA cert (for HTTPS variant)
-│   └── README.md           ← macOS Keychain install instructions
-├── launchd/
-│   └── com.hermes-agent.browser-bridge.plist  ← Auto-restart plist
-├── tests/
-│   └── smoke_test.sh       ← Basic curl-based smoke tests
-├── docs/
-│   ├── CHROME_EXTENSION.md ← Chrome extension specification
-│   └── AUTH.md             ← Production auth design
-├── SPEC.md
-├── SETUP.md
-└── CHANGELOG.md
+User's Browser Tab (any site — Google, banking, intranet, etc.)
+    │
+    │ content.js (injected content script)
+    │   • Reads rendered DOM + page state
+    │   • MutationObserver → streams incremental page state
+    │   • Executes: click, scroll, type, navigate, evaluate, submit
+    │
+    ▼
+background.js (extension service worker / background page)
+    │   • Maintains WebSocket to proxy
+    │   • Routes commands to content script
+    │   • Routes page state to proxy
+    │
+    │  WebSocket (ws://localhost:9321)
+    ▼
+proxy_server/ (Node.js)
+    │  • HTTP REST API (page_state, commands, sessions)
+    │  • WebSocket endpoint for Hermes Agent
+    │  • PageMirror: caches page state per session
+    │  • CmdQueue: async command execution with ack/error
+    │
+    │  HTTP/WS  localhost:9321
+    ▼
+Hermes Agent
+    • Reads page state via GET /page_state
+    • Sends commands via POST /command
+    • Receives push via WebSocket connect to ws://localhost:9321/hermes
 ```
 
-## Dependencies
+### What This Solves
 
-| Package | Version | Purpose |
-|---|---|---|
-| `ws` (npm) | `^8.20.0` | WebSocket server — the only external dependency |
-
-## Communication Protocol
-
-### Extension → Proxy (WebSocket outbound)
-
-```json
-{ "type": "tab_snapshot", "url": "...", "title": "...", "html": "...", "seq": 1, "sessionId": "...", "incremental": false }
-{ "type": "mutation",      "mutations": [...], "url": "...", "sessionId": "...", "seq": 1 }
-{ "type": "heartbeat",     "tabId": 1 }
-{ "type": "cmd_ack",       "cmdId": "uuid", "success": true, "result": "..." }
-{ "type": "cmd_error",     "cmdId": "uuid", "success": false, "error": "..." }
-```
-
-### Proxy → Extension (WebSocket inbound)
-
-```json
-{ "type": "navigate", "url": "https://...", "cmdId": "uuid" }
-{ "type": "click",    "selector": "#login-btn", "cmdId": "uuid" }
-{ "type": "scroll",   "x": 0, "y": 300, "cmdId": "uuid" }
-{ "type": "type",     "selector": "input[name=q]", "text": "...", "cmdId": "uuid" }
-{ "type": "evaluate", "script": "return document.title", "cmdId": "uuid" }
-{ "type": "refresh",  "cmdId": "uuid" }
-```
-
-### Hermes → Proxy (REST)
-
-```
-GET  /health              → { status, uptime, connected, pendingCommands, wsClients, activeSessions }
-GET  /page_state          → { url, title, html, htmlStale, seq, connected, lastUpdate, mutations }
-GET  /page_state?sessionId=X&lastSeq=N  → delta mutations since lastSeq for that session
-POST /command             → { type, selector?, url?, x?, y?, text?, script?, sessionId? }
-                          ← { cmdId, status: "pending", message, rateLimitRemaining, sessionId }
-GET  /command/:cmdId      → { cmdId, status: "pending"|"done"|"error", result?, error? }
-```
-
-## Safari Extension Behavior
-
-- Click extension icon → popup with connection status + "Activate Tab" button
-- "Activate Tab" → extension starts reading the current tab
-- MutationObserver watches `document.body` for DOM changes:
-  - **Incremental mode** (on minor mutations): sends lightweight structural snapshot — element counts, body text sample, URL, title. No outerHTML sent.
-  - **Full mode** (first load, every 2s interval, navigation, explicit `refresh`, or major DOM changes): sends complete `outerHTML`
-- `refresh` command forces an immediate full snapshot
-- Navigate handlers properly removed before adding new ones (no listener leak)
-- Commands arrive via WebSocket → execute via DOM APIs
-- Background script maintains WebSocket to proxy, routes messages to/from content script
-- Background polls `/health` every 10s to detect silent disconnects
-- `disconnect` button properly terminates the active tab session
-- Commands tracked per-command-id (Map) — parallel commands work correctly
-- `sessionId` attached to every extension→proxy message for multi-session tracking
-- Popup retains last known URL on reconnect; shows command log; supports manual refresh
-
-## Proxy Server Behavior
-
-- Node.js with `ws` npm package for WebSocket
-- Single HTTP server shared with WebSocket (no port conflict)
-- `proxy_lib.js`: all shared logic; `server.js` and `server_https.js` are thin wrappers
-- `page_mirror.js`: caches per-session url/title/html, TTL 5s for html, 30s for mutations, ring buffer max 100 mutations
-- **Per-session connected state** — `connected` is derived per-session, not global
-- **Per-session mutation scoping** — `getState(sessionId, lastSeq)` returns only that session's mutations delta
-- **Session eviction** — disconnected sessions cleaned up after 5 minutes of inactivity
-- **Per-session rate limiting** — each `sessionId` gets its own 5 commands/sec token bucket
-- **Per-session command routing** — commands with `?sessionId=X` are sent only to that session's WebSocket
-- **Origin validation** — WebSocket connections from non-localhost origins are rejected (HTTP 1008)
-- `cmd_queue.js`: stores pending commands with 30s timeout, resolves rather than rejects on timeout
-- permessage-deflate compression enabled on WebSocket connections
-- Periodic prune of completed commands every 2 minutes
-- Graceful shutdown on SIGINT (Ctrl+C)
-
-## Security Model
-
-- All traffic on localhost — nothing leaves the machine
-- Extension activates only when user clicks — no passive tracking
-- CORS restricted to `http://localhost:*`
-- WebSocket origin validated — unauthorized origins rejected
-- v1.3: **no auth** on WebSocket/REST (local-only, trusted machine assumption)
-- v2.0 planned (see `docs/AUTH.md`):
-  - Token-based auth: Hermes sends `Authorization: Bearer <token>` header
-  - Proxy validates token on every HTTP request and WebSocket handshake
-  - Token stored in macOS Keychain, loaded at startup
-  - Command idempotency keys prevent double-execution on retry
-
-## Testing
-
-| Test | Expected |
+| Blocker | How Bridge Solves It |
 |---|---|
-| Load extension in Safari | Popup shows "Inactive" |
-| Click "Activate Tab" | Popup shows "Connected", green dot |
-| Browse to https://example.com | DOM streamed to proxy within 2s |
-| GET /page_state | Full HTML of current tab |
-| GET /page_state?sessionId=X&lastSeq=5 | Only mutations with seq > 5 |
-| POST 6 commands simultaneously | All 6 complete with correct cmdIds |
-| POST 10 commands in 1 second (same session) | Last 5 get 429 Rate Limit Exceeded |
-| POST 1 command per second for 10 seconds | All 10 succeed (bucket refills) |
-| GET /page_state after 5s idle | `htmlStale: true` |
-| GET /command/nonexistent | 404 not found |
-| Close extension popup | Connection stays alive (background script) |
-| Click Disconnect | Session cleared, popup resets to Inactive |
-| Click Refresh Snapshot | Full snapshot resent immediately |
-| Extension reconnect after brief disconnect | URL retained in popup |
+| Cloudflare | Traffic originates from YOUR browser IP/session — Cloudflare sees a real user |
+| CORS | Extension reads page locally, sends to proxy on localhost — no cross-origin HTTP |
+| Login walls | Extension runs inside your authenticated session — it sees what you see |
+| Intranet sites | Same — extension reads whatever page is open, no network access needed |
+| CSP restrictions | Content script runs at document_start before CSP; some sites still block — known limitation |
 
-## Future Work
+### Limitations
 
-- Chrome extension (see `docs/CHROME_EXTENSION.md`)
-- Production auth with macOS Keychain token (see `docs/AUTH.md`)
-- End-to-end encryption with user-held key
-- Headless mode (no popup, auto-attach on browser launch)
-- Multiple tab support (switch active tab from Hermes)
-- Video frame capture for visual page understanding
+- **CSP-blocklisted sites**: Some sites (Google, banking, crypto exchanges) set Content Security Policy that blocks even content script injection. The extension reads the rendered page but interaction (click/type) may be silently blocked. The page state is still readable.
+- **cross-origin iframes**: Content script runs at the top-frame level; sub-frame content may not be fully accessible.
+- **Browser storage access**: content.js cannot read `sessionStorage`/`localStorage` cross-origin by design, but has access to cookies for the top-level domain.
+
+---
+
+## 2. Architecture Components
+
+### 2.1 Content Script (`content.js`)
+
+Injected into every page at `document_idle`. Responsibilities:
+
+**Page State Capture**
+- On init: captures full HTML snapshot synchronously (`document.documentElement.outerHTML`) before MutationObserver attaches — avoids missing early DOM mutations
+- Subsequent snapshots: structural snapshots (element counts, changed text, form/link counts) every 3 seconds
+- Full snapshot on major DOM changes (5+ childList mutations)
+- `characterData` mutations (text changes) are accumulated and included in the next structural snapshot
+
+**MutationObserver**
+- Observes `document.body` with `childList: true, subtree: true, characterData: true`
+- Accumulates `characterData` mutations in a buffer; flushes buffer in the next structural snapshot (up to 10 changed text snippets)
+- Major mutations (5+ added nodes or any removals) trigger an immediate full HTML snapshot after a 300ms debounce
+- First snapshot is captured *before* the observer starts (race condition fix)
+
+**Command Execution**
+- Receives commands from background page via `window.addEventListener('message')`
+- Supported commands: `navigate`, `click`, `scroll`, `type`, `submit`, `evaluate`, `refresh`
+- Each command gets a unique `cmdId` (UUID); result is sent back via `cmd_ack` or `cmd_error`
+- `navigate` uses `_navigate` (background page calls `chrome.tabs.update` to navigate the tab itself)
+- `evaluate` uses `new Function(cmd.script)` — sandboxed to current page context
+
+**Communication**
+- To background: `window.postMessage({ type, ...payload }, '*')`
+- Heartbeat: every 15s when tab is active
+
+### 2.2 Background Service (`background.js` / SafariWebExtensionHandler)
+
+**WebSocket to Proxy**
+- Connects to `ws://localhost:9321` on extension load
+- Sends `session_announce` with its `sessionId` after connect
+- On reconnect: re-sends `session_announce` with same `sessionId` so proxy can re-associate
+
+**Message Routing**
+- Extension (content) → proxy: `tab_snapshot`, `mutation`, `cmd_ack`, `cmd_error`, `content_error`, `heartbeat`
+- proxy (via WS) → extension: `navigate`, `click`, `scroll`, `type`, `submit`, `evaluate`, `refresh`, `cancel`, `backpressure`
+
+**Tab Management**
+- Tracks `currentTabId` via `tabs.onActivated` and `tabs.onUpdated`
+- `_navigate` command: calls `chrome.tabs.update(tabId, { url })` to navigate the tab directly
+
+**Popup Communication**
+- Popup ↔ background: `chrome.runtime.sendMessage`
+- Background pushes events: `connected`, `disconnected`, `tab_activated`, `cmd_sent`, `cmd_done`, `cmd_error`
+
+**Hermes WebSocket Push (v1.3)**
+- Background also connects to `ws://localhost:9321/hermes` (separate WS connection)
+- Sends `{ type: 'session_announce', sessionId }` to subscribe
+- Receives `{ type: 'command', ...cmd }` from Hermes and forwards to the correct session's tab
+- Receives `{ type: 'cancel', cmdId }` and forwards to content script
+
+### 2.3 Proxy Server (`proxy_server/`)
+
+**Files**
+- `server.js` — main entry: HTTP + WebSocket server on port 9321
+- `server_https.js` — TLS variant on port 9322 (uses certificates from `../certificates/`)
+- `proxy_lib.js` — shared logic (all HTTP handlers, WebSocket handling, state)
+- `page_mirror.js` — DOM cache + mutation ring buffer
+- `cmd_queue.js` — command queue with ack/error tracking and cancel support
+- `config.js` — runtime configuration (port, rate limits, sizes, timeouts)
+
+**HTTP Endpoints**
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/health` | Server health + connection count |
+| GET | `/page_state?sessionId=X` | Current page state for session (HTML or structural) |
+| POST | `/command` | Submit a command for a session |
+| GET | `/command/:cmdId` | Poll command result |
+| DELETE | `/command/:cmdId` | Cancel a pending command |
+| GET | `/sessions` | List all active sessions + URLs |
+| POST | `/sessions/:id/activate` | Set which session Hermes is actively watching |
+| GET | `/last_seq?sessionId=X` | Get last received seq number for session |
+| GET | `/metrics` | Prometheus-compatible metrics (text/plain) |
+
+**WebSocket Endpoint `/hermes`**
+
+For Hermes Agent's real-time push connection:
+
+```
+1. Client connects to ws://localhost:9321/hermes
+2. Client sends: { type: 'session_announce', sessionId: 'abc123' }
+3. Proxy sends: { type: 'subscribed', sessionId: 'abc123' }
+4. Proxy pushes: { type: 'command', cmdId: '...', type: 'click', selector: '#btn' }
+5. Client (Hermes) sends: { type: 'ack', cmdId: '...' } (optional)
+6. Proxy receives ack/error from extension, forwards to Hermes WS
+```
+
+The proxy routes commands to the correct session based on the `sessionId` in `session_announce`.
+If Hermes sends a `command` without announcing first, it is routed to the most recently active session.
+
+**HTTP Endpoint `/command`**
+
+```
+POST /command
+Body: { type, sessionId, cmdId, selector?, text?, url?, script?, x?, y? }
+
+Response 202: { accepted: true, cmdId }
+Response 400: { error: 'invalid type' }
+Response 429: { error: 'rate limited' }
+Response 504: { error: 'command timed out' } (after 30s)
+```
+
+**Backpressure Flow Control**
+
+When the extension sends `mutation` events faster than Hermes consumes them (Hermes disconnects or is slow), the proxy tracks the pending mutation queue depth per session. When the queue exceeds `BACKPRESSURE_THRESHOLD` (50 mutations), the proxy sends `{ type: 'backpressure', paused: true }` to the extension's background WS. The extension stops sending `mutation` events (but continues sending `tab_snapshot` at the periodic interval). When the queue drains below the threshold, `{ type: 'backpressure', paused: false }` is sent and `mutation` flow resumes.
+
+### 2.4 PageMirror (`page_mirror.js`)
+
+Stores page state per `sessionId`. In-memory only (no persistence).
+
+**State per session**
+- `url`: last known URL
+- `title`: last known title
+- `html`: full HTML snapshot (null if only structural data)
+- `structural`: `{ total, forms, inputs, buttons, links, images }` counts
+- `changedTexts`: last N changed text snippets (max 10)
+- `bodySample`: first 200 chars of body text
+- `seq`: monotonically increasing sequence number
+- `updatedAt`: timestamp
+
+**Mutation Ring Buffer**
+- Per-session circular buffer of recent mutation events
+- Max 100 entries; oldest are evicted
+- Used for debugging and replay
+
+**Deduplication**
+- If two consecutive `tab_snapshot` events have identical `html` and `seq`, the second is silently dropped (idempotency)
+
+### 2.5 CommandQueue (`cmd_queue.js`)
+
+Tracks pending commands awaiting `cmd_ack` or `cmd_error` from the extension.
+
+- Commands time out after `CMD_TIMEOUT_MS` (default: 30000ms, configurable in `config.js`)
+- `cancel(cmdId)` removes the command without resolving it
+- Uses a UUID → pending command map for O(1) insert/lookup/delete
+
+---
+
+## 3. Configuration (`config.js`)
+
+```javascript
+PORT: 9321,                    // HTTP/WebSocket port
+RATE_LIMIT_RPS: 5,             // Max commands per second per session
+CMD_TIMEOUT_MS: 30000,        // Command timeout (ms)
+MAX_HTML_BYTES: 10 * 1024 * 1024,  // Max HTML snapshot size (10MB)
+MAX_STRUCTURAL_CHANGES: 200,  // Max mutations per batch
+FULL_SNAPSHOT_INTERVAL_MS: 3000,   // ms between full HTML snapshots
+MAJOR_MUTATION_DEBOUNCE_MS: 300,   // ms to wait before full snapshot after major mutation
+HEARTBEAT_INTERVAL_MS: 15000,  // content.js → background.js heartbeat interval
+BACKPRESSURE_THRESHOLD: 50,   // Mutations queued before backpressure kicks in
+MAX_PENDING_MESSAGES: 100,    // Extension → proxy pending queue depth
+MAX_IDEMPOTENCY_CACHE: 1000,   // Max entries in the idempotency cache
+IDEMPOTENCY_TTL_MS: 60000,    // How long idempotency keys live (ms)
+SESSION_MAX_AGE_MS: 3600000,  // Evict sessions inactive for 1 hour
+MAX_SESSIONS: 100,             // Max concurrent sessions before LRU eviction
+```
+
+---
+
+## 4. Security Model
+
+**Localhost only**: All HTTP and WebSocket endpoints are bound to `localhost`. No remote access by default.
+
+**Extension has full page access**: The content script has access to all DOM content, cookies (for the top-level domain), and can execute arbitrary JavaScript in the page context. This is inherent to how browser extensions work.
+
+**No credential sharing**: Hermes Agent never sees your passwords or session tokens. It only receives the rendered DOM (text content of elements) and can issue click/type commands that go through the extension.
+
+**Production hardening** (when ready for multi-user/multi-machine deployment):
+- Add token-based auth: extensions receive a time-limited token; proxy validates it on every request
+- Use HTTPS (server_https.js + CA cert) for non-localhost proxy access
+- Add per-session ACLs (restrict which sites a given token can access)
+- Add request signing (HMAC) to prevent tampering in transit
+
+---
+
+## 5. Browser Compatibility
+
+| Browser | Extension Type | Status |
+|---|---|---|
+| Safari 16+ (macOS) | Safari Web Extension | ✅ Implemented |
+| Chrome 120+ (macOS/Windows/Linux) | Manifest V3 Web Extension | ✅ Implemented |
+| Firefox 120+ | Web Extension (MV3) | Not tested — should work with minor API changes (`browser.*` vs `chrome.*`) |
+
+---
+
+## 6. Future Work
+
+- **Screenshot capture**: `GET /screenshot?sessionId=X` — returns a base64 PNG of the current viewport
+- **File upload**: `POST /upload` — extension sends file input state, Hermes can provide file bytes
+- **Multi-tab subscription**: Allow Hermes to subscribe to *multiple* sessions simultaneously and receive updates from all
+- **DevTools Protocol (CDP)**: Use Chrome's CDP for deeper introspection without content script injection
+- **Encrypted transport**: End-to-end encryption between extension and proxy (ChaCha20-Poly1305)
+- **Session recording**: Persist page state stream to disk for replay/archival
+- **WebDriver Protocol**: Bidirectional bridge to W3C WebDriver for cross-browser automation parity
+
+---
+
+## 7. Version History
+
+| Version | Date | Changes |
+|---|---|---|
+| 1.3.0 | 2026-05-03 | R25 audit fixes: Hermes WS push redesign, backpressure, session management, command cancellation, Safari + Chrome extension parity, Prometheus metrics, requestIdleCallback, $HOME launchd path, popup listener cleanup, HTTPS shutdown fix, chunked WS |
+| 1.2.0 | 2026-04 | Hermes WebSocket push endpoint added |
+| 1.1.0 | 2026-04 | HTTPS variant, command queue, idempotency cache |
+| 1.0.0 | 2026-03 | Initial release: Safari extension + HTTP proxy |
