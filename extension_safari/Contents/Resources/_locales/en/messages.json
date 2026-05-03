@@ -1,0 +1,10 @@
+{
+  "extension_name": {
+    "message": "Hermes Browser Bridge",
+    "description": "Name of the extension"
+  },
+  "extension_description": {
+    "message": "Gives Hermes Agent real-time access to your Safari tabs",
+    "description": "Description of the extension"
+  }
+}

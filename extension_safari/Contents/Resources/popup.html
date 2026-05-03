@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Hermes Browser Bridge</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="logo">🔷</div>
+      <div class="title">Hermes Browser Bridge</div>
+    </header>
+
+    <div id="status-panel" class="panel">
+      <div class="status-row">
+        <span class="status-dot" id="status-dot">⚫</span>
+        <span id="status-text">Inactive</span>
+      </div>
+      <div class="url-row" id="url-display">No tab active</div>
+    </div>
+
+    <div id="error-panel" class="panel error hidden">
+      <span id="error-text"></span>
+    </div>
+
+    <button id="activate-btn" class="btn primary">
+      Activate Tab
+    </button>
+
+    <button id="disconnect-btn" class="btn secondary hidden">
+      Disconnect
+    </button>
+
+    <div class="info">
+      <p id="info-text">Click "Activate Tab" to give Hermes Agent access to your current page.</p>
+    </div>
+
+    <div class="footer">
+      <span>v1.0</span>
+      <span>·</span>
+      <span>localhost:9321</span>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
