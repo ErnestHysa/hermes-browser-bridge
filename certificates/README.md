@@ -18,7 +18,7 @@ This guide explains how to install the Hermes Browser Bridge CA certificate so t
 ### Step 1: Add to Keychain
 
 ```bash
-sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ~/Desktop/DEVPROJECTS/mmorgp_browser_bridge/certificates/ca.crt
+sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ~/Desktop/DEVPROJECTS/hermes-browser-bridge/certificates/ca.crt
 ```
 
 Or manually:

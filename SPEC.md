@@ -33,7 +33,7 @@ A two-part local stack: a Safari Web Extension that reads and controls your open
 ## File Structure
 
 ```
-mmorgp_browser_bridge/
+hermes-browser-bridge/
 ├── proxy_server/
 │   ├── server.js       ← Main entry: HTTP + WebSocket server
 │   ├── page_mirror.js  ← In-memory DOM cache + mutation buffer

@@ -38,7 +38,7 @@ The **Develop** menu now appears in your menu bar.
 The Safari extension requires a native binary (`SafariWebExtensionHandler`) to bridge JavaScript and Safari.
 
 ```bash
-cd ~/Desktop/DEVPROJECTS/mmorgp_browser_bridge
+cd ~/Desktop/DEVPROJECTS/hermes-browser-bridge
 swiftc \
   -target arm64-apple-macosx15.0 \
   -sdk $(xcrun --sdk macosx --show-sdk-path) \
@@ -60,7 +60,7 @@ xcode-select --install
 Icons are pre-generated. To regenerate:
 
 ```bash
-cd ~/Desktop/DEVPROJECTS/mmorgp_browser_bridge/extension_safari/Contents/Resources/images
+cd ~/Desktop/DEVPROJECTS/hermes-browser-bridge/extension_safari/Contents/Resources/images
 node generate_icons.js
 ```
 
@@ -75,7 +75,7 @@ macOS Safari allows loading unpacked Web Extensions directly from the filesystem
 ```
 1. Safari → Develop menu → "Extensions…"
 2. Click the "+" button at the bottom of the Extensions list
-3. Navigate to: ~/Desktop/DEVPROJECTS/mmorgp_browser_bridge/extension_safari
+3. Navigate to: ~/Desktop/DEVPROJECTS/hermes-browser-bridge/extension_safari
 4. Click "Open"
 5. Safari prompts: "Develop extension?" → Click "Install"
 ```
@@ -86,7 +86,7 @@ macOS Safari allows loading unpacked Web Extensions directly from the filesystem
 1. Safari → Settings… → Privacy & Security
 2. Scroll to "Extensions"
 3. Click "Install…" (or click "+" if available)
-4. Navigate to: ~/Desktop/DEVPROJECTS/mmorgp_browser_bridge/extension_safari
+4. Navigate to: ~/Desktop/DEVPROJECTS/hermes-browser-bridge/extension_safari
 5. Click "Open"
 ```
 
@@ -103,7 +103,7 @@ If you see "Failed to load" — Developer mode is not enabled. Repeat Step 1.
 Open a Terminal window and run:
 
 ```bash
-cd ~/Desktop/DEVPROJECTS/mmorgp_browser_bridge/proxy_server
+cd ~/Desktop/DEVPROJECTS/hermes-browser-bridge/proxy_server
 node server.js
 ```
 
@@ -187,14 +187,14 @@ Once running, just tell me: "Read my Safari tab" or "click the login button" or 
 
 ### Extension shows "Error" state
 
-1. Proxy server not running → `cd ~/Desktop/DEVPROJECTS/mmorgp_browser_bridge/proxy_server && node server.js`
+1. Proxy server not running → `cd ~/Desktop/DEVPROJECTS/hermes-browser-bridge/proxy_server && node server.js`
 2. Wrong working directory → must be inside the `proxy_server` folder
 
 ### Extension shows "Connecting…" forever
 
 WebSocket cannot reach the proxy:
 - Proxy server not running → start it (Step 4)
-- Wrong directory → `cd ~/Desktop/DEVPROJECTS/mmorgp_browser_bridge/proxy_server && node server.js`
+- Wrong directory → `cd ~/Desktop/DEVPROJECTS/hermes-browser-bridge/proxy_server && node server.js`
 - Port conflict → `lsof -ti :9321 | xargs kill -9` then restart
 
 ### "Failed to load" when installing extension
@@ -202,7 +202,7 @@ WebSocket cannot reach the proxy:
 - Safari Developer mode not enabled → Step 1
 - Extension files missing → run:
   ```bash
-  find ~/Desktop/DEVPROJECTS/mmorgp_browser_bridge/extension_safari -type f | wc -l
+  find ~/Desktop/DEVPROJECTS/hermes-browser-bridge/extension_safari -type f | wc -l
   ```
   Should output 13 or more.
 
@@ -227,7 +227,7 @@ WebSocket cannot reach the proxy:
 
 | | |
 |---|---|
-| Start proxy | `node ~/Desktop/DEVPROJECTS/mmorgp_browser_bridge/proxy_server/server.js` |
+| Start proxy | `node ~/Desktop/DEVPROJECTS/hermes-browser-bridge/proxy_server/server.js` |
 | Stop proxy | Ctrl+C in the proxy Terminal |
 | Health | `curl http://localhost:9321/health` |
 | Page state | `curl http://localhost:9321/page_state` |
@@ -238,7 +238,7 @@ WebSocket cannot reach the proxy:
 ## Project Structure
 
 ```
-mmorgp_browser_bridge/
+hermes-browser-bridge/
 ├── extension_safari/
 │   ├── Contents/
 │   │   ├── Info.plist
