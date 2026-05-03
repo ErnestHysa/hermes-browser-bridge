@@ -98,7 +98,49 @@ If you see "Failed to load" — Developer mode is not enabled. Repeat Step 1.
 
 ---
 
-## Step 5: Start the Proxy Server
+## Step 5: (Optional) Auto-Start with Launchd
+
+Install the launchd plist to have the proxy start automatically on login and restart after crashes:
+
+```bash
+cp ~/Desktop/DEVPROJECTS/hermes-browser-bridge/launchd/com.hermes-agent.browser-bridge.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.hermes-agent.browser-bridge.plist
+```
+
+Verify it's running:
+```bash
+launchctl list | grep hermes
+curl http://localhost:9321/health
+```
+
+To uninstall:
+```bash
+launchctl unload ~/Library/LaunchAgents/com.hermes-agent.browser-bridge.plist
+rm ~/Library/LaunchAgents/com.hermes-agent.browser-bridge.plist
+```
+
+---
+
+## Step 6: (Optional) HTTPS Proxy
+
+For accessing the proxy from other machines on your network, use the HTTPS variant instead:
+
+```bash
+cd ~/Desktop/DEVPROJECTS/hermes-browser-bridge/proxy_server
+node server_https.js
+```
+
+Runs on `https://localhost:9322`. You must first install the CA cert:
+```bash
+# See certificates/README.md for full instructions
+sudo security add-trusted-cert -d -r trustRoot \
+  -k /Library/Keychains/System.keychain \
+  ~/Desktop/DEVPROJECTS/hermes-browser-bridge/certificates/ca.crt
+```
+
+---
+
+## Step 7: Start the Proxy Server
 
 Open a Terminal window and run:
 
@@ -126,7 +168,7 @@ node server.js
 
 ---
 
-## Step 6: Activate the Extension in Safari
+## Step 8: Activate the Extension in Safari
 
 ```
 1. Browse to any website in Safari (e.g. https://sonniss.com)
@@ -140,7 +182,7 @@ The extension is now streaming your tab to the proxy server.
 
 ---
 
-## Step 7: Test the Proxy API
+## Step 9: Test the Proxy API
 
 Open a second Terminal window (proxy keeps running in the first):
 
@@ -177,7 +219,7 @@ curl http://localhost:9321/command/<cmdId>
 
 ---
 
-## Step 8: Done — Use with Hermes Agent
+## Step 10: Done — Use with Hermes Agent
 
 Once running, just tell me: "Read my Safari tab" or "click the login button" or "scroll down on my current page." I will query the proxy automatically.
 
@@ -228,10 +270,12 @@ WebSocket cannot reach the proxy:
 | | |
 |---|---|
 | Start proxy | `node ~/Desktop/DEVPROJECTS/hermes-browser-bridge/proxy_server/server.js` |
+| Start HTTPS proxy | `node ~/Desktop/DEVPROJECTS/hermes-browser-bridge/proxy_server/server_https.js` |
 | Stop proxy | Ctrl+C in the proxy Terminal |
 | Health | `curl http://localhost:9321/health` |
 | Page state | `curl http://localhost:9321/page_state` |
 | Kill port | `lsof -ti :9321 \| xargs kill -9` |
+| Install auto-start | `cp launchd/*.plist ~/Library/LaunchAgents/ && launchctl load ~/Library/LaunchAgents/com.hermes-agent.browser-bridge.plist` |
 
 ---
 
@@ -239,24 +283,31 @@ WebSocket cannot reach the proxy:
 
 ```
 hermes-browser-bridge/
+├── proxy_server/
+│   ├── server.js           ← HTTP + WebSocket proxy (main entry)
+│   ├── server_https.js     ← HTTPS + WSS variant (optional)
+│   ├── page_mirror.js      ← DOM cache + mutation ring buffer
+│   ├── cmd_queue.js        ← Command queue with timeout + ack/error tracking
+│   └── package.json        ← ws@^8.20.0
 ├── extension_safari/
 │   ├── Contents/
 │   │   ├── Info.plist
+│   │   ├── MacOS/
+│   │   │   ├── SafariWebExtensionHandler    ← Compiled native binary
+│   │   │   └── SafariWebExtensionHandler.swift
 │   │   └── Resources/
-│   │       ├── manifest.json      ← Manifest V3
-│   │       ├── background.js      ← WebSocket client
-│   │       ├── content.js         ← DOM reader + cmd executor
-│   │       ├── popup.html/css/js  ← Click-to-activate UI
+│   │       ├── manifest.json   ← Manifest V3
+│   │       ├── background.js  ← WebSocket client + message routing
+│   │       ├── content.js     ← MutationObserver, DOM reader, cmd executor
+│   │       ├── popup.html/css/js  ← Click-to-activate popup UI
 │   │       ├── _locales/
-│   │       └── images/            ← Extension icons
-├── proxy_server/
-│   ├── server.js                  ← HTTP + WebSocket proxy
-│   ├── page_mirror.js            ← DOM cache
-│   ├── cmd_queue.js              ← Command tracking
-│   └── package.json               ← ws@^8.20.0
+│   │       └── images/        ← Extension icons
+├── launchd/
+│   └── com.hermes-agent.browser-bridge.plist  ← Auto-restart on login
 ├── certificates/
-│   ├── ca.crt                    ← Self-signed CA (optional, v1 not needed)
+│   ├── ca.crt / ca.key      ← Self-signed CA (for HTTPS variant)
 │   └── README.md
 ├── SPEC.md                        ← Architecture spec
-└── SETUP.md                       ← This file
+├── SETUP.md                       ← Setup guide
+└── CHANGELOG.md                   ← Version history
 ```

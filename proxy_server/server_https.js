@@ -1,21 +1,43 @@
 /**
- * server.js — Hermes Browser Bridge Proxy Server
- * HTTP REST API + WebSocket server for the Safari/Chrome extension.
- * Pure Node.js (built-in modules only except `ws`).
+ * server_https.js — Hermes Browser Bridge Proxy Server (HTTPS variant)
  *
- * Usage: node server.js
- * Runs on: http://localhost:9321 + ws://localhost:9321
+ * Identical to server.js but adds TLS/HTTPS support using the self-signed
+ * CA certificate in ../certificates/. This is useful if you want to expose
+ * the proxy to other machines on your network (e.g. a second Mac on the same
+ * LAN) or if a site refuses HTTP connections.
+ *
+ * Usage: node server_https.js
+ * Runs on: https://localhost:9322 + wss://localhost:9322
+ *
+ * ⚠️  Self-signed certs will cause a browser warning.
+ *     Install the CA cert from ../certificates/ca.crt into Keychain first.
+ *     See: ../certificates/README.md
  */
 
-const http = require('node:http');
+const https = require('node:https');
 const { WebSocketServer } = require('ws');
 const { randomUUID } = require('node:crypto');
+const { readFileSync } = require('node:fs');
 
 const { CommandQueue } = require('./cmd_queue');
 const { PageMirror } = require('./page_mirror');
 
-const PORT = 9321;
+const PORT = 9322;
 const HOST = '0.0.0.0';
+
+// Load TLS cert/key from certificates/
+const TLS_DIR = __dirname + '/../certificates';
+let tlsOptions;
+try {
+  tlsOptions = {
+    cert: readFileSync(`${TLS_DIR}/ca.crt`),
+    key: readFileSync(`${TLS_DIR}/ca.key`)
+  };
+} catch (e) {
+  console.error('[HTTPS] Failed to load TLS certificates from ../certificates/:', e.message);
+  console.error('[HTTPS] Run: cd certificates && ./generate.sh  (or create ca.crt + ca.key manually)');
+  process.exit(1);
+}
 
 // ─── Shared state ────────────────────────────────────────────────────────────
 
@@ -46,10 +68,9 @@ function parseBody(req) {
   });
 }
 
-// ─── WebSocket Server (shares the HTTP server) ──────────────────────────────
+// ─── WebSocket Server (shares the HTTPS server) ───────────────────────────
 
-// FIX #8: ws shares the http server — one port, one socket, no conflict
-const server = http.createServer();
+const server = https.createServer(tlsOptions);
 const wss = new WebSocketServer({ server });
 
 wss.on('connection', (ws, req) => {
@@ -70,23 +91,18 @@ wss.on('connection', (ws, req) => {
       case 'tab_snapshot':
         pageMirror.updateSnapshot(msg);
         break;
-
       case 'mutation':
         pageMirror.addMutations(msg);
         break;
-
       case 'heartbeat':
         pageMirror.setConnected(true, msg.tabId ?? null);
         break;
-
       case 'cmd_ack':
         cmdQueue.ack(msg.cmdId, msg.result);
         break;
-
       case 'cmd_error':
         cmdQueue.error(msg.cmdId, msg.error);
         break;
-
       default:
         console.warn('[WS] Unknown message type:', msg.type);
     }
@@ -102,11 +118,10 @@ wss.on('connection', (ws, req) => {
     pageMirror.setConnected(false);
   });
 
-  // Send welcome
-  ws.send(JSON.stringify({ type: 'connected', message: 'Hermes Browser Bridge proxy ready' }));
+  ws.send(JSON.stringify({ type: 'connected', message: 'Hermes Browser Bridge proxy ready (HTTPS)' }));
 });
 
-// Heartbeat: ping WS clients every 30s to detect dead connections
+// Heartbeat: ping WS clients every 30s
 const heartbeat = setInterval(() => {
   wss.clients.forEach((ws) => {
     if (!ws.isAlive) { ws.terminate(); return; }
@@ -117,10 +132,9 @@ const heartbeat = setInterval(() => {
 
 wss.on('close', () => clearInterval(heartbeat));
 
-// Periodic prune of old completed commands (every 2 min)
+// Periodic prune of old completed commands
 const pruneInterval = setInterval(() => cmdQueue.prune(60000), 120000);
 
-// Broadcast to all connected extension clients
 function broadcastToExtension(msg) {
   const data = JSON.stringify(msg);
   wss.clients.forEach((client) => {
@@ -130,31 +144,29 @@ function broadcastToExtension(msg) {
   });
 }
 
-// ─── HTTP REST API ──────────────────────────────────────────────────────────
+// ─── HTTP REST API ─────────────────────────────────────────────────────────
 
 server.on('request', async (req, res) => {
-  const url = new URL(req.url, `http://${HOST}:${PORT}`);
+  const url = new URL(req.url, `https://${HOST}:${PORT}`);
   const path = url.pathname;
 
-  // CORS preflight
   if (req.method === 'OPTIONS') {
     jsonResponse(res, 204, {});
     return;
   }
 
-  // ── GET /health ──────────────────────────────────────────────────────────
   if (req.method === 'GET' && path === '/health') {
     jsonResponse(res, 200, {
       status: 'ok',
       uptime: Math.floor(process.uptime()),
       connected: pageMirror.connected,
       pendingCommands: cmdQueue.size,
-      wsClients: wss.clients.size
+      wsClients: wss.clients.size,
+      tls: true
     });
     return;
   }
 
-  // ── GET /page_state ──────────────────────────────────────────────────────
   if (req.method === 'GET' && path === '/page_state') {
     const state = pageMirror.getState();
     if (!pageMirror.connected) {
@@ -168,7 +180,6 @@ server.on('request', async (req, res) => {
     return;
   }
 
-  // ── POST /command ────────────────────────────────────────────────────────
   if (req.method === 'POST' && path === '/command') {
     let body;
     try { body = await parseBody(req); }
@@ -194,22 +205,19 @@ server.on('request', async (req, res) => {
     const cmdId = randomUUID();
     const cmd = { type, cmdId, selector, url: destUrl, x, y, text, script };
 
-    // FIX #1: await the promise — catch so unhandledRejections never reach the process
     cmdQueue.add(cmdId, cmd).then((result) => {
       console.log(`[CMD] ${cmdId} resolved:`, result.success ? 'OK' : result.error);
     }).catch((err) => {
-      // Already resolved in cmd_queue; this is a safety net
       console.warn(`[CMD] ${cmdId} caught: ${err.message}`);
     });
 
     broadcastToExtension(cmd);
-    console.log(`[HTTP] → Extension: ${type} (${cmdId})`);
+    console.log(`[HTTPS] → Extension: ${type} (${cmdId})`);
 
     jsonResponse(res, 202, { cmdId, status: 'pending', message: `Command queued. Poll GET /command/${cmdId}` });
     return;
   }
 
-  // ── GET /command/:cmdId ──────────────────────────────────────────────────
   const cmdMatch = path.match(/^\/command\/([^/]+)$/);
   if (req.method === 'GET' && cmdMatch) {
     const cmdId = cmdMatch[1];
@@ -222,36 +230,33 @@ server.on('request', async (req, res) => {
     return;
   }
 
-  // 404
-  jsonResponse(res, 404, { error: 'Not found. Available: GET /health, GET /page_state, POST /command, GET /command/:cmdId' });
+  jsonResponse(res, 404, { error: 'Not found.' });
 });
 
 // ─── Start ─────────────────────────────────────────────────────────────────
 
 server.listen(PORT, HOST, () => {
-  console.log('Hermes Browser Bridge proxy running');
-  console.log(`  HTTP REST: http://${HOST}:${PORT}`);
-  console.log(`  WebSocket: ws://${HOST}:${PORT}`);
+  console.log('Hermes Browser Bridge proxy running (HTTPS)');
+  console.log(`  HTTPS REST: https://${HOST}:${PORT}`);
+  console.log(`  WSS:       wss://${HOST}:${PORT}`);
   console.log('');
-  console.log('Waiting for extension to connect…');
+  console.log('⚠️  Using self-signed certificate — browser will show a warning.');
+  console.log('   Install ../certificates/ca.crt into Keychain to suppress it.');
   console.log('');
   console.log('Endpoints:');
-  console.log('  GET  /health          → proxy health');
-  console.log('  GET  /page_state      → current tab snapshot');
-  console.log('  POST /command         → send command to extension');
-  console.log('  GET  /command/:cmdId  → poll command result');
+  console.log('  GET  /health');
+  console.log('  GET  /page_state');
+  console.log('  POST /command');
+  console.log('  GET  /command/:cmdId');
 });
 
 server.on('error', (err) => {
   if (err.code === 'EADDRINUSE') {
     console.error(`ERROR: Port ${PORT} is already in use.`);
-    console.error('Stop the existing server or change PORT in server.js');
     process.exit(1);
   }
   throw err;
 });
-
-// ─── Graceful shutdown ─────────────────────────────────────────────────────
 
 process.on('SIGINT', () => {
   console.log('\nShutting down…');

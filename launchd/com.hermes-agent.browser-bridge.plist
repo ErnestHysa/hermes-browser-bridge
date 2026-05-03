@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Launchd label (must match filename before .plist) -->
+  <key>Label</key>
+  <string>com.hermes-agent.browser-bridge</string>
+
+  <!-- Program to run -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/node</string>
+    <string>/Users/ernest/Desktop/DEVPROJECTS/hermes-browser-bridge/proxy_server/server.js</string>
+  </array>
+
+  <!-- Run every login (not just once) -->
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- Auto-restart if it crashes -->
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- Start the proxy when the user logs in (after local network is available) -->
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>9</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+
+  <!-- Set the working directory -->
+  <key>WorkingDirectory</key>
+  <string>/Users/ernest/Desktop/DEVPROJECTS/hermes-browser-bridge/proxy_server</string>
+
+  <!-- stdout/stderr (logged to system log) -->
+  <key>StandardOutPath</key>
+  <string>/tmp/hermes-browser-bridge.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/hermes-browser-bridge.error.log</string>
+
+  <!--
+    Install:
+      cp launchd/com.hermes-agent.browser-bridge.plist ~/Library/LaunchAgents/
+      launchctl load ~/Library/LaunchAgents/com.hermes-agent.browser-bridge.plist
+
+    Uninstall:
+      launchctl unload ~/Library/LaunchAgents/com.hermes-agent.browser-bridge.plist
+      rm ~/Library/LaunchAgents/com.hermes-agent.browser-bridge.plist
+  -->
+</dict>
+</plist>

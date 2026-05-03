@@ -1,6 +1,8 @@
 /**
  * cmd_queue.js — Command queue with ack/error tracking
  * Tracks pending commands, resolves them on ack/error from extension.
+ * Fire-and-forget callers (server.js HTTP endpoint) get their promise
+ * caught so Node never emits unhandledRejection.
  */
 
 const { EventEmitter } = require('node:events');
@@ -10,14 +12,18 @@ const DEFAULT_TIMEOUT_MS = 30000;
 class CommandQueue extends EventEmitter {
   constructor(timeoutMs = DEFAULT_TIMEOUT_MS) {
     super();
-    this.pending = new Map(); // cmdId → { cmd, timer, resolve, reject }
-    this.completed = new Map(); // cmdId → { status, result, error, timestamp }
+    /** @type {Map<string, { cmd: object, timer: NodeJS.Timeout, resolve: function, reject: function }>} */
+    this.pending = new Map();
+    /** @type {Map<string, { status: string, result?: any, error?: string, timestamp: number }>} */
+    this.completed = new Map();
     this.timeoutMs = timeoutMs;
   }
 
   /**
    * Add a command to the queue. Returns a promise that resolves when
    * the extension acknowledges it (ack or error).
+   * Unhandled rejections are caught internally so the process never dies.
+   *
    * @param {string} cmdId
    * @param {object} cmd
    * @returns {Promise<{success: boolean, result?: any, error?: string}>}
@@ -32,7 +38,8 @@ class CommandQueue extends EventEmitter {
         const error = `Command ${cmdId} timed out after ${this.timeoutMs}ms`;
         this.completed.set(cmdId, { status: 'error', error, timestamp: Date.now() });
         this.emit('timeout', cmdId, cmd);
-        reject(new Error(error));
+        // Resolve (not reject) so the promise settles without unhandledRejection
+        resolve({ success: false, error });
       }, this.timeoutMs);
 
       this.pending.set(cmdId, { cmd, timer, resolve, reject });
@@ -67,6 +74,7 @@ class CommandQueue extends EventEmitter {
     clearTimeout(entry.timer);
     this.pending.delete(cmdId);
     this.completed.set(cmdId, { status: 'error', error, timestamp: Date.now() });
+    // Resolve (not reject) so the promise settles without unhandledRejection
     entry.resolve({ success: false, error });
     this.emit('error', cmdId, error);
   }
@@ -74,7 +82,7 @@ class CommandQueue extends EventEmitter {
   /**
    * Get the status of a command (including completed ones).
    * @param {string} cmdId
-   * @returns {{ status: 'pending'|'done'|'error', result?: any, error?: string }}
+   * @returns {{ status: 'pending'|'done'|'error'|'unknown', result?: any, error?: string }}
    */
   get(cmdId) {
     if (this.pending.has(cmdId)) {
@@ -88,8 +96,8 @@ class CommandQueue extends EventEmitter {
   }
 
   /**
-   * Clean up old completed entries (call periodically).
-   * @param {number} maxAgeMs
+   * Prune old completed entries older than maxAgeMs.
+   * @param {number} [maxAgeMs=60000]
    */
   prune(maxAgeMs = 60000) {
     const now = Date.now();
@@ -100,6 +108,7 @@ class CommandQueue extends EventEmitter {
     }
   }
 
+  /** Pending command count. */
   get size() {
     return this.pending.size;
   }

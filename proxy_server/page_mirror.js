@@ -3,8 +3,9 @@
  * Stores the latest DOM snapshot and mutation buffer from the extension.
  */
 
-const HTML_TTL_MS = 5000;   // Full HTML snapshot expires after 5s
-const MUTATION_TTL_MS = 30000; // Mutation buffer expires after 30s
+const HTML_TTL_MS = 5000;
+const MUTATION_TTL_MS = 30000;
+const MUTATION_BUFFER_MAX = 100;
 
 class PageMirror {
   constructor() {
@@ -16,6 +17,8 @@ class PageMirror {
     this.seq = 0; // snapshot sequence number
     this.connected = false;
     this.tabId = null;
+    /** @type {Array<{mutations: object[], url: string, ts: number}>} */
+    this._mutationBuffer = [];
   }
 
   /**
@@ -27,40 +30,38 @@ class PageMirror {
     this.title = title;
     this.html = html;
     this.lastHtmlUpdate = Date.now();
-    this.seq = seq || (this.seq + 1);
+    this.seq = seq ?? (this.seq + 1);
   }
 
   /**
-   * Add mutation data to the buffer.
-   * @param {{ mutations: object[] }} mutationData
+   * Add mutation data to the ring buffer.
+   * Mutations are stored with a timestamp so stale ones can be filtered out.
+   * @param {{ mutations: object[], url: string }} mutationData
    */
-  addMutations(mutationData) {
+  addMutations({ mutations, url }) {
     this.lastMutationUpdate = Date.now();
-    // Mutations are stored in a ring buffer (last 100)
-    if (!this._mutationBuffer) this._mutationBuffer = [];
-    this._mutationBuffer.push({ ...mutationData, ts: Date.now() });
-    if (this._mutationBuffer.length > 100) {
+    this._mutationBuffer.push({ mutations, url, ts: Date.now() });
+    if (this._mutationBuffer.length > MUTATION_BUFFER_MAX) {
       this._mutationBuffer.shift();
     }
   }
 
   /**
    * Get the current page state for Hermes.
-   * Returns null if the data is stale (TTL expired).
-   * @returns {{ url: string, title: string, html: string, seq: number, connected: boolean, lastUpdate: number } | null}
+   * @returns {{ url: string, title: string, html: string, seq: number, connected: boolean, tabId: (string|null), lastUpdate: number, mutations: object[] }}
    */
   getState() {
     const now = Date.now();
     const htmlFresh = (now - this.lastHtmlUpdate) < HTML_TTL_MS;
-    const connected = this.connected;
 
-    // Always return state — html freshness is caller's choice
     return {
       url: this.url,
       title: this.title,
+      // Return empty html if stale so Hermes knows data is outdated
       html: htmlFresh ? this.html : '',
+      htmlStale: !htmlFresh,
       seq: this.seq,
-      connected,
+      connected: this.connected,
       tabId: this.tabId,
       lastUpdate: this.lastHtmlUpdate,
       mutations: this.getMutations()
@@ -68,25 +69,34 @@ class PageMirror {
   }
 
   /**
-   * Get recent mutations (not yet stale).
+   * Get recent mutations that are not yet stale.
    * @returns {object[]}
    */
   getMutations() {
     const now = Date.now();
-    if (!this._mutationBuffer) return [];
     return this._mutationBuffer
       .filter(m => (now - m.ts) < MUTATION_TTL_MS)
-      .map(m => ({ type: m.type, mutations: m.mutations, url: m.url, ts: m.ts }));
+      .map(m => ({ mutations: m.mutations, url: m.url, ts: m.ts }));
   }
 
+  /**
+   * Update connection state.
+   * @param {boolean} connected
+   * @param {string|null} [tabId]
+   */
   setConnected(connected, tabId = null) {
     this.connected = connected;
     this.tabId = tabId;
+    if (!connected) {
+      this.tabId = null;
+    }
   }
 
+  /**
+   * @returns {boolean}
+   */
   isFresh() {
-    const now = Date.now();
-    return (now - this.lastHtmlUpdate) < HTML_TTL_MS;
+    return (Date.now() - this.lastHtmlUpdate) < HTML_TTL_MS;
   }
 }
 

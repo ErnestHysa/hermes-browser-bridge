@@ -31,8 +31,7 @@
     }
   },
   "permissions": [
-    "activeTab",
-    "nativeMessaging"
+    "activeTab"
   ],
   "host_permissions": [
     "<all_urls>"

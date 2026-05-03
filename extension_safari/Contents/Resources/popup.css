@@ -1,3 +1,21 @@
+/* FIX #21: use CSS custom properties for all colors — easy theming */
+:root {
+  --bg-primary: #1e1e2e;
+  --bg-secondary: #313244;
+  --bg-tertiary: #45475a;
+  --text-primary: #cdd6f4;
+  --text-secondary: #a6adc8;
+  --text-muted: #6c7086;
+  --accent-blue: #89b4fa;
+  --accent-green: #a6e3a1;
+  --accent-red: #f38ba8;
+  --accent-yellow: #f9e2af;
+  --border-color: #313244;
+  --badge-connected: #34C759;
+  --badge-connecting: #FFCC00;
+  --badge-disconnected: #8E8E93;
+}
+
 * {
   box-sizing: border-box;
   margin: 0;
@@ -7,8 +25,8 @@
 body {
   width: 320px;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  background: #1e1e2e;
-  color: #cdd6f4;
+  background: var(--bg-primary);
+  color: var(--text-primary);
 }
 
 .container {
@@ -23,7 +41,7 @@ header {
   align-items: center;
   gap: 10px;
   padding-bottom: 8px;
-  border-bottom: 1px solid #313244;
+  border-bottom: 1px solid var(--border-color);
 }
 
 .logo {
@@ -34,11 +52,11 @@ header {
 .title {
   font-size: 15px;
   font-weight: 600;
-  color: #cdd6f4;
+  color: var(--text-primary);
 }
 
 .panel {
-  background: #313244;
+  background: var(--bg-secondary);
   border-radius: 8px;
   padding: 12px;
 }
@@ -59,7 +77,7 @@ header {
 .url-row {
   margin-top: 6px;
   font-size: 11px;
-  color: #a6adc8;
+  color: var(--text-secondary);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -67,14 +85,13 @@ header {
 }
 
 .error {
-  background: #f38ba8;
-  color: #1e1e2e;
+  background: var(--accent-red);
+  color: var(--bg-primary);
   font-size: 12px;
 }
 
 .error.hidden,
-.btn.hidden,
-.info.hidden {
+.btn.hidden {
   display: none;
 }
 
@@ -86,7 +103,7 @@ header {
   font-size: 14px;
   font-weight: 600;
   cursor: pointer;
-  transition: opacity 0.2s, background 0.2s;
+  transition: opacity 0.2s, background 0.2s, box-shadow 0.2s;
 }
 
 .btn:hover {
@@ -97,20 +114,28 @@ header {
   opacity: 0.7;
 }
 
+/* FIX #25: visual disabled state for connecting button */
+.btn.disabled,
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  box-shadow: none;
+}
+
 .btn.primary {
-  background: #89b4fa;
-  color: #1e1e2e;
+  background: var(--accent-blue);
+  color: var(--bg-primary);
 }
 
 .btn.secondary {
-  background: #313244;
-  color: #cdd6f4;
-  border: 1px solid #45475a;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  border: 1px solid var(--bg-tertiary);
 }
 
 .info {
   font-size: 11px;
-  color: #6c7086;
+  color: var(--text-muted);
   text-align: center;
   line-height: 1.4;
 }
@@ -120,23 +145,23 @@ header {
   justify-content: center;
   gap: 6px;
   font-size: 10px;
-  color: #45475a;
+  color: var(--bg-tertiary);
   padding-top: 4px;
 }
 
-/* State classes */
+/* State classes for status dot */
 .status-dot.connected {
-  color: #a6e3a1;
+  color: var(--accent-green);
 }
 
 .status-dot.disconnected {
-  color: #f38ba8;
+  color: var(--accent-red);
 }
 
 .status-dot.connecting {
-  color: #f9e2af;
+  color: var(--accent-yellow);
 }
 
 .url-row.active {
-  color: #a6e3a1;
+  color: var(--accent-green);
 }
