@@ -33,26 +33,40 @@ The **Develop** menu now appears in your menu bar.
 
 ---
 
-## Step 2: Generate Extension Icons
+## Step 2: Compile the Native Extension Handler
 
-The extension needs PNG icon files. Generate them:
+The Safari extension requires a native binary (`SafariWebExtensionHandler`) to bridge JavaScript and Safari.
+
+```bash
+cd ~/Desktop/DEVPROJECTS/mmorgp_browser_bridge
+swiftc \
+  -target arm64-apple-macosx15.0 \
+  -sdk $(xcrun --sdk macosx --show-sdk-path) \
+  extension_safari/Contents/MacOS/SafariWebExtensionHandler.swift \
+  -o extension_safari/Contents/MacOS/SafariWebExtensionHandler
+```
+
+Expected: **no output** (success). A warning about unused `profile` is harmless.
+
+If you see `error: cannot find 'SafariServices'` — run:
+```bash
+xcode-select --install
+```
+
+---
+
+## Step 3: Generate Extension Icons (optional — already done)
+
+Icons are pre-generated. To regenerate:
 
 ```bash
 cd ~/Desktop/DEVPROJECTS/mmorgp_browser_bridge/extension_safari/Contents/Resources/images
 node generate_icons.js
 ```
 
-Expected output:
-```
-Created icon-16.png (243 bytes)
-Created icon-48.png (945 bytes)
-Created icon-96.png (1739 bytes)
-Created icon-128.png (2864 bytes)
-```
-
 ---
 
-## Step 3: Load the Safari Extension
+## Step 4: Load the Safari Extension
 
 macOS Safari allows loading unpacked Web Extensions directly from the filesystem. No App Store, no bundling.
 
@@ -84,7 +98,7 @@ If you see "Failed to load" — Developer mode is not enabled. Repeat Step 1.
 
 ---
 
-## Step 4: Start the Proxy Server
+## Step 5: Start the Proxy Server
 
 Open a Terminal window and run:
 
@@ -112,7 +126,7 @@ node server.js
 
 ---
 
-## Step 5: Activate the Extension in Safari
+## Step 6: Activate the Extension in Safari
 
 ```
 1. Browse to any website in Safari (e.g. https://sonniss.com)
@@ -126,7 +140,7 @@ The extension is now streaming your tab to the proxy server.
 
 ---
 
-## Step 6: Test the Proxy API
+## Step 7: Test the Proxy API
 
 Open a second Terminal window (proxy keeps running in the first):
 
@@ -163,7 +177,7 @@ curl http://localhost:9321/command/<cmdId>
 
 ---
 
-## Step 7: Done — Use with Hermes Agent
+## Step 8: Done — Use with Hermes Agent
 
 Once running, just tell me: "Read my Safari tab" or "click the login button" or "scroll down on my current page." I will query the proxy automatically.
 
@@ -216,7 +230,7 @@ WebSocket cannot reach the proxy:
 | Start proxy | `node ~/Desktop/DEVPROJECTS/mmorgp_browser_bridge/proxy_server/server.js` |
 | Stop proxy | Ctrl+C in the proxy Terminal |
 | Health | `curl http://localhost:9321/health` |
-| Page state | `curl http://localhost:9321/health` |
+| Page state | `curl http://localhost:9321/page_state` |
 | Kill port | `lsof -ti :9321 \| xargs kill -9` |
 
 ---
