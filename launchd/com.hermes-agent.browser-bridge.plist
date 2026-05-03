@@ -13,9 +13,13 @@
     <string>/Users/ernest/Desktop/DEVPROJECTS/hermes-browser-bridge/proxy_server/server.js</string>
   </array>
 
-  <!-- Run every login (not just once) -->
+  <!--
+    Fix #7: Set to false — start manually via launchctl.
+    User enables/disables via: launchctl enable/disable.
+    Set to true only if you want the proxy running on every login automatically.
+  -->
   <key>RunAtLoad</key>
-  <true/>
+  <false/>
 
   <!-- Auto-restart if it crashes — KeepAlive alone, no StartCalendarInterval conflict -->
   <key>KeepAlive</key>

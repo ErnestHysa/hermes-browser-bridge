@@ -9,13 +9,19 @@
 <body>
   <div class="container">
     <header>
-      <div class="logo">🔷</div>
+      <div class="logo">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <rect width="24" height="24" rx="5" fill="#89b4fa"/>
+          <path d="M7 12h10M12 7v10" stroke="#1e1e2e" stroke-width="2" stroke-linecap="round"/>
+        </svg>
+      </div>
       <div class="title">Hermes Browser Bridge</div>
     </header>
 
     <div id="status-panel" class="panel">
       <div class="status-row">
-        <span class="status-dot" id="status-dot">⚫</span>
+        <!-- Fix #17: CSS-only status dot (no emoji) -->
+        <span class="status-dot" id="status-dot"></span>
         <span id="status-text">Inactive</span>
       </div>
       <div class="url-row" id="url-display">No tab active</div>
@@ -25,12 +31,26 @@
       <span id="error-text"></span>
     </div>
 
+    <!-- Fix #13: command log panel -->
+    <div id="cmd-log-panel" class="panel cmd-log hidden">
+      <div class="cmd-log-header">
+        <span>Recent commands</span>
+        <span id="cmd-count">0</span>
+      </div>
+      <ul id="cmd-log-list"></ul>
+    </div>
+
     <button id="activate-btn" class="btn primary">
       Activate Tab
     </button>
 
     <button id="disconnect-btn" class="btn secondary hidden">
       Disconnect
+    </button>
+
+    <!-- Fix #12: manual refresh button -->
+    <button id="refresh-btn" class="btn secondary hidden">
+      Refresh Snapshot
     </button>
 
     <div class="info">

@@ -1,4 +1,4 @@
-# Hermes Browser Bridge — Setup Guide v1.2.0
+# Hermes Browser Bridge — Setup Guide v1.3.0
 
 **For macOS (Apple Silicon/Intel) · Safari · Node.js v18+**
 
@@ -93,7 +93,7 @@ macOS Safari allows loading unpacked Web Extensions directly from the filesystem
 If you see "Failed to load" — Developer mode is not enabled. Repeat Step 1.
 
 **Verify the extension loaded:**
-- Look for the 🔷 icon in Safari's toolbar (right side of address bar)
+- Look for the Hermes Browser Bridge icon in Safari's toolbar (right side of the address bar)
 - If no icon: right-click the address bar → Customize Control Strip → drag "Hermes Browser Bridge" to visible area
 
 ---
@@ -171,8 +171,8 @@ node server.js
 ## Step 8: Activate the Extension in Safari
 
 ```
-1. Browse to any website in Safari (e.g. https://sonniss.com)
-2. Click the 🔷 Hermes Browser Bridge icon in the toolbar
+1. Browse to any website in Safari (e.g. https://example.com)
+2. Click the Hermes Browser Bridge icon in the toolbar
 3. Click "Activate Tab"
 4. Status changes to "Connected" (green dot)
 5. Current tab URL appears in the popup

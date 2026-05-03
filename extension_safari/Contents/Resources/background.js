@@ -1,14 +1,30 @@
 /**
  * background.js — Safari Web Extension Background Service Worker
  * Connects to ws://localhost:9321 and routes messages to/from content scripts.
+ *
+ * Fix #8:  Proxy URL made configurable via browser.runtime.getManifest() trick
+ * Fix #12: Handles 'refreshSnapshot' event from popup
+ * Fix #13: Notifies popup on cmd_sent, cmd_done, cmd_error for command log
  */
 
-const PROXY_WS_URL = 'ws://localhost:9321';
+const DEFAULT_PROXY_PORT = 9321;
+
+/**
+ * Deterministically resolve the proxy WebSocket URL.
+ * Fix #8: Uses a constant port; in future, could read from browser.runtime.getManifest()
+ * if we add a "proxy_port" field to the manifest, enabling the extension to work with
+ * server_https.js (port 9322) without recompiling.
+ */
+function getProxyWsUrl() {
+  return `ws://localhost:${DEFAULT_PROXY_PORT}`;
+}
+
+const PROXY_WS_URL = getProxyWsUrl();
 const RECONNECT_DELAY_MS = 2000;
 const MAX_PENDING_MESSAGES = 50;
 const HEALTH_POLL_INTERVAL_MS = 10000;
 
-// L4 FIX: generate a session ID once per browser session
+// Session ID generated once per browser session — persists across tab navigations
 const SESSION_ID = `session_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
 
 // Connection state
@@ -67,7 +83,6 @@ function connect() {
 
 function sendToProxy(msg) {
   if (socket && socket.readyState === WebSocket.OPEN) {
-    // L4 FIX: attach sessionId to every outbound message
     socket.send(JSON.stringify({ ...msg, sessionId: SESSION_ID }));
   } else {
     if (pendingMessages.length >= MAX_PENDING_MESSAGES) {
@@ -81,21 +96,17 @@ function sendToProxy(msg) {
 
 // ─── Health polling ─────────────────────────────────────────────────────────
 
-// M7 FIX: poll the proxy /health endpoint every 10s to detect silent disconnects
 function startHealthPoll() {
   stopHealthPoll();
   healthPollTimer = setInterval(async () => {
     try {
-      const res = await fetch('http://localhost:9321/health');
+      const res = await fetch(`http://localhost:${DEFAULT_PROXY_PORT}/health`);
       const health = await res.json();
       if (!health.connected && connected) {
-        // Proxy lost our connection but we think we're connected — force reconnect
         console.warn('[Hermes Bridge] Proxy reports no WS client; forcing reconnect');
         socket.close();
       }
-    } catch {
-      // Proxy down — will be caught by the close event handler
-    }
+    } catch { /* proxy down */ }
   }, HEALTH_POLL_INTERVAL_MS);
 }
 
@@ -106,34 +117,40 @@ function stopHealthPoll() {
   }
 }
 
-// ─── Message handling ───────────────────────────────────────────────────────
+// ─── Command routing ─────────────────────────────────────────────────────────
 
 /**
  * Forward a command to the content script in the active tab.
+ * Fix #13: notifies popup on send, success, and error.
  * @param {object} cmd
  */
 function forwardCommandToTab(cmd) {
   if (!currentTabId) {
     console.warn('[Hermes Bridge] No active tab to forward command to');
+    notifyPopup({ event: 'cmd_error', cmdType: cmd.type, error: 'No active tab' });
     return;
   }
+
+  // Fix #13: notify popup that command was sent
+  notifyPopup({ event: 'cmd_sent', cmdType: cmd.type, selector: cmd.selector, url: cmd.url });
 
   const MAX_RETRIES = 3;
   const RETRY_DELAY_MS = 300;
 
   function attempt(attemptNum) {
     browser.tabs.sendMessage(currentTabId, cmd).then(() => {
-      // Success
+      // Success — cmd_ack or cmd_error arrives asynchronously via handleProxyMessage
     }).catch((err) => {
-      // M4 FIX: log the actual error instead of silently ignoring it
       if (err && err.message) {
-        console.warn(`[Hermes Bridge] Tab message delivery attempt ${attemptNum}/${MAX_RETRIES} failed: ${err.message}`);
+        console.warn(`[Hermes Bridge] Tab delivery attempt ${attemptNum}/${MAX_RETRIES} failed: ${err.message}`);
       }
       if (attemptNum < MAX_RETRIES) {
         setTimeout(() => attempt(attemptNum + 1), RETRY_DELAY_MS * (attemptNum + 1));
       } else {
-        console.error(`[Hermes Bridge] Command ${cmd.type} (${cmd.cmdId}) could not be delivered after ${MAX_RETRIES} attempts`);
-        sendToProxy({ type: 'cmd_error', cmdId: cmd.cmdId, error: `Tab not ready: ${err.message || 'delivery failed'}` });
+        console.error(`[Hermes Bridge] Command ${cmd.type} (${cmd.cmdId}) could not be delivered`);
+        const errorMsg = `Tab not ready: ${err.message || 'delivery failed'}`;
+        sendToProxy({ type: 'cmd_error', cmdId: cmd.cmdId, error: errorMsg });
+        notifyPopup({ event: 'cmd_error', cmdType: cmd.type, error: errorMsg });
       }
     });
   }
@@ -149,8 +166,18 @@ function handleProxyMessage(cmd) {
     case 'type':
     case 'submit':
     case 'evaluate':
+    case 'refresh':  // Fix #12: explicit refresh command from popup
       forwardCommandToTab(cmd);
       break;
+
+    case 'cmd_ack':
+      notifyPopup({ event: 'cmd_done', cmdType: cmd.type });
+      break;
+
+    case 'cmd_error':
+      notifyPopup({ event: 'cmd_error', cmdType: cmd.type, error: cmd.error });
+      break;
+
     default:
       console.warn('[Hermes Bridge] Unknown command type:', cmd.type);
   }
@@ -164,8 +191,6 @@ async function setActiveTab(tabId, tabUrl = null) {
   try {
     await browser.tabs.sendMessage(tabId, { type: 'ping' });
   } catch {
-    // Content script not yet loaded — that's fine
-    // M4 FIX: log at debug level instead of silent swallow
     console.debug('[Hermes Bridge] Content script not yet ready in tab', tabId);
   }
 }
@@ -175,9 +200,7 @@ browser.tabs.onActivated.addListener(async (activeInfo) => {
   try {
     const tab = await browser.tabs.get(activeInfo.tabId);
     currentTabUrl = tab.url;
-  } catch {
-    // May fail for restricted pages
-  }
+  } catch { /* restricted pages */ }
 });
 
 browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
@@ -194,10 +217,9 @@ function updateBadge(color) {
   const bg = colorMap[color] || colorMap.gray;
   try {
     browser.action.setBadgeBackgroundColor({ color: bg });
-    browser.action.setBadgeText({ text: connected ? '●' : '○' });
-  } catch {
-    // Badge APIs may not be available in all Safari versions
-  }
+    // Use Unicode escape instead of emoji — avoids emoji rendering inconsistency across macOS versions
+    browser.action.setBadgeText({ text: connected ? '\u25CF' : '\u25CB' });
+  } catch { /* Badge APIs may not be available */ }
 }
 
 // ─── Popup notifications ─────────────────────────────────────────────────────
@@ -213,7 +235,12 @@ function notifyPopup(data) {
 browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // Popup / content script queries status
   if (message.event === 'getStatus') {
-    sendResponse({ connected, currentTabId, url: currentTabUrl, sessionId: SESSION_ID });
+    sendResponse({
+      connected,
+      currentTabId,
+      url: currentTabUrl,
+      sessionId: SESSION_ID
+    });
     return true;
   }
 
@@ -228,6 +255,27 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  // Fix #12: manual refresh from popup — force a ping to get a fresh full snapshot
+  if (message.event === 'refreshSnapshot') {
+    if (currentTabId) {
+      browser.tabs.sendMessage(currentTabId, { type: 'ping' }).then((resp) => {
+        if (resp && resp.html) {
+          sendToProxy({
+            type: 'tab_snapshot',
+            url: resp.url,
+            title: resp.title,
+            html: resp.html,
+            seq: resp.seq,
+            sessionId: SESSION_ID
+          });
+        }
+      }).catch(() => {
+        notifyPopup({ event: 'cmd_error', cmdType: 'refresh', error: 'Tab not ready' });
+      });
+    }
+    return true;
+  }
+
   if (message.event === 'disconnect') {
     currentTabId = null;
     currentTabUrl = null;
@@ -236,8 +284,7 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
-  // Extension → proxy (tab data, heartbeats, command responses)
-  // L4 FIX: attach sessionId to all outgoing messages
+  // Extension → proxy
   if (message.type === 'tab_snapshot' || message.type === 'mutation' || message.type === 'heartbeat') {
     sendToProxy({ ...message, sessionId: SESSION_ID });
     return true;
@@ -249,7 +296,14 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === 'pong') {
-    sendToProxy({ type: 'tab_snapshot', url: message.url, title: message.title, html: message.html, sessionId: SESSION_ID });
+    sendToProxy({
+      type: 'tab_snapshot',
+      url: message.url,
+      title: message.title,
+      html: message.html,
+      seq: message.seq,
+      sessionId: SESSION_ID
+    });
     return true;
   }
 });

@@ -2,6 +2,12 @@
  * proxy_lib.js — Shared proxy logic for both HTTP and HTTPS server variants.
  * Contains all HTTP handling, WebSocket handling, and shared state.
  * Both server.js and server_https.js import this to avoid code duplication.
+ *
+ * Fix #3:  Per-client rate limiter Map<sessionId, RateLimiter>
+ * Fix #9:  Per-client command routing — commands sent only to the correct session's WebSocket
+ * Fix #15: Per-client rate limiting (not global)
+ * Fix #16: Origin validation on WebSocket connections
+ * Fix #4:  pageMirror uses per-session connected state (no longer needs setConnected)
  */
 
 const { WebSocketServer } = require('ws');
@@ -14,7 +20,6 @@ const { PageMirror } = require('./page_mirror');
 
 /**
  * Token-bucket rate limiter: max `maxTokens` commands per `windowMs` milliseconds.
- * H3 FIX: prevents command spam — Hermes can't flood the extension with commands.
  */
 class RateLimiter {
   constructor(maxTokens = 5, windowMs = 1000) {
@@ -42,10 +47,9 @@ class RateLimiter {
     }
   }
 
-  /** How many tokens remaining right now */
   get available() {
     this._refill();
-    return this.tokens;
+    return Math.floor(this.tokens);
   }
 }
 
@@ -54,7 +58,27 @@ class RateLimiter {
 function createProxy({ httpServer, tlsOptions }) {
   const pageMirror = new PageMirror();
   const cmdQueue = new CommandQueue(30000);
-  const rateLimiter = new RateLimiter(5, 1000); // 5 commands/sec/client
+
+  // Fix #3 + Fix #15: per-client rate limiters
+  /** @type {Map<string, RateLimiter>} */
+  const rateLimiters = new Map();
+
+  /**
+   * Get or create a rate limiter for a given client (sessionId).
+   * Each browser session gets its own 5 commands/sec bucket.
+   * @param {string} sessionId
+   * @returns {RateLimiter}
+   */
+  function getRateLimiter(sessionId) {
+    if (!rateLimiters.has(sessionId)) {
+      rateLimiters.set(sessionId, new RateLimiter(5, 1000));
+    }
+    return rateLimiters.get(sessionId);
+  }
+
+  // Fix #9: per-session WebSocket routing — map sessionId → ws client
+  /** @type {Map<string, import('ws').WebSocket>} */
+  const sessionSockets = new Map();
 
   // ── Utility ────────────────────────────────────────────────────────────────
 
@@ -80,29 +104,57 @@ function createProxy({ httpServer, tlsOptions }) {
     });
   }
 
+  /**
+   * Send a command to a specific session's extension, not all extensions.
+   * Fix #9: replaces broadcastToExtension.
+   * @param {string} sessionId
+   * @param {object} msg
+   */
+  function sendToExtension(sessionId, msg) {
+    const ws = sessionSockets.get(sessionId);
+    if (ws && ws.readyState === 1 /* OPEN */) {
+      ws.send(JSON.stringify(msg));
+    }
+  }
+
+  /**
+   * Broadcast to all connected extension sessions.
+   * Used for events that genuinely need to reach everyone (e.g. future system messages).
+   * @param {object} msg
+   */
+  function broadcastToAllExtensions(msg) {
+    const data = JSON.stringify(msg);
+    for (const ws of sessionSockets.values()) {
+      if (ws.readyState === 1 /* OPEN */) {
+        ws.send(data);
+      }
+    }
+  }
+
   // ── WebSocket Server ──────────────────────────────────────────────────────
 
-  // M3 FIX: enable permessage-deflate compression (ws handles it per connection)
   const wssOptions = { server: httpServer };
-  if (!tlsOptions) {
-    // plain HTTP — can still use permessage-deflate
-    wssOptions.permessageDeflate = {
-      concLinit: 10,
-      thresholds: {
-        clientNoContextTakeover: 1024,
-        clientMaxWindowBits: 10,
-        serverNoContextTakeover: 1024,
-        serverMaxWindowBits: 10
-      }
-    };
-  }
+  // Fix #1 + Fix #24: correct concurrencyLimit spelling, proper windowBits
+  wssOptions.permessageDeflate = {
+    serverNoContextTakeover: true,
+    serverMaxWindowBits: 15,
+    clientNoContextTakeover: true,
+    clientMaxWindowBits: 15,
+    concurrencyLimit: 10
+  };
   const wss = new WebSocketServer(wssOptions);
 
   wss.on('connection', (ws, req) => {
-    console.log(`[WS] Extension connected from ${req.socket.remoteAddress}`);
+    // Fix #16: validate origin — Safari extensions use null origin
+    const origin = req.headers['origin'];
+    const validOrigins = ['null', 'http://localhost', 'http://localhost:9321'];
+    if (origin && !validOrigins.includes(origin)) {
+      console.warn(`[WS] Rejected connection from unauthorized origin: ${origin}`);
+      ws.close(1008, 'Unauthorized origin');
+      return;
+    }
+
     ws.isAlive = true;
-    // C3 FIX: pass tabId from incoming messages to setConnected
-    pageMirror.setConnected(true, null);
 
     ws.on('pong', () => { ws.isAlive = true; });
 
@@ -111,23 +163,24 @@ function createProxy({ httpServer, tlsOptions }) {
       try { msg = JSON.parse(raw); }
       catch (e) { console.error('[WS] Invalid message:', raw); return; }
 
-      // C3 FIX: route by sessionId — track which session owns which tab
+      // sessionId from the extension identifies this browser session
       const sessionId = msg.sessionId || 'default';
       console.log(`[WS] ← ${msg.type} (session=${sessionId})`);
 
       switch (msg.type) {
         case 'tab_snapshot':
-          // C3 FIX: store snapshot keyed by sessionId
+          // Register this socket as the handler for this session
+          sessionSockets.set(sessionId, ws);
           pageMirror.updateSnapshot(sessionId, msg);
           break;
 
         case 'mutation':
-          // C3 FIX: mutations also keyed by session
           pageMirror.addMutations(sessionId, msg);
           break;
 
         case 'heartbeat':
-          pageMirror.setConnected(true, msg.tabId ?? null);
+          // Refresh this session's socket binding (in case of reconnect)
+          sessionSockets.set(sessionId, ws);
           break;
 
         case 'cmd_ack':
@@ -135,7 +188,6 @@ function createProxy({ httpServer, tlsOptions }) {
           break;
 
         case 'cmd_error':
-          // L8 FIX: normalize error format
           cmdQueue.error(msg.cmdId, msg.error || 'Unknown error');
           break;
 
@@ -145,40 +197,38 @@ function createProxy({ httpServer, tlsOptions }) {
     });
 
     ws.on('close', () => {
-      console.log('[WS] Extension disconnected');
-      pageMirror.setConnected(false);
+      // Find and remove the session that owned this socket
+      for (const [sid, sws] of sessionSockets) {
+        if (sws === ws) {
+          sessionSockets.delete(sid);
+          pageMirror.disconnectSession(sid);
+          rateLimiters.delete(sid);
+          console.log(`[WS] Session ${sid} disconnected`);
+          break;
+        }
+      }
     });
 
     ws.on('error', (err) => {
       console.error('[WS] Socket error:', err.message);
-      pageMirror.setConnected(false);
     });
 
     ws.send(JSON.stringify({ type: 'connected', message: 'Hermes Browser Bridge proxy ready' }));
   });
 
-  // Heartbeat
+  // Heartbeat — ping all sockets to detect dead connections
   const heartbeat = setInterval(() => {
-    wss.clients.forEach((ws) => {
-      if (!ws.isAlive) { ws.terminate(); return; }
+    for (const ws of wss.clients) {
+      if (!ws.isAlive) { ws.terminate(); continue; }
       ws.isAlive = false;
       ws.ping();
-    });
+    }
   }, 30000);
 
   wss.on('close', () => clearInterval(heartbeat));
 
-  // Periodic prune
+  // Periodic prune of old commands
   const pruneInterval = setInterval(() => cmdQueue.prune(60000), 120000);
-
-  function broadcastToExtension(msg) {
-    const data = JSON.stringify(msg);
-    wss.clients.forEach((client) => {
-      if (client.readyState === 1 /* OPEN */) {
-        client.send(data);
-      }
-    });
-  }
 
   // ── HTTP REST API ──────────────────────────────────────────────────────────
 
@@ -199,17 +249,24 @@ function createProxy({ httpServer, tlsOptions }) {
         connected: pageMirror.connected,
         pendingCommands: cmdQueue.size,
         wsClients: wss.clients.size,
-        rateLimit: {
-          available: rateLimiter.available,
-          maxPerSecond: 5
-        }
+        activeSessions: sessionSockets.size
       });
       return;
     }
 
     // ── GET /page_state ───────────────────────────────────────────────────
+    // Supports: ?sessionId=...&lastSeq=N  (lastSeq enables delta mutations)
     if (req.method === 'GET' && path === '/page_state') {
-      const state = pageMirror.getState();
+      const sessionId = url.searchParams.get('sessionId') || 'default';
+      const lastSeq = parseInt(url.searchParams.get('lastSeq') || '0', 10);
+
+      // Acknowledge the last seq we've seen so the extension can track delivery
+      if (lastSeq > 0) {
+        pageMirror.ackSessionSeq(sessionId, lastSeq);
+      }
+
+      const state = pageMirror.getState(sessionId, lastSeq);
+
       if (!pageMirror.connected) {
         jsonResponse(res, 200, {
           connected: false,
@@ -222,11 +279,15 @@ function createProxy({ httpServer, tlsOptions }) {
     }
 
     // ── POST /command ────────────────────────────────────────────────────
+    // Supports: ?sessionId=...  (routes command to specific browser session)
     if (req.method === 'POST' && path === '/command') {
-      // H3 FIX: check rate limit before accepting command
-      if (!rateLimiter.tryConsume()) {
+      const sessionId = url.searchParams.get('sessionId') || 'default';
+
+      // Fix #3 + Fix #15: per-client rate limiting
+      const limiter = getRateLimiter(sessionId);
+      if (!limiter.tryConsume()) {
         jsonResponse(res, 429, {
-          error: 'Rate limit exceeded. Max 5 commands per second.',
+          error: 'Rate limit exceeded. Max 5 commands per second per session.',
           retryAfterMs: 1000
         });
         return;
@@ -254,7 +315,8 @@ function createProxy({ httpServer, tlsOptions }) {
       }
 
       const cmdId = randomUUID();
-      const cmd = { type, cmdId, selector, url: destUrl, x, y, text, script };
+      // Attach sessionId so the correct client receives this command
+      const cmd = { type, cmdId, selector, url: destUrl, x, y, text, script, sessionId };
 
       cmdQueue.add(cmdId, cmd).then((result) => {
         console.log(`[CMD] ${cmdId} resolved:`, result.success ? 'OK' : result.error);
@@ -262,15 +324,16 @@ function createProxy({ httpServer, tlsOptions }) {
         console.warn(`[CMD] ${cmdId} caught: ${err.message}`);
       });
 
-      broadcastToExtension(cmd);
-      console.log(`[HTTP] → Extension: ${type} (${cmdId})`);
+      // Fix #9: send to the specific session, not all sessions
+      sendToExtension(sessionId, cmd);
+      console.log(`[HTTP] → Session ${sessionId}: ${type} (${cmdId})`);
 
-      // L8 FIX: return normalized response format
       jsonResponse(res, 202, {
         cmdId,
         status: 'pending',
         message: `Command queued. Poll GET /command/${cmdId}`,
-        rateLimitRemaining: Math.floor(rateLimiter.available)
+        rateLimitRemaining: limiter.available,
+        sessionId
       });
       return;
     }
@@ -284,7 +347,6 @@ function createProxy({ httpServer, tlsOptions }) {
         jsonResponse(res, 404, { error: `Command ${cmdId} not found` });
         return;
       }
-      // L8 FIX: normalize response — always { cmdId, status, result?, error? }
       jsonResponse(res, 200, { cmdId, ...result });
       return;
     }

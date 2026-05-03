@@ -12,7 +12,7 @@ import os.log
  * This handler exists to satisfy the Safari Web Extension native messaging contract
  * and to provide browser-level information not accessible from JavaScript.
  *
- * Compiled: swiftc -target arm64-apple-macosx13.0 ...
+ * Compiled: swiftc -target arm64-apple-macosx15.0 ...
  * Deployment: macOS 13.0+ (Ventura and later)
  */
 

@@ -1,4 +1,4 @@
-/* FIX #21: use CSS custom properties for all colors — easy theming */
+/* Fix #17: CSS-only status indicators (no emoji) */
 :root {
   --bg-primary: #1e1e2e;
   --bg-secondary: #313244;
@@ -11,9 +11,6 @@
   --accent-red: #f38ba8;
   --accent-yellow: #f9e2af;
   --border-color: #313244;
-  --badge-connected: #34C759;
-  --badge-connecting: #FFCC00;
-  --badge-disconnected: #8E8E93;
 }
 
 * {
@@ -33,7 +30,7 @@ body {
   padding: 16px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 10px;
 }
 
 header {
@@ -45,7 +42,7 @@ header {
 }
 
 .logo {
-  font-size: 24px;
+  flex-shrink: 0;
   line-height: 1;
 }
 
@@ -69,9 +66,22 @@ header {
   font-weight: 500;
 }
 
+/* Fix #17: real CSS circles instead of emoji dots */
 .status-dot {
-  font-size: 12px;
-  transition: color 0.3s;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--accent-red);
+  transition: background 0.3s;
+}
+
+.status-dot.connected {
+  background: var(--accent-green);
+}
+
+.status-dot.connecting {
+  background: var(--accent-yellow);
 }
 
 .url-row {
@@ -84,6 +94,10 @@ header {
   max-width: 280px;
 }
 
+.url-row.active {
+  color: var(--accent-green);
+}
+
 .error {
   background: var(--accent-red);
   color: var(--bg-primary);
@@ -91,7 +105,8 @@ header {
 }
 
 .error.hidden,
-.btn.hidden {
+.btn.hidden,
+.cmd-log.hidden {
   display: none;
 }
 
@@ -103,23 +118,16 @@ header {
   font-size: 14px;
   font-weight: 600;
   cursor: pointer;
-  transition: opacity 0.2s, background 0.2s, box-shadow 0.2s;
+  transition: opacity 0.2s, background 0.2s;
 }
 
-.btn:hover {
-  opacity: 0.85;
-}
+.btn:hover { opacity: 0.85; }
+.btn:active { opacity: 0.7; }
 
-.btn:active {
-  opacity: 0.7;
-}
-
-/* FIX #25: visual disabled state for connecting button */
 .btn.disabled,
 .btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
-  box-shadow: none;
 }
 
 .btn.primary {
@@ -131,6 +139,10 @@ header {
   background: var(--bg-secondary);
   color: var(--text-primary);
   border: 1px solid var(--bg-tertiary);
+}
+
+.btn.secondary:hover {
+  background: var(--bg-tertiary);
 }
 
 .info {
@@ -149,19 +161,48 @@ header {
   padding-top: 4px;
 }
 
-/* State classes for status dot */
-.status-dot.connected {
+/* Fix #13: command log */
+.cmd-log {
+  padding: 8px 12px;
+}
+
+.cmd-log-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+
+.cmd-log-header span:last-child {
+  background: var(--bg-tertiary);
+  border-radius: 10px;
+  padding: 1px 7px;
+  font-size: 10px;
+}
+
+#cmd-log-list {
+  list-style: none;
+  max-height: 80px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+#cmd-log-list li {
+  font-size: 11px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#cmd-log-list li.success {
   color: var(--accent-green);
 }
 
-.status-dot.disconnected {
+#cmd-log-list li.error {
   color: var(--accent-red);
-}
-
-.status-dot.connecting {
-  color: var(--accent-yellow);
-}
-
-.url-row.active {
-  color: var(--accent-green);
 }

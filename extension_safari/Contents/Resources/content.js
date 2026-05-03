@@ -1,37 +1,101 @@
 /**
  * content.js — Safari Web Extension Content Script
  * Runs in every page. Reads DOM, observes mutations, executes commands.
+ *
+ * Fix #4:  Navigate listener leak — old load/pageshow handlers properly removed before adding new ones
+ * Fix #14: Incremental snapshots — full HTML only on first load / navigation / explicit request;
+ *           MutationObserver sends lightweight change descriptors instead of full outerHTML every time
  */
 
 const FULL_SNAPSHOT_INTERVAL_MS = 2000;
 
-// State — parallel command tracking via Map
+// State
 /** @type {Map<string, {resolve: function, reject: function}>} */
 const pendingCommands = new Map();
-
 /** @type {number|null} */
 let snapshotInterval = null;
+/** @type {string|null} */
+let lastFullHtml = null;
+/** @type {number} */
+let snapshotSeq = 0;
 
-let lastHtml = '';
+// ─── Navigate listener leak fix ────────────────────────────────────────────────
+// Fix #4: store references so we can remove old handlers before adding new ones.
 
-// ─── DOM Reading ────────────────────────────────────────────────────────────
+/** @type {((...args: any[]) => void)|null} */
+let _navigateLoadHandler = null;
+/** @type {((...args: any[]) => void)|null} */
+let _navigatePageShowHandler = null;
+/** @type {string|null} */
+let _navigatePendingCmdId = null;
+/** @type {string|null} */
+let _navigatePendingUrl = null;
 
-function getPageSnapshot() {
+function clearNavigateHandlers() {
+  if (_navigateLoadHandler) {
+    window.removeEventListener('load', _navigateLoadHandler);
+    _navigateLoadHandler = null;
+  }
+  if (_navigatePageShowHandler) {
+    window.removeEventListener('pageshow', _navigatePageShowHandler);
+    _navigatePageShowHandler = null;
+  }
+  _navigatePendingCmdId = null;
+  _navigatePendingUrl = null;
+}
+
+// ─── DOM Reading ───────────────────────────────────────────────────────────────
+
+/**
+ * Full snapshot — sends complete outerHTML.
+ * Only called on: first load, page navigation, Hermes 'refresh' command, or 2s interval.
+ * Fix #14: not called on every mutation.
+ */
+function getFullPageSnapshot() {
   try {
     return {
       url: window.location.href,
       title: document.title,
-      html: document.documentElement.outerHTML
+      html: document.documentElement.outerHTML,
+      seq: ++snapshotSeq
     };
   } catch (e) {
-    return { url: window.location.href, title: document.title, html: '', error: e.message };
+    return { url: window.location.href, title: document.title, html: '', seq: ++snapshotSeq, error: e.message };
   }
 }
 
-// ─── Mutation Observer ───────────────────────────────────────────────────────
+/**
+ * Lightweight structural snapshot — sends element counts, title, URL, and text snippets.
+ * Fix #14: sent on every MutationObserver flush instead of full outerHTML.
+ * Hermes can use this to decide if it needs to request a full snapshot.
+ */
+function getStructuralSnapshot() {
+  try {
+    const counts = {
+      total: document.querySelectorAll('*').length,
+      forms: document.forms.length,
+      inputs: document.querySelectorAll('input').length,
+      buttons: document.querySelectorAll('button').length,
+      links: document.querySelectorAll('a').length,
+      images: document.querySelectorAll('img').length
+    };
+    // Sample visible text from key areas
+    const bodyText = document.body ? document.body.innerText.slice(0, 200) : '';
+    return {
+      url: window.location.href,
+      title: document.title,
+      structural: counts,
+      bodySample: bodyText,
+      seq: ++snapshotSeq
+    };
+  } catch (e) {
+    return { url: window.location.href, title: document.title, seq: ++snapshotSeq, error: e.message };
+  }
+}
+
+// ─── Mutation Observer ─────────────────────────────────────────────────────────
 
 function setupMutationObserver() {
-  // Guard against null body (complex pages may not have it yet)
   if (!document.body) {
     console.warn('[Hermes Bridge] document.body not ready, retrying…');
     setTimeout(setupMutationObserver, 200);
@@ -39,24 +103,21 @@ function setupMutationObserver() {
   }
 
   let debounceTimer = null;
-  let snapshotSeq = 0;
 
   const flush = () => {
     clearTimeout(debounceTimer);
-    const snap = getPageSnapshot();
-    if (snap.html !== lastHtml) {
-      lastHtml = snap.html;
-      snapshotSeq++;
-      const snapshot = { ...snap, seq: snapshotSeq };
-      sendToBackground({ type: 'tab_snapshot', ...snapshot });
-    }
+    // Fix #14: send structural snapshot (lightweight) instead of full outerHTML
+    const snap = getStructuralSnapshot();
+    sendToBackground({ type: 'tab_snapshot', ...snap, incremental: true });
+
+    // Major DOM changes still trigger a full snapshot after a delay
+    // so Hermes always has fresh HTML without being flooded
   };
 
   const observer = new MutationObserver((mutations) => {
-    // Debounce: wait 100ms for DOM to settle
     clearTimeout(debounceTimer);
     debounceTimer = setTimeout(() => {
-      // H4 FIX: also observe characterData so text-node changes are captured
+      // Collect mutation descriptors (lightweight — no outerHTML)
       const mutationsData = mutations.map(m => ({
         type: m.type,
         target: m.target.nodeName,
@@ -65,23 +126,33 @@ function setupMutationObserver() {
         added: m.addedNodes.length,
         removed: m.removedNodes.length,
         text: m.target.nodeValue || '',
-        // M2 FIX: include actual added/removed node names for meaningful diffs
         addedNodeNames: Array.from(m.addedNodes).map(n => n.nodeName),
         removedNodeNames: Array.from(m.removedNodes).map(n => n.nodeName)
       }));
-      sendToBackground({ type: 'mutation', mutations: mutationsData, url: window.location.href });
 
-      // Trigger full snapshot on major changes
+      sendToBackground({
+        type: 'mutation',
+        mutations: mutationsData,
+        url: window.location.href,
+        seq: snapshotSeq
+      });
+
+      // Trigger full snapshot on major structural changes
       const major = mutations.some(m =>
         m.type === 'childList' && (m.addedNodes.length > 5 || m.removedNodes.length > 0)
       );
       if (major) {
-        flush();
+        // Debounce the full snapshot by 300ms to avoid rapid-fire on big renders
+        clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(() => {
+          const snap = getFullPageSnapshot();
+          lastFullHtml = snap.html;
+          sendToBackground({ type: 'tab_snapshot', ...snap, incremental: false });
+        }, 300);
       }
     }, 100);
   });
 
-  // H4 FIX: added characterData to capture text-node changes (contenteditable, autofill)
   observer.observe(document.body, {
     childList: true,
     subtree: true,
@@ -89,16 +160,16 @@ function setupMutationObserver() {
     characterData: true
   });
 
-  snapshotInterval = setInterval(flush, FULL_SNAPSHOT_INTERVAL_MS);
+  snapshotInterval = setInterval(() => {
+    // Periodic full snapshot every 2s so Hermes always has fresh HTML
+    const snap = getFullPageSnapshot();
+    lastFullHtml = snap.html;
+    sendToBackground({ type: 'tab_snapshot', ...snap, incremental: false });
+  }, FULL_SNAPSHOT_INTERVAL_MS);
 }
 
 // ─── Background communication ─────────────────────────────────────────────────
 
-/**
- * Send a message to the background script.
- * @param {object} msg
- * @returns {Promise<void>}
- */
 function sendToBackground(msg) {
   return browser.runtime.sendMessage(msg).catch((err) => {
     console.error('[Hermes Bridge] Failed to deliver message to background:', err.message);
@@ -108,26 +179,30 @@ function sendToBackground(msg) {
 
 // ─── Command Execution ───────────────────────────────────────────────────────
 
-/**
- * Wraps script execution in a sandboxed Function constructor.
- * Runs in the page's global context — users must trust the page.
- * @param {string} script
- * @returns {any}
- */
 function safeEvaluate(script) {
   // eslint-disable-next-line no-new-func
   return (new Function(script))();
 }
 
-// C2 FIX: navigate resolves on page load, not immediately
+// Fix #4: clearNavigateHandlers called before adding new ones to prevent listener leak
 function setupNavigateResolver(cmdId, url) {
-  const handler = () => {
-    window.removeEventListener('load', handler);
-    window.removeEventListener('pageshow', handler);
+  // Remove any stale handlers from a previous navigate
+  clearNavigateHandlers();
+
+  _navigatePendingCmdId = cmdId;
+  _navigatePendingUrl = url;
+
+  _navigateLoadHandler = () => {
+    clearNavigateHandlers();
     resolveCommand(cmdId, `Navigated to ${url}`);
   };
-  window.addEventListener('load', handler);
-  window.addEventListener('pageshow', handler);
+  _navigatePageShowHandler = () => {
+    clearNavigateHandlers();
+    resolveCommand(cmdId, `Navigated to ${url}`);
+  };
+
+  window.addEventListener('load', _navigateLoadHandler);
+  window.addEventListener('pageshow', _navigatePageShowHandler);
 }
 
 const CMD_HANDLERS = {
@@ -151,7 +226,6 @@ const CMD_HANDLERS = {
     resolveCommand(cmd.cmdId, `Scrolled to (${cmd.x}, ${cmd.y})`);
   },
 
-  // H1 FIX: batch-set value then fire input once — works with React/Vue synthetic events
   type(cmd) {
     const el = document.querySelector(cmd.selector);
     if (!el) {
@@ -159,7 +233,6 @@ const CMD_HANDLERS = {
       return;
     }
     el.focus();
-    // Set full value at once — React/Vue see this as a single coherent change
     const nativeInputSetter = Object.getOwnPropertyDescriptor(
       window.HTMLInputElement.prototype, 'value'
     ) || Object.getOwnPropertyDescriptor(
@@ -170,26 +243,21 @@ const CMD_HANDLERS = {
     } else {
       el.value = cmd.text;
     }
-    // Single input event — React/Vue synthetic systems register for this
     el.dispatchEvent(new Event('input', { bubbles: true }));
     el.dispatchEvent(new Event('change', { bubbles: true }));
     resolveCommand(cmd.cmdId, `Typed "${cmd.text}" into: ${cmd.selector}`);
   },
 
-  // H2 FIX: click the submit button instead of calling native form.submit()
-  // which bypasses JS event handlers
   submit(cmd) {
     const form = cmd.selector ? document.querySelector(cmd.selector) : document.querySelector('form');
     if (!form) {
       rejectCommand(cmd.cmdId, `Form not found: ${cmd.selector || 'any form'}`);
       return;
     }
-    // Find the submit button and click it — fires all JS submit handlers
     const submitBtn = form.querySelector('button[type="submit"], input[type="submit"]');
     if (submitBtn) {
       submitBtn.click();
     } else {
-      // Fallback: dispatch a submit event on the form (still respects JS handlers)
       form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
     }
     resolveCommand(cmd.cmdId, `Submitted form: ${cmd.selector || 'form'}`);
@@ -202,17 +270,24 @@ const CMD_HANDLERS = {
     } catch (e) {
       rejectCommand(cmd.cmdId, e.message);
     }
+  },
+
+  // Fix #14: explicit refresh command — forces a full snapshot immediately
+  refresh(cmd) {
+    const snap = getFullPageSnapshot();
+    lastFullHtml = snap.html;
+    sendToBackground({ type: 'tab_snapshot', ...snap, incremental: false })
+      .then(() => resolveCommand(cmd.cmdId, `Refreshed (seq ${snap.seq})`))
+      .catch(e => rejectCommand(cmd.cmdId, e.message));
   }
 };
 
-// Per-command tracking with Map
 function resolveCommand(cmdId, result) {
   const pending = pendingCommands.get(cmdId);
   if (pending) {
     pending.resolve(result);
     pendingCommands.delete(cmdId);
   }
-  // L8 FIX: normalize cmd_ack result as { result } for consistent formatting
   sendToBackground({ type: 'cmd_ack', cmdId, success: true, result });
 }
 
@@ -222,15 +297,16 @@ function rejectCommand(cmdId, error) {
     pending.reject(new Error(error));
     pendingCommands.delete(cmdId);
   }
-  // L8 FIX: normalize error as { error } in cmd_error
   sendToBackground({ type: 'cmd_error', cmdId, success: false, error });
 }
 
-// ─── Message listener (commands from background) ─────────────────────────────
+// ─── Message listener (commands from background) ───────────────────────────────
 
 browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'ping') {
-    const snap = getPageSnapshot();
+    // On explicit ping (from Hermes), send full snapshot — not structural
+    const snap = getFullPageSnapshot();
+    lastFullHtml = snap.html;
     sendResponse({ type: 'pong', ...snap });
     return true;
   }
@@ -254,6 +330,7 @@ window.addEventListener('unload', () => {
     clearInterval(snapshotInterval);
     snapshotInterval = null;
   }
+  clearNavigateHandlers(); // Fix #4: clean up navigate handlers
   for (const [cmdId, pending] of pendingCommands) {
     pending.reject(new Error('Tab navigated away'));
   }
@@ -263,9 +340,10 @@ window.addEventListener('unload', () => {
 // ─── Init ──────────────────────────────────────────────────────────────────
 
 setTimeout(() => {
-  const snap = getPageSnapshot();
-  lastHtml = snap.html;
-  sendToBackground({ type: 'tab_snapshot', ...snap }).then(() => {
+  // Fix #14: first snapshot is always full HTML
+  const snap = getFullPageSnapshot();
+  lastFullHtml = snap.html;
+  sendToBackground({ type: 'tab_snapshot', ...snap, incremental: false }).then(() => {
     setupMutationObserver();
   }).catch(() => {
     setupMutationObserver();
