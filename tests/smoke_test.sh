@@ -36,6 +36,12 @@ http_code() {
   curl -s -o /dev/null -w "%{http_code}" "$@"
 }
 
+# ── Pre-flight: is playwright installed? ────────────────────────────────────
+
+if ! command -v npx &>/dev/null || ! npx playwright --version &>/dev/null; then
+  echo "WARNING: Playwright not found. Install with: npm install -D playwright && npx playwright install chromium"
+fi
+
 # ── Pre-flight: is the proxy up? ────────────────────────────────────────────
 
 echon "Waiting for proxy to be ready"

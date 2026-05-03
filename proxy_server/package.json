@@ -5,7 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "start:https": "node server_https.js",
+    "start:https": "node server.js --https",
     "dev": "nodemon server.js",
     "build:icons": "node ../extension_safari/Contents/Resources/images/generate_icons.js",
     "build:safari": "swiftc -target arm64-apple-macosx13.0 -sdk $(xcrun --sdk macosx --show-sdk-path) ../extension_safari/Contents/MacOS/SafariWebExtensionHandler.swift -o ../extension_safari/Contents/MacOS/SafariWebExtensionHandler",
@@ -19,7 +19,9 @@
   "dependencies": {
     "ws": "^8.20.0"
   },
+  "engines": { "node": ">=18" },
   "devDependencies": {
-    "nodemon": "^3.1.14"
+    "nodemon": "^3.1.14",
+    "playwright": "^1.52.0"
   }
 }

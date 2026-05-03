@@ -47,7 +47,11 @@ const BACKPRESSURE_THRESHOLD_MS = cfg.BACKPRESSURE_THRESHOLD_MS; // P2-8: from c
  * @param {string} msg
  * @param {object} extras
  */
+const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
+const CURRENT_LOG_LEVEL = LOG_LEVELS[cfg.LOG_LEVEL] ?? LOG_LEVELS.info;
+
 function log(level, msg, extras = {}) {
+  if (LOG_LEVELS[level] === undefined || LOG_LEVELS[level] < CURRENT_LOG_LEVEL) return;
   const entry = {
     t: new Date().toISOString(),
     level,
@@ -83,7 +87,7 @@ const metrics = {
     backpressureActive: 0,
   },
   histograms: {
-    commandDuration: [],   // [{type, durationMs, ts}]
+    commandDuration: {},   // { type: [{value, ts}] }
     htmlBytes: [],        // [{bytes, ts}]
     mutationBufferSize: [], // [{size, ts}]
   }
@@ -99,9 +103,10 @@ function metricIncr(counterPath, labels = {}) {
   const last = parts[parts.length - 1];
   if (!node[last]) node[last] = labels._total ? 0 : {};
   if (labels._total) { node[last]++; return; }
-  // Multi-label: store as nested key
-  const key = Object.keys(labels).length > 0
-    ? Object.entries(labels).sort(([a], [b]) => a.localeCompare(b)).map(([k,v]) => `${k}="${v}"`).join(',')
+  // Build label key for multi-label metrics
+  const labelKeys = Object.keys(labels).sort((a, b) => a.localeCompare(b));
+  const key = labelKeys.length > 0
+    ? labelKeys.map(k => `${k}="${labels[k]}"`).join(',')
     : '';
   if (!node[last][key]) node[last][key] = 0;
   node[last][key]++;
@@ -112,77 +117,113 @@ function metricGauge(name, value) {
 }
 
 function metricHistogramPush(histName, value, labels = {}) {
-  const bucket = { value, labels, ts: Date.now() };
-  metrics.histograms[histName].push(bucket);
-  // Keep last 1000 entries
-  if (metrics.histograms[histName].length > 1000) {
-    metrics.histograms[histName].shift();
+  const type = labels.type || 'unknown';
+  if (!metrics.histograms[histName][type]) {
+    metrics.histograms[histName][type] = [];
+  }
+  metrics.histograms[histName][type].push({ value, labels, ts: Date.now() });
+  // Keep last 1000 entries per type
+  if (metrics.histograms[histName][type].length > 1000) {
+    metrics.histograms[histName][type].shift();
   }
 }
 
 function formatPrometheus() {
   const lines = [];
-  const fmt = (name, type, help, value, labelLines = []) => {
-    lines.push(`# HELP ${name} ${help}`);
-    lines.push(`# TYPE ${name} ${type}`);
-    labelLines.forEach(l => lines.push(l));
-    lines.push(`${name} ${value}`);
-  };
+  const emit = (...parts) => lines.push(parts.join(' '));
 
-  // Uptime
-  fmt('hbs_uptime_seconds', 'gauge', 'Proxy uptime in seconds',
-    Math.floor(metrics.gauges.uptimeSeconds));
+  // ── Gauges (TYPE/HELP before value) ────────────────────────────────────
+  emit('# HELP hbs_uptime_seconds Proxy uptime in seconds');
+  emit('# TYPE hbs_uptime_seconds gauge');
+  emit(`hbs_uptime_seconds ${Math.floor(metrics.gauges.uptimeSeconds)}`);
 
-  // Gauges
-  fmt('hbs_connected_sessions', 'gauge', 'Number of active extension sessions',
-    metrics.gauges.connectedSessions);
-  fmt('hbs_pending_commands', 'gauge', 'Number of pending commands in queue',
-    metrics.gauges.pendingCommands);
-  fmt('hbs_ws_hermes_clients', 'gauge', 'Number of Hermes WS clients connected',
-    metrics.gauges.hermesClients);
-  fmt('hbs_backpressure_active', 'gauge', 'Whether backpressure is active (1=paused, 0=normal)',
-    metrics.gauges.backpressureActive);
+  emit('# HELP hbs_connected_sessions Number of active extension sessions');
+  emit('# TYPE hbs_connected_sessions gauge');
+  emit(`hbs_connected_sessions ${metrics.gauges.connectedSessions}`);
 
-  // Command counters by type and status
+  emit('# HELP hbs_pending_commands Number of pending commands in queue');
+  emit('# TYPE hbs_pending_commands gauge');
+  emit(`hbs_pending_commands ${metrics.gauges.pendingCommands}`);
+
+  emit('# HELP hbs_ws_hermes_clients Number of Hermes WS clients connected');
+  emit('# TYPE hbs_ws_hermes_clients gauge');
+  emit(`hbs_ws_hermes_clients ${metrics.gauges.hermesClients}`);
+
+  emit('# HELP hbs_backpressure_active Whether backpressure is active (1=paused, 0=normal)');
+  emit('# TYPE hbs_backpressure_active gauge');
+  emit(`hbs_backpressure_active ${metrics.gauges.backpressureActive}`);
+
+  // ── Counters ─────────────────────────────────────────────────────────────
+  emit('# HELP hbs_commands_total Total commands processed');
+  emit('# TYPE hbs_commands_total counter');
+  let grandTotal = 0;
   for (const [type, statusMap] of Object.entries(metrics.counters.commands)) {
+    if (type === 'total') continue;
     for (const [labels, count] of Object.entries(statusMap)) {
-      const labelStr = labels ? `{${labels}}` : '';
-      lines.push(`hbs_commands_total{type="${type}",${labels}} ${count}`);
+      grandTotal += count;
+      const labelPart = labels ? `{${labels}}` : '';
+      emit(`hbs_commands_total{${labels}} ${count}`);
     }
   }
-  lines.push(`hbs_commands_total{type="_total"} ${metrics.counters.commands.total}`);
-  lines.push(`# TYPE hbs_commands_total counter`);
+  // Fix #15: Derive total from sum of all labeled counters to avoid divergence
+  emit(`hbs_commands_total ${grandTotal}`);
 
-  lines.push(`# TYPE hbs_ws_connections_total counter`);
-  lines.push(`hbs_ws_connections_total ${metrics.counters.wsConnections}`);
-  lines.push(`# TYPE hbs_ws_messages_total counter`);
-  lines.push(`hbs_ws_messages_total{direction="rx"} ${metrics.counters.wsMessages.rx}`);
-  lines.push(`hbs_ws_messages_total{direction="tx"} ${metrics.counters.wsMessages.tx}`);
-  lines.push(`# TYPE hbs_idempotency_rejections_total counter`);
-  lines.push(`hbs_idempotency_rejections_total ${metrics.counters.idempotencyRejections}`);
+  emit('# HELP hbs_ws_connections_total WebSocket connections established');
+  emit('# TYPE hbs_ws_connections_total counter');
+  emit(`hbs_ws_connections_total ${metrics.counters.wsConnections}`);
 
-  // Histograms (Prometheus classic)
-  const durationBuckets = [5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000];
-  for (const [type, durations] of Object.entries(metrics.histograms.commandDuration)) {
-    const values = durations.map(d => d.value);
-    if (values.length === 0) continue;
+  emit('# HELP hbs_ws_messages_total WebSocket messages received/sent');
+  emit('# TYPE hbs_ws_messages_total counter');
+  emit(`hbs_ws_messages_total{direction="rx"} ${metrics.counters.wsMessages.rx}`);
+  emit(`hbs_ws_messages_total{direction="tx"} ${metrics.counters.wsMessages.tx}`);
+
+  emit('# HELP hbs_idempotency_rejections_total Duplicate commands rejected');
+  emit('# TYPE hbs_idempotency_rejections_total counter');
+  emit(`hbs_idempotency_rejections_total ${metrics.counters.idempotencyRejections}`);
+
+  // ── Histogram: command duration (proper Prometheus bucket structure) ──────
+  const durationBuckets = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5];
+  emit('# HELP hbs_command_duration_seconds Command execution duration in seconds');
+  emit('# TYPE hbs_command_duration_seconds histogram');
+  for (const [cmdType, entries] of Object.entries(metrics.histograms.commandDuration)) {
+    if (!Array.isArray(entries) || entries.length === 0) continue;
+    const values = entries.map(e => e.value);
     const sum = values.reduce((a, b) => a + b, 0);
     const count = values.length;
-    lines.push(`# TYPE hbs_command_duration_seconds histogram`);
-    lines.push(`hbs_command_duration_seconds_sum{type="${type}"} ${(sum / 1000).toFixed(4)}`);
-    lines.push(`hbs_command_duration_seconds_count{type="${type}"} ${count}`);
+    // Bucket counts
+    const bucketCounts = new Array(durationBuckets.length + 1).fill(0);
+    for (const v of values) {
+      const sec = v / 1000;
+      for (let i = 0; i < durationBuckets.length; i++) {
+        if (sec <= durationBuckets[i]) bucketCounts[i]++;
+      }
+      bucketCounts[durationBuckets.length]++; // +Inf bucket
+    }
+    const leLabels = [...durationBuckets.map(b => `${b}`), '+Inf'].map(b => `le="${b}"`).join(',');
+    for (let i = 0; i <= durationBuckets.length; i++) {
+      emit(`hbs_command_duration_seconds_bucket{type="${cmdType}",${leLabels.split(',')[i]} ${bucketCounts[i]}`);
+    }
+    emit(`hbs_command_duration_seconds_sum{type="${cmdType}"} ${(sum / 1000).toFixed(4)}`);
+    emit(`hbs_command_duration_seconds_count{type="${cmdType}"} ${count}`);
   }
 
-  for (const entry of metrics.histograms.htmlBytes) {
-    lines.push(`# TYPE hbs_html_bytes gauge`);
-    lines.push(`# HELP hbs_html_bytes HTML snapshot size in bytes received by proxy`);
-    lines.push(`hbs_html_bytes ${entry.value} ${entry.ts}`);
+  // Fix #3: htmlBytes and mutationBufferSize were emitting ALL histogram entries as
+  // O(n) lines per scrape — replace with a single current-value gauge to avoid
+  // unbounded output that scales with session lifetime.
+  if (metrics.histograms.htmlBytes.length > 0) {
+    emit('# HELP hbs_html_bytes HTML snapshot size in bytes received by proxy');
+    emit('# TYPE hbs_html_bytes gauge');
+    // Emit only the most recent entry as the current value
+    const latest = metrics.histograms.htmlBytes[metrics.histograms.htmlBytes.length - 1];
+    emit(`hbs_html_bytes ${latest.value} ${latest.ts}`);
   }
 
-  for (const entry of metrics.histograms.mutationBufferSize) {
-    lines.push(`# TYPE hbs_mutation_buffer_size gauge`);
-    lines.push(`# HELP hbs_mutation_buffer_size Number of mutations in buffer`);
-    lines.push(`hbs_mutation_buffer_size ${entry.value} ${entry.ts}`);
+  if (metrics.histograms.mutationBufferSize.length > 0) {
+    emit('# HELP hbs_mutation_buffer_size Number of mutations in buffer');
+    emit('# TYPE hbs_mutation_buffer_size gauge');
+    // Emit only the most recent entry as the current value
+    const latest = metrics.histograms.mutationBufferSize[metrics.histograms.mutationBufferSize.length - 1];
+    emit(`hbs_mutation_buffer_size ${latest.value} ${latest.ts}`);
   }
 
   return lines.join('\n');
@@ -272,46 +313,59 @@ class RateLimiter {
 // ─── Backpressure Manager (Fix #P2-8) ─────────────────────────────────────────
 
 /**
- * Tracks per-extension-session backpressure state.
- * When the proxy's write buffer is high (incoming data overwhelming the extension),
- * we signal it to pause sending mutations.
+ * Fix #18: Per-session backpressure tracking.
+ * Each extension session has its own backpressure state — a slow session
+ * doesn't pause other sessions.
  */
 class BackpressureManager {
   constructor() {
-    /** @type {Map<string, boolean>} sessionId → isPaused */
-    this._paused = new Map();
-    /** @type {Set<import('ws').WebSocket>} */
-    this._pausedSockets = new Set();
+    /** @type {Map<string, {paused: boolean, ws: import('ws').WebSocket}>} */
+    this._sessions = new Map();
   }
 
   markWriting(sessionId, ws) {
-    // Called before a large write — temporarily increase backpressure score
-    if (!this._paused.get(sessionId)) {
-      this._paused.set(sessionId, true);
-      this._pausedSockets.add(ws);
+    // Only signal if this specific session isn't already paused
+    const entry = this._sessions.get(sessionId);
+    if (!entry || !entry.paused) {
+      this._sessions.set(sessionId, { paused: true, ws });
       metricGauge('backpressureActive', 1);
       this._sendSignal(ws, true);
     }
   }
 
   markDone(sessionId, ws) {
-    // Called after write completes
-    if (this._paused.get(sessionId)) {
-      this._paused.set(sessionId, false);
-      this._pausedSockets.delete(ws);
+    const entry = this._sessions.get(sessionId);
+    if (entry && entry.paused) {
+      entry.paused = false;
       this._sendSignal(ws, false);
-      if (this._pausedSockets.size === 0) {
+      // Check if any session is still paused
+      const anyPaused = Array.from(this._sessions.values()).some(e => e.paused);
+      if (!anyPaused) {
         metricGauge('backpressureActive', 0);
       }
     }
   }
 
   isPaused(sessionId) {
-    return this._paused.get(sessionId) || false;
+    const entry = this._sessions.get(sessionId);
+    return entry ? entry.paused : false;
+  }
+
+  /** Remove a session from backpressure tracking on disconnect */
+  removeSession(sessionId) {
+    const entry = this._sessions.get(sessionId);
+    if (entry && entry.paused) {
+      this._sendSignal(entry.ws, false);
+    }
+    this._sessions.delete(sessionId);
+    const anyPaused = Array.from(this._sessions.values()).some(e => e.paused);
+    if (!anyPaused) {
+      metricGauge('backpressureActive', 0);
+    }
   }
 
   _sendSignal(ws, paused) {
-    if (ws.readyState === 1) {
+    if (ws && ws.readyState === 1) {
       ws.send(JSON.stringify({
         type: 'backpressure',
         paused,
@@ -392,8 +446,11 @@ class HermesPushManager {
 
 // ─── Shared Proxy Factory ─────────────────────────────────────────────────────
 
-function createProxy({ httpServer, tlsOptions }) {
-  const pageMirror = new PageMirror({ maxHtmlBytes: MAX_HTML_BYTES });
+function createProxy({ httpServer, tlsOptions, version }) {
+  const PROXY_VERSION = version || '1.0.0';
+  const pageMirror = new PageMirror({ maxHtmlBytes: MAX_HTML_BYTES, sessionTtlMs: cfg.SESSION_TTL_MS });
+  // Fix #5: Start background eviction so disconnected sessions don't accumulate
+  pageMirror.startEvictionTimer();
   const cmdQueue = new CommandQueue(cfg.CMD_TIMEOUT_MS);  // P3-14: configurable timeout
   const idempotencyCache = new IdempotencyCache();
   const backpressure = new BackpressureManager();
@@ -519,8 +576,14 @@ function createProxy({ httpServer, tlsOptions }) {
       try { msg = JSON.parse(raw); } catch { return; }
       log('debug', `Hermes WS ← ${msg.type}`, { reqId });
 
-      // P0-1: First message must be "hello" (no auth yet — localhost assumption)
+      // Fix #1: Token-based auth on /hermes — token validated against HBS_AUTH_TOKEN env var
       if (msg.type === 'hello') {
+        const expectedToken = process.env.HBS_AUTH_TOKEN || null;
+        if (expectedToken && msg.token !== expectedToken) {
+          log('warn', 'Hermes WS auth failed — invalid token', { reqId });
+          ws.close(1008, 'Invalid token');
+          return;
+        }
         authenticated = true;
         ws.send(JSON.stringify({ type: 'hello_ack', message: 'Hermes Browser Bridge proxy ready', reqId }));
         return;
@@ -554,7 +617,7 @@ function createProxy({ httpServer, tlsOptions }) {
 
       // P0-1: Command over WS — forward to extension session
       if (msg.type === 'command') {
-        const sessionId = msg.sessionId || 'default';
+        const sessionId = msg.sessionId;
         const cmd = {
           type: msg.commandType,   // 'click', 'navigate', etc.
           cmdId: msg.cmdId || randomUUID(),
@@ -624,11 +687,10 @@ function createProxy({ httpServer, tlsOptions }) {
       return;
     }
 
-    ws.isAlive = true;
     log('info', 'Extension WS connected', { reqId, origin: origin || 'null', remoteIp });
     metricIncr('wsConnections');
 
-    ws.on('pong', () => { ws.isAlive = true; });
+    // isAlive tracking now handled by ws library's ping/pong protocol
 
     ws.on('message', (raw) => {
       metrics.counters.wsMessages.rx++;
@@ -639,12 +701,16 @@ function createProxy({ httpServer, tlsOptions }) {
         return;
       }
 
-      const sessionId = msg.sessionId || 'default';
+      // Fix #12: Warn when falling back to 'default' sessionId — masks config errors
+      const sessionId = msg.sessionId || _warnDefault('sessionId', msg.sessionId);
+      if (!msg.sessionId) {
+        log('warn', 'Extension WS sent no sessionId — falling back to default', { reqId });
+      }
       log('debug', `WS ← ${msg.type}`, { reqId, sessionId, tabId: msg.tabId || null });
 
       switch (msg.type) {
         case 'tab_snapshot': {
-          sessionSockets.set(sessionId, ws);
+          if (sessionId) sessionSockets.set(sessionId, ws);
           pageMirror.updateSnapshot(sessionId, msg);
           metricGauge('connectedSessions', sessionSockets.size);
           break;
@@ -716,26 +782,28 @@ function createProxy({ httpServer, tlsOptions }) {
     ws.send(JSON.stringify({ type: 'connected', message: 'Proxy ready' }));
   });
 
-  // Heartbeat
+  // Heartbeat — use ws library's built-in ping/pong (Fix #28)
+  // ws handles protocol-level pings automatically when pingInterval is set
+  wss.options = { ...wss.options, pingInterval: 30000, pingTimeout: 10000 };
+  wssHermes.options = { ...wssHermes.options, pingInterval: 30000, pingTimeout: 10000 };
+
   const heartbeat = setInterval(() => {
-    for (const ws of wss.clients) {
-      if (!ws.isAlive) { ws.terminate(); continue; }
-      ws.isAlive = false;
-      ws.ping();
-    }
-    for (const ws of wssHermes.clients) {
-      if (!ws.isAlive) { ws.terminate(); continue; }
-      ws.isAlive = false;
-      ws.ping();
-    }
     metricGauge('uptimeSeconds', Math.floor(process.uptime()));
   }, 30000);
 
-  // Prune old commands + idempotency cache
+  // Prune old commands + idempotency cache + stale sessions
+  // Fix #5: Session eviction now runs on a background interval, not just on getState()
   const pruneInterval = setInterval(() => {
     cmdQueue.prune(60000);
     idempotencyCache.prune();
     metricGauge('pendingCommands', cmdQueue.size);
+    // Evict sessions that have been disconnected past SESSION_TTL_MS
+    const before = pageMirror.connected;
+    pageMirror.evictStaleSessions();
+    const after = pageMirror.connected;
+    if (before !== after) {
+      metricGauge('connectedSessions', sessionSockets.size);
+    }
   }, PRUNE_INTERVAL_MS);
 
   wss.on('close', () => {
@@ -746,6 +814,12 @@ function createProxy({ httpServer, tlsOptions }) {
   // ── HTTP REST API ──────────────────────────────────────────────────────────
 
   httpServer.on('request', async (req, res) => {
+    req.setTimeout(30000, () => {
+      if (!res.headersSent) {
+        res.writeHead(408, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Request timeout' }));
+      }
+    });
     const reqId = randomUUID().slice(0, 8);
     const serverPort = httpServer.address().port;
     const url = new URL(req.url, `http://localhost:${serverPort}`);
@@ -762,7 +836,7 @@ function createProxy({ httpServer, tlsOptions }) {
     if (req.method === 'GET' && path === '/health') {
       jsonResponse(res, 200, {
         status: 'ok',
-        version: '1.3.0',
+        version: PROXY_VERSION,
         uptime: Math.floor(process.uptime()),
         connected: pageMirror.connected,
         pendingCommands: cmdQueue.size,
@@ -796,6 +870,27 @@ function createProxy({ httpServer, tlsOptions }) {
       return;
     }
 
+    // ── GET /sessions/:id (Fix #16) ─────────────────────────────────────────────
+    const sessionMatch = path.match(/^\/sessions\/([^\/]+)$/);
+    if (req.method === 'GET' && sessionMatch) {
+      const sid = sessionMatch[1];
+      const ws = sessionSockets.get(sid);
+      if (!ws) {
+        jsonResponse(res, 404, { error: `Session '${sid}' not found` });
+        return;
+      }
+      const state = pageMirror.getState(sid);
+      jsonResponse(res, 200, {
+        sessionId: sid,
+        connected: ws.readyState === 1,
+        url: state.url || '',
+        title: state.title || '',
+        lastUpdate: state.lastUpdate || 0,
+        mutationsPending: state.mutations ? state.mutations.length : 0,
+      });
+      return;
+    }
+
     // ── POST /sessions/:id/activate (Fix #P1-3) ──────────────────────────────
     const activateMatch = path.match(/^\/sessions\/([^/]+)\/activate$/);
     if (req.method === 'POST' && activateMatch) {
@@ -816,7 +911,7 @@ function createProxy({ httpServer, tlsOptions }) {
 
     // ── GET /page_state ─────────────────────────────────────────────────────
     if (req.method === 'GET' && path === '/page_state') {
-      const sessionId = url.searchParams.get('sessionId') || 'default';
+      const sessionId = url.searchParams.get('sessionId');
       const lastSeq = parseInt(url.searchParams.get('lastSeq') || '0', 10);
 
       if (lastSeq > 0) {
@@ -846,7 +941,7 @@ function createProxy({ httpServer, tlsOptions }) {
 
     // ── POST /command ───────────────────────────────────────────────────────
     if (req.method === 'POST' && path === '/command') {
-      const sessionId = url.searchParams.get('sessionId') || 'default';
+      const sessionId = url.searchParams.get('sessionId');
 
       const meta = getSessionMeta(sessionId);
       if (!meta.limiter.tryConsume()) {
@@ -982,6 +1077,16 @@ function createProxy({ httpServer, tlsOptions }) {
     log('info', 'Shutdown signal received');
     clearInterval(heartbeat);
     clearInterval(pruneInterval);
+
+    // Fix #11: Close all extension WebSocket connections gracefully with code 1001 (going away)
+    // This gives extensions a chance to handle the close event rather than treating it as a crash.
+    for (const ws of wss.clients) {
+      try { ws.close(1001, 'Proxy shutting down'); } catch (_) {}
+    }
+    for (const ws of wssHermes.clients) {
+      try { ws.close(1001, 'Proxy shutting down'); } catch (_) {}
+    }
+
     wss.close();
     wssHermes.close();
     httpServer.close();

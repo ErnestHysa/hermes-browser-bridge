@@ -13,10 +13,8 @@
 'use strict';
 
 const FULL_SNAPSHOT_INTERVAL_MS = 2000;
-const IDLE_DEBOUNCE_MS = 100;       // idle callback timeout for non-urgent serialization
 const MAJOR_MUTATION_DEBOUNCE_MS = 300;
 const MAX_STRUCTURAL_ELEMENTS = 2000;
-const CANCEL_SETTLE_MS = 100;        // wait for in-flight cancel before settling ack
 
 // ─── State ─────────────────────────────────────────────────────────────────────
 
@@ -30,6 +28,7 @@ let pageObserver = null;
 let debounceTimer = null;
 let navigateFailTimer = null;
 let lastNavigateCmdId = null;
+let backpressurePaused = false;  // Fix #6: stop MutationObserver batching when Hermes is slow
 
 // Fix #13: skip periodic full HTML send when page hasn't changed
 let lastSnapshotHash = '';
@@ -95,12 +94,16 @@ function getFullPageSnapshot() {
 function getStructuralSnapshot(changedTexts = []) {
   const elementCount = (document.querySelectorAll('*').length || 0);
 
-  // P3-18: For large pages, defer to requestIdleCallback
+  // Fix #7: For large pages, use requestIdleCallback with a forced-timeout fallback.
+  // If requestIdleCallback never fires (busy page), the setTimeout always resolves.
   if (elementCount > MAX_STRUCTURAL_ELEMENTS && typeof requestIdleCallback !== 'undefined') {
     return new Promise((resolve) => {
-      requestIdleCallback(() => {
-        resolve(_buildStructuralSnapshot(changedTexts));
-      }, { timeout: 500 });
+      const snapshot = () => resolve(_buildStructuralSnapshot(changedTexts));
+      const id = requestIdleCallback(snapshot, { timeout: 500 });
+      // Safety net: if idle callback doesn't fire within 500ms, resolve anyway
+      setTimeout(() => {
+        try { snapshot(); } catch (_) {}
+      }, 600);
     });
   }
   return Promise.resolve(_buildStructuralSnapshot(changedTexts));
@@ -221,14 +224,17 @@ function setupMutationObserver() {
       }
     }
 
-    sendToBackground({
-      type: 'mutation',
-      mutations: mutationsData,
-      url: window.location.href,
-      seq: window._snapshotSeq || 0
-    });
+    // Fix #6: When backpressure is active, skip sending mutation events to reduce load
+    if (!backpressurePaused) {
+      sendToBackground({
+        type: 'mutation',
+        mutations: mutationsData,
+        url: window.location.href,
+        seq: window._snapshotSeq || 0
+      });
+    }
 
-    // Major DOM changes trigger full snapshot after debounce
+    // Major DOM changes trigger full snapshot after debounce (even when paused)
     const major = mutations.some(m =>
       m.type === 'childList' && (m.addedNodes.length > 5 || m.removedNodes.length > 0)
     );
@@ -245,7 +251,8 @@ function setupMutationObserver() {
   observer.observe(document.body, {
     childList: true,
     subtree: true,
-    attributes: false,
+    attributes: true,
+    attributeOldValue: true,
     characterData: true
   });
 
@@ -287,6 +294,7 @@ const CMD_HANDLERS = {
           type: 'cmd_error',
           cmdId: cmd.cmdId,
           success: false,
+          errorCode: 'NAVIGATE_TIMEOUT',
           error: `Navigation to ${cmd.url} was blocked or timed out`
         });
       }
@@ -340,7 +348,7 @@ const CMD_HANDLERS = {
           el.dispatchEvent(clickEvent);
         } else {
           pendingCommands.delete(cmd.cmdId);
-          sendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, success: false, error: `Element not found: ${cmd.selector}` });
+          sendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'ELEMENT_NOT_FOUND', error: `Element not found: ${cmd.selector}` });
           return;
         }
       } else {
@@ -355,7 +363,7 @@ const CMD_HANDLERS = {
     const el = document.querySelector(cmd.selector);
     if (!el) {
       pendingCommands.delete(cmd.cmdId);
-      sendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, success: false, error: `Element not found: ${cmd.selector}` });
+      sendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'ELEMENT_NOT_FOUND', error: `Element not found: ${cmd.selector}` });
       return;
     }
     el.click();
@@ -373,7 +381,7 @@ const CMD_HANDLERS = {
     const el = document.querySelector(cmd.selector);
     if (!el) {
       pendingCommands.delete(cmd.cmdId);
-      sendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, success: false, error: `Element not found: ${cmd.selector}` });
+      sendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'ELEMENT_NOT_FOUND', error: `Element not found: ${cmd.selector}` });
       return;
     }
     el.focus();
@@ -397,7 +405,7 @@ const CMD_HANDLERS = {
     const form = cmd.selector ? document.querySelector(cmd.selector) : document.querySelector('form');
     if (!form) {
       pendingCommands.delete(cmd.cmdId);
-      sendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, success: false, error: `Form not found: ${cmd.selector || 'any form'}` });
+      sendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'FORM_NOT_FOUND', error: `Form not found: ${cmd.selector || 'any form'}` });
       return;
     }
     const submitBtn = form.querySelector('button[type="submit"], input[type="submit"]');
@@ -411,6 +419,9 @@ const CMD_HANDLERS = {
   },
 
   evaluate(cmd) {
+    // SECURITY WARNING: new Function() executes arbitrary JS in the page context.
+    // Only use the evaluate command with scripts you trust. Malicious page scripts
+    // can observe/modify the evaluated result via prototype overrides.
     try {
       // eslint-disable-next-line no-new-func
       const result = (new Function(cmd.script))();
@@ -418,19 +429,22 @@ const CMD_HANDLERS = {
       sendToBackground({ type: 'cmd_ack', cmdId: cmd.cmdId, success: true, result });
     } catch (e) {
       pendingCommands.delete(cmd.cmdId);
-      sendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, success: false, error: e.message });
+      sendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'REFRESH_FAILED', error: e.message });
     }
   },
 
   refresh(cmd) {
+    // Fix #10: Send snapshot then ack — never before the async send completes.
+    // Only sends cmd_ack after tab_snapshot is confirmed delivered.
     const snap = getFullPageSnapshot();
-    pendingCommands.delete(cmd.cmdId);
     sendToBackground({ type: 'tab_snapshot', ...snap, incremental: false })
       .then(() => {
+        pendingCommands.delete(cmd.cmdId);
         sendToBackground({ type: 'cmd_ack', cmdId: cmd.cmdId, success: true, result: `Refreshed (seq ${snap.seq})` });
       })
       .catch(e => {
-        sendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, success: false, error: e.message });
+        pendingCommands.delete(cmd.cmdId);
+        sendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'REFRESH_FAILED', error: e.message });
       });
   }
 };
@@ -449,7 +463,14 @@ function handleCancel(cmdId) {
 
 // ─── Message listener ───────────────────────────────────────────────────────────
 
+// Fix #6: Handle backpressure signal from background — pause/resume observer
 browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  // Backpressure: pause observer when Hermes is overwhelmed
+  if (message.type === 'backpressure') {
+    backpressurePaused = message.paused;
+    return true;
+  }
+
   // P3-17: Handle cancel command type
   if (message.type === 'cancel') {
     handleCancel(message.cmdId);

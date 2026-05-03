@@ -56,6 +56,7 @@ function onBgMessage(msg) {
     const lastUrl = sessionStorage.getItem('hermes_last_url');
     setState('active', { url: lastUrl || undefined });
   } else if (msg.event === 'disconnected') {
+    pendingCmdId = null;
     setState('inactive');
   } else if (msg.event === 'tab_activated') {
     sessionStorage.setItem('hermes_last_url', msg.url);
@@ -63,24 +64,29 @@ function onBgMessage(msg) {
   } else if (msg.event === 'error') {
     setState('error', { message: msg.message });
   } else if (msg.event === 'cmd_sent') {
+    pendingCmdId = msg.cmdId;
     addCmdLog('pending', `${msg.cmdType} → ${msg.selector || msg.url || '(action)'}`);
   } else if (msg.event === 'cmd_done') {
+    pendingCmdId = null;
     addCmdLog('success', `${msg.cmdType}: OK`);
   } else if (msg.event === 'cmd_error') {
+    pendingCmdId = null;
     addCmdLog('error', `${msg.cmdType}: ${msg.error}`);
   } else if (msg.event === 'backpressure') {
-    // Fix #14: show backpressure PAUSED state in popup
+    // Fix #14: show backpressure PAUSED state in popup; clear pending command
     if (msg.paused) {
+      pendingCmdId = null;
       addCmdLog('pending', 'PAUSED — Hermes is catching up');
     } else {
       addCmdLog('success', 'Resumed — Hermes is up to date');
     }
   } else if (msg.event === 'hermes_session') {
-    // Fix #15: show which session Hermes is subscribed to
-    const hint = document.createElement('span');
-    hint.textContent = ` | Session: ${msg.sessionId.slice(0, 12)}…`;
-    hint.style.fontSize = '10px';
-    hint.style.color = 'var(--text-muted)';
+    // Fix #8: Session hint was created but never appended to DOM — now uses existing element
+    const el = document.getElementById('hermes-session-hint');
+    if (el) {
+      el.textContent = `Session: ${msg.sessionId.slice(0, 12)}…`;
+      el.classList.remove('hidden');
+    }
   }
 }
 

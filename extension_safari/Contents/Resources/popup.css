@@ -6,11 +6,21 @@
   --text-primary: #cdd6f4;
   --text-secondary: #a6adc8;
   --text-muted: #6c7086;
+  --accent: var(--accent-blue);       /* Fix #25: unified accent shorthand */
   --accent-blue: #89b4fa;
   --accent-green: #a6e3a1;
   --accent-red: #f38ba8;
   --accent-yellow: #f9e2af;
   --border-color: #313244;
+  /* Fix #25: spacing and sizing tokens */
+  --space-xs: 4px;
+  --space-sm: 8px;
+  --space-md: 12px;
+  --space-lg: 16px;
+  --radius: 8px;
+  --font-size-xs: 10px;
+  --font-size-sm: 11px;
+  --font-size-base: 14px;
 }
 
 * {

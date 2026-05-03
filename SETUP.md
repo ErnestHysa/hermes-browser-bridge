@@ -19,13 +19,16 @@ This guide takes you from zero to fully running in under 10 minutes.
 
 Before loading the extension, compile the Safari native handler and generate icons:
 
+**Icons are pre-generated and committed to the repo** — you do not need to regenerate them unless you change the design. If you do change the design, run `npm run build:icons` from `proxy_server/` to regenerate all sizes from a source image.
+
 ```bash
 cd ~/Desktop/DEVPROJECTS/hermes-browser-bridge/proxy_server
 
 # Compile Safari's native extension handler (required for Safari)
 npm run build:safari
 
-# Generate all icon sizes (if you ever need to regenerate)
+# Generate all icon sizes — only needed if you change the icon design
+# (requires a source image at ../extension_safari/Contents/Resources/images/source.png)
 npm run build:icons
 
 # Or run both at once:

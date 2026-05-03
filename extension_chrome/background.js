@@ -54,13 +54,20 @@ function connect() {
     backpressurePaused = false;
     updateBadge('green');
     startHealthPoll();
+    // Notify content script that backpressure is cleared on reconnect
+    if (currentTabId) {
+      chrome.tabs.sendMessage(currentTabId, { type: 'backpressure', paused: false }).catch(() => {});
+    }
     // Fix #7: Persist sessionId across service worker restarts
-    chrome.storage.local.get(['hermesSessionId'], (result) => {
+    // Fix #22: Persist sessionId via chrome.storage.session (survives service worker restarts)
+    chrome.storage.session.get(['hermesSessionId']).then((result) => {
       if (result.hermesSessionId) {
         SESSION_ID = result.hermesSessionId;
       } else {
-        chrome.storage.local.set({ hermesSessionId: SESSION_ID });
+        chrome.storage.session.set({ hermesSessionId: SESSION_ID });
       }
+    }).catch(() => {
+      // session storage unavailable — use volatile memory only
     });
     while (pendingMessages.length > 0) {
       const msg = pendingMessages.shift();
@@ -146,11 +153,14 @@ function forwardCommandToTab(tabId, cmd) {
 
   notifyPopup({ event: 'cmd_sent', cmdType: cmd.type, selector: cmd.selector, url: cmd.url, cmdId: cmd.cmdId });
 
+  // Fix #14: Attach a short reqId to every command forwarded to content script
+  // so Hermes can correlate logs across extension → proxy → Hermes
+  const reqId = `${cmd.cmdId.slice(0, 8)}`;
   const MAX_RETRIES = 3;
   const RETRY_DELAY_MS = 300;
 
   function attempt(attemptNum) {
-    chrome.tabs.sendMessage(tabId, cmd, (resp) => {
+    chrome.tabs.sendMessage(tabId, { ...cmd, reqId }, (resp) => {
       if (chrome.runtime.lastError) {
         if (attemptNum < MAX_RETRIES) {
           setTimeout(() => attempt(attemptNum + 1), RETRY_DELAY_MS * (attemptNum + 1));
@@ -181,11 +191,16 @@ function forwardCommandToTab(tabId, cmd) {
  */
 function handleProxyMessage(cmd) {
   switch (cmd.type) {
-    case 'backpressure':
+    case 'backpressure': {
       backpressurePaused = cmd.paused;
+      // Fix #6: Forward backpressure signal to content script so it can pause observer
+      if (currentTabId) {
+        chrome.tabs.sendMessage(currentTabId, { type: 'backpressure', paused: cmd.paused }).catch(() => {});
+      }
       notifyPopup({ event: 'backpressure', paused: cmd.paused });
       console.warn(`[Hermes Bridge] Backpressure ${cmd.paused ? 'ACTIVE' : 'cleared'}`);
       break;
+    }
 
     case 'cancel':
       if (currentTabId) {
@@ -247,8 +262,13 @@ function updateBadge(color) {
 // ─── Popup notifications ─────────────────────────────────────────────────────
 
 function notifyPopup(data) {
-  chrome.runtime.sendMessage({ ...data, from: 'background' }).catch(() => {
-    // Popup not open — ignore
+  // Fix #13: Log errors from notifyPopup instead of silently swallowing them.
+  // Errors are expected when popup is closed, but real failures should be visible.
+  chrome.runtime.sendMessage({ ...data, from: 'background' }).catch((err) => {
+    if (chrome.runtime.lastError?.message !== 'Could not establish connection. Receiving end does not exist.') {
+      console.warn('[Hermes Bridge] notifyPopup failed:', chrome.runtime.lastError?.message || err.message);
+    }
+    // Popup not open — expected, no action needed
   });
 }
 
@@ -317,7 +337,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     currentTabUrl = null;
     backpressurePaused = false;
     updateBadge('gray');
-    notifyPopup({ event: 'disconnected' });
+    notifyPopup({ event: 'disconnected', pendingCmdId: null });
     return true;
   }
 

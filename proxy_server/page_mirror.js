@@ -13,7 +13,6 @@
 const HTML_TTL_MS = 5000;
 const MUTATION_TTL_MS = 30000;
 const MUTATION_BUFFER_MAX = 500;
-const SESSION_TTL_MS = 300000; // 5 minutes after disconnect
 const DEFAULT_MAX_HTML_BYTES = 10 * 1024 * 1024; // 10MB
 
 class PageMirror {
@@ -22,6 +21,7 @@ class PageMirror {
    */
   constructor(options = {}) {
     this._maxHtmlBytes = options.maxHtmlBytes || DEFAULT_MAX_HTML_BYTES;
+    this._sessionTtlMs = options.sessionTtlMs || (5 * 60 * 1000); // default 5 min
 
     /**
      * Per-session page state.
@@ -51,6 +51,31 @@ class PageMirror {
      * @type {boolean}
      */
     this._anyConnected = false;
+
+    // Fix #5: Start background eviction timer so disconnected sessions are
+    // cleaned up even when no active poll requests come in.
+    this._evictionTimer = null;
+  }
+
+  /**
+   * Start the background eviction interval. Called once after construction.
+   * Safe to call multiple times — only one interval runs at a time.
+   */
+  startEvictionTimer() {
+    if (this._evictionTimer) return; // already running
+    this._evictionTimer = setInterval(() => {
+      this.evictStaleSessions();
+    }, Math.max(30000, this._sessionTtlMs / 2)); // run at half TTL or 30s, whichever is larger
+  }
+
+  /**
+   * Stop the background eviction timer. Mainly for testing.
+   */
+  stopEvictionTimer() {
+    if (this._evictionTimer) {
+      clearInterval(this._evictionTimer);
+      this._evictionTimer = null;
+    }
   }
 
   // ─── Session management ─────────────────────────────────────────────────────
@@ -104,10 +129,10 @@ class PageMirror {
   /**
    * Evict sessions disconnected for longer than SESSION_TTL_MS.
    */
-  _evictStaleSessions() {
+  evictStaleSessions() {
     const now = Date.now();
     for (const [sessionId, session] of this._sessions) {
-      if (!session.connected && (now - session.lastHtmlUpdate) > SESSION_TTL_MS) {
+      if (!session.connected && (now - session.lastHtmlUpdate) > this._sessionTtlMs) {
         this._sessions.delete(sessionId);
         this._lastSeqPerSession.delete(sessionId);
         this._mutationBuffer = this._mutationBuffer.filter(m => m.sessionId !== sessionId);
@@ -122,9 +147,15 @@ class PageMirror {
    */
   addMutations(sessionId, { mutations, url, seq }) {
     const ts = Date.now();
+    // Fix #4: Warn when dropping oldest mutation due to buffer overflow
+    if (this._mutationBuffer.length >= MUTATION_BUFFER_MAX) {
+      console.warn(`[PageMirror] Mutation buffer full — dropping oldest entry for session ${sessionId}`);
+    }
     this._mutationBuffer.push({ sessionId, mutations, url, seq, ts });
     if (this._mutationBuffer.length > MUTATION_BUFFER_MAX) {
-      this._mutationBuffer.shift();
+      // Fix #4: Signal when oldest mutations are dropped due to buffer overflow
+      const dropped = this._mutationBuffer.shift();
+      log('warn', `Mutation buffer overflow — dropped ${dropped.mutations.length} oldest mutation(s) for session ${dropped.sessionId}`);
     }
   }
 
@@ -137,7 +168,7 @@ class PageMirror {
    * @returns {{ url: string, title: string, html: string, seq: number, connected: boolean, tabId: (string|null), lastUpdate: number, mutations: object[], htmlStale: boolean }}
    */
   getState(sessionId, lastSeq = 0) {
-    this._evictStaleSessions();
+    this.evictStaleSessions();
 
     let targetSession = this._sessions.get(sessionId);
     let actualSessionId = sessionId;

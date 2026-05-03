@@ -50,6 +50,10 @@ function connect() {
     backpressurePaused = false; // P2-8
     updateBadge('green');
     startHealthPoll();
+    // Fix #6: Notify content script that backpressure is cleared on reconnect
+    if (currentTabId) {
+      browser.tabs.sendMessage(currentTabId, { type: 'backpressure', paused: false }).catch(() => {});
+    }
     while (pendingMessages.length > 0) {
       const msg = pendingMessages.shift();
       sendToProxy(msg);
@@ -171,6 +175,10 @@ function handleProxyMessage(cmd) {
     // P2-8: Backpressure signal — proxy is overwhelmed, pause/resume sending
     case 'backpressure':
       backpressurePaused = cmd.paused;
+      // Fix #6: Forward to content script so it can pause its MutationObserver
+      if (currentTabId) {
+        browser.tabs.sendMessage(currentTabId, { type: 'backpressure', paused: cmd.paused }).catch(() => {});
+      }
       notifyPopup({ event: 'backpressure', paused: cmd.paused });
       console.warn(`[Hermes Bridge] Backpressure ${cmd.paused ? 'ACTIVE' : 'cleared'}`);
       break;
@@ -246,8 +254,13 @@ function updateBadge(color) {
 // ─── Popup notifications ─────────────────────────────────────────────────────
 
 function notifyPopup(data) {
-  browser.runtime.sendMessage({ ...data, from: 'background' }).catch(() => {
-    // Popup not open — ignore
+  // Fix #13: Log unexpected errors from notifyPopup instead of silently swallowing all.
+  browser.runtime.sendMessage({ ...data, from: 'background' }).catch((err) => {
+    // "Could not establish connection" is expected when popup is closed — don't log it
+    const msg = err?.message || browser.runtime.lastError?.message || '';
+    if (!msg.includes('Could not establish connection')) {
+      console.warn('[Hermes Bridge] notifyPopup failed:', msg);
+    }
   });
 }
 

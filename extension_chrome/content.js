@@ -31,6 +31,7 @@ function snapshotHash() {
 }
 
 // ─── Navigate handler (Chrome) ─────────────────────────────────────────────────
+let _navLoadHandler = null;
 let _navPageShowHandler = null;
 
 function clearNavigateHandlers() {
@@ -72,9 +73,16 @@ function getFullPageSnapshot() {
 
 function getStructuralSnapshot(changedTexts = []) {
   const elementCount = document.querySelectorAll('*').length || 0;
+  // Fix #7: Safari already has a setTimeout safety net; Chrome was missing it.
+  // If requestIdleCallback never fires on a busy page, the Promise would hang forever.
   if (elementCount > MAX_STRUCTURAL_ELEMENTS && typeof requestIdleCallback !== 'undefined') {
     return new Promise((resolve) => {
-      requestIdleCallback(() => resolve(_buildStructuralSnapshot(changedTexts)), { timeout: 500 });
+      const snapshot = () => resolve(_buildStructuralSnapshot(changedTexts));
+      requestIdleCallback(snapshot, { timeout: 500 });
+      // Safety net: if idle callback doesn't fire within 600ms, resolve anyway
+      setTimeout(() => {
+        try { snapshot(); } catch (_) {}
+      }, 600);
     });
   }
   return Promise.resolve(_buildStructuralSnapshot(changedTexts));
@@ -193,7 +201,8 @@ function setupMutationObserver() {
   observer.observe(document.body, {
     childList: true,
     subtree: true,
-    attributes: false,
+    attributes: true,
+    attributeOldValue: true,
     characterData: true
   });
 
@@ -228,7 +237,7 @@ const CMD_HANDLERS = {
       if (lastNavigateCmdId === cmd.cmdId) {
         lastNavigateCmdId = null;
         pendingCommands.delete(cmd.cmdId);
-        sendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, success: false, error: `Navigation to ${cmd.url} was blocked or failed` });
+        sendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'NAVIGATE_BLOCKED', error: `Navigation to ${cmd.url} was blocked or failed` });
       }
     }, 3000);
 
@@ -262,7 +271,7 @@ const CMD_HANDLERS = {
           el.dispatchEvent(clickEvent);
         } else {
           pendingCommands.delete(cmd.cmdId);
-          sendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, success: false, error: `Element not found: ${cmd.selector}` });
+          sendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'ELEMENT_NOT_FOUND', error: `Element not found: ${cmd.selector}` });
           return;
         }
       } else {
@@ -276,7 +285,7 @@ const CMD_HANDLERS = {
     const el = document.querySelector(cmd.selector);
     if (!el) {
       pendingCommands.delete(cmd.cmdId);
-      sendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, success: false, error: `Element not found: ${cmd.selector}` });
+      sendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'ELEMENT_NOT_FOUND', error: `Element not found: ${cmd.selector}` });
       return;
     }
     el.click();
@@ -294,7 +303,7 @@ const CMD_HANDLERS = {
     const el = document.querySelector(cmd.selector);
     if (!el) {
       pendingCommands.delete(cmd.cmdId);
-      sendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, success: false, error: `Element not found: ${cmd.selector}` });
+      sendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'ELEMENT_NOT_FOUND', error: `Element not found: ${cmd.selector}` });
       return;
     }
     el.focus();
@@ -312,7 +321,7 @@ const CMD_HANDLERS = {
     const form = cmd.selector ? document.querySelector(cmd.selector) : document.querySelector('form');
     if (!form) {
       pendingCommands.delete(cmd.cmdId);
-      sendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, success: false, error: `Form not found: ${cmd.selector || 'any form'}` });
+      sendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'FORM_NOT_FOUND', error: `Form not found: ${cmd.selector || 'any form'}` });
       return;
     }
     const submitBtn = form.querySelector('button[type="submit"], input[type="submit"]');
@@ -330,7 +339,7 @@ const CMD_HANDLERS = {
       sendToBackground({ type: 'cmd_ack', cmdId: cmd.cmdId, success: true, result });
     } catch (e) {
       pendingCommands.delete(cmd.cmdId);
-      sendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, success: false, error: e.message });
+      sendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'EVAL_ERROR', error: e.message });
     }
   },
 
@@ -339,7 +348,7 @@ const CMD_HANDLERS = {
     pendingCommands.delete(cmd.cmdId);
     sendToBackground({ type: 'tab_snapshot', ...snap, incremental: false })
       .then(() => sendToBackground({ type: 'cmd_ack', cmdId: cmd.cmdId, success: true, result: `Refreshed (seq ${snap.seq})` }))
-      .catch(e => sendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, success: false, error: e.message }));
+      .catch(e => sendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'REFRESH_FAILED', error: e.message }));
   }
 };
 
