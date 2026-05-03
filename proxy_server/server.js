@@ -10,7 +10,7 @@ const http = require('node:http');
 const { createProxy } = require('./proxy_lib');
 
 const PORT = 9321;
-const HOST = '0.0.0.0';
+const HOST = '127.0.0.1';  // Fix #C4: localhost only — prevents LAN exposure
 
 const httpServer = http.createServer();
 const proxy = createProxy({ httpServer });

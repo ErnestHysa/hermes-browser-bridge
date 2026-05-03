@@ -14,7 +14,7 @@ const { readFileSync } = require('node:fs');
 const { createProxy } = require('./proxy_lib');
 
 const PORT = 9322;
-const HOST = '0.0.0.0';
+const HOST = '127.0.0.1';  // Fix #C4: localhost only — prevents LAN exposure
 
 // Load TLS cert/key from certificates/
 const TLS_DIR = __dirname + '/../certificates';

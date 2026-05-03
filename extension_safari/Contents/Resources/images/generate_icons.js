@@ -6,8 +6,9 @@
  * Creates 4 sizes (16, 48, 96, 128) with a geometric "H" bridge design
  * in the accent blue color on a dark background.
  *
- * PNG format: IHDR + IDAT (uncompressed Flate) + IEND
- * Uses no external libraries — pure Node.js crypto and zlib.
+ * PNG format: IHDR + IDAT (zlib-deflated scanlines) + IEND
+ * Fix #L5: uses zlib.deflateSync() which produces proper zlib-wrapped DEFLATE
+ * data valid for PNG IDAT chunks (RFC 2083 §5.2).
  */
 
 const { deflateSync } = require('zlib');

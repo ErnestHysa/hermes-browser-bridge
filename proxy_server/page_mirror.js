@@ -1,19 +1,28 @@
 /**
  * page_mirror.js — In-memory page state cache
  *
- * Fix #4:  Per-session connected flag (not global)
- * Fix #6:  lastSeqPerSession — tracks per-session last acknowledged seq
- * Fix #7:  Mutations scoped to session — getMutations(sessionId) filters
- * Fix #8:  Disconnected sessions evicted after SESSION_TTL_MS of inactivity
+ * Fix #C4:  (network binding done in server.js, not here)
+ * Fix #4:   Per-session connected flag (not global)
+ * Fix #6:   lastSeqPerSession — tracks per-session last acknowledged seq
+ * Fix #7:   Mutations scoped to session
+ * Fix #8:   Disconnected sessions evicted after SESSION_TTL_MS of inactivity
+ * Fix #M3:   maxHtmlBytes guard — rejects snapshots exceeding the configured size
+ * Fix #L2:   getLastSeq(sessionId) exposed via HTTP GET /page_state?sessionId=...&lastSeq=N
  */
 
 const HTML_TTL_MS = 5000;
 const MUTATION_TTL_MS = 30000;
 const MUTATION_BUFFER_MAX = 100;
 const SESSION_TTL_MS = 300000; // 5 minutes after disconnect
+const DEFAULT_MAX_HTML_BYTES = 10 * 1024 * 1024; // 10MB
 
 class PageMirror {
-  constructor() {
+  /**
+   * @param {{ maxHtmlBytes?: number }} options
+   */
+  constructor(options = {}) {
+    this._maxHtmlBytes = options.maxHtmlBytes || DEFAULT_MAX_HTML_BYTES;
+
     /**
      * Per-session page state.
      * Key: sessionId (string)
@@ -26,7 +35,6 @@ class PageMirror {
      * Tracks the last seq each client (Hermes poll call) has seen, per session.
      * Key: sessionId. Value: last seq number Hermes acknowledged for this session.
      * Used so Hermes can request only delta mutations since its last poll.
-     * Fix #6
      * @type {Map<string, number>}
      */
     this._lastSeqPerSession = new Map();
@@ -39,18 +47,14 @@ class PageMirror {
 
     /**
      * Global connected flag — true when at least one session is connected.
-     * Fix #4: derived from session state, not a separate flag.
+     * Derived from session state, not a separate flag.
+     * @type {boolean}
      */
     this._anyConnected = false;
   }
 
   // ─── Session management ─────────────────────────────────────────────────────
 
-  /**
-   * Get or create a session entry.
-   * @param {string} sessionId
-   * @returns {object}
-   */
   _getSession(sessionId) {
     let session = this._sessions.get(sessionId);
     if (!session) {
@@ -62,27 +66,31 @@ class PageMirror {
 
   /**
    * Update the full page snapshot for a session.
-   * Fix #4: also updates the per-session connected flag.
-   * Fix #6: increments seq and stores it.
+   * Fix #M3: enforces maxHtmlBytes — truncates or rejects oversized HTML.
    * @param {string} sessionId
    * @param {{ url: string, title: string, html: string, seq?: number }} snapshot
    */
   updateSnapshot(sessionId, { url, title, html, seq }) {
     const session = this._getSession(sessionId);
+
+    // Fix #M3: enforce max HTML size
+    let finalHtml = html;
+    if (html.length > this._maxHtmlBytes) {
+      console.warn(`[PageMirror] HTML snapshot for session ${sessionId} exceeds ${this._maxHtmlBytes} bytes (${html.length}) — truncating`);
+      finalHtml = html.slice(0, this._maxHtmlBytes);
+    }
+
     session.url = url;
     session.title = title;
-    session.html = html;
+    session.html = finalHtml;
     session.lastHtmlUpdate = Date.now();
     session.seq = seq ?? (session.seq + 1);
-    // Mark session connected and refresh its TTL
     session.connected = true;
     this._anyConnected = true;
   }
 
   /**
-   * Mark a session as disconnected. The session entry is kept until SESSION_TTL_MS
-   * elapses (Fix #8), allowing Hermes to still read the last known state during
-   * brief disconnects/reconnects without losing session context.
+   * Mark a session as disconnected.
    * @param {string} sessionId
    */
   disconnectSession(sessionId) {
@@ -90,13 +98,11 @@ class PageMirror {
     if (session) {
       session.connected = false;
     }
-    // Recompute _anyConnected
     this._anyConnected = Array.from(this._sessions.values()).some(s => s.connected);
   }
 
   /**
-   * Evict sessions that have been disconnected for longer than SESSION_TTL_MS.
-   * Called periodically to prevent unbounded memory growth (Fix #8).
+   * Evict sessions disconnected for longer than SESSION_TTL_MS.
    */
   _evictStaleSessions() {
     const now = Date.now();
@@ -104,7 +110,6 @@ class PageMirror {
       if (!session.connected && (now - session.lastHtmlUpdate) > SESSION_TTL_MS) {
         this._sessions.delete(sessionId);
         this._lastSeqPerSession.delete(sessionId);
-        // Also prune mutations belonging to this session
         this._mutationBuffer = this._mutationBuffer.filter(m => m.sessionId !== sessionId);
       }
     }
@@ -127,19 +132,13 @@ class PageMirror {
 
   /**
    * Get the current page state for Hermes, scoped to a specific session.
-   * Fix #4: uses per-session connected state.
-   * Fix #6: returns only new mutations since lastSeq.
-   * Fix #7: mutations filtered to the requested sessionId.
-   *
-   * @param {string} sessionId — the session to return state for
-   * @param {number} [lastSeq=0] — the last seq Hermes has already seen (for delta mutations)
+   * @param {string} sessionId
+   * @param {number} [lastSeq=0]
    * @returns {{ url: string, title: string, html: string, seq: number, connected: boolean, tabId: (string|null), lastUpdate: number, mutations: object[], htmlStale: boolean }}
    */
   getState(sessionId, lastSeq = 0) {
-    // Evict stale sessions first
     this._evictStaleSessions();
 
-    // If the requested session doesn't exist, fall back to the most recently updated session
     let targetSession = this._sessions.get(sessionId);
     let actualSessionId = sessionId;
     if (!targetSession) {
@@ -166,8 +165,7 @@ class PageMirror {
     const now = Date.now();
     const htmlFresh = (now - targetSession.lastHtmlUpdate) < HTML_TTL_MS;
 
-    // Fix #7: only return mutations for this specific session
-    // Fix #6: only return mutations with seq > lastSeq (delta since last poll)
+    // Only return mutations for this session with seq > lastSeq
     const mutations = this._mutationBuffer
       .filter(m => m.sessionId === actualSessionId && m.seq > lastSeq && (now - m.ts) < MUTATION_TTL_MS)
       .map(m => ({ mutations: m.mutations, url: m.url, seq: m.seq, ts: m.ts }));
@@ -188,7 +186,6 @@ class PageMirror {
   /**
    * Update the last-acknowledged seq for a session.
    * Called by the HTTP handler when Hermes includes ?lastSeq=N in the request.
-   * Fix #6
    * @param {string} sessionId
    * @param {number} seq
    */
@@ -201,8 +198,7 @@ class PageMirror {
 
   /**
    * Get the last-acknowledged seq for a session.
-   * Used so Hermes can pass it back on the next poll call.
-   * Fix #6
+   * Fix #L2: used by the HTTP handler to expose GET /page_state?sessionId=...
    * @param {string} sessionId
    * @returns {number}
    */
@@ -210,9 +206,7 @@ class PageMirror {
     return this._lastSeqPerSession.get(sessionId) || 0;
   }
 
-  /**
-   * @returns {boolean} true if at least one session is currently connected
-   */
+  /** @returns {boolean} true if at least one session is currently connected */
   get connected() {
     return this._anyConnected;
   }

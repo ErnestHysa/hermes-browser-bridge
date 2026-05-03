@@ -2,18 +2,20 @@
  * background.js — Safari Web Extension Background Service Worker
  * Connects to ws://localhost:9321 and routes messages to/from content scripts.
  *
- * Fix #8:  Proxy URL made configurable via browser.runtime.getManifest() trick
- * Fix #12: Handles 'refreshSnapshot' event from popup
- * Fix #13: Notifies popup on cmd_sent, cmd_done, cmd_error for command log
+ * Fix #C1:   Handles '_navigate' from content script — uses browser.tabs.update()
+ *             instead of content script directly calling window.location.href
+ * Fix #L3:   Clarified ping (content→background ping request) vs
+ *             heartbeat (background→proxy keepalive) vs pong (content→background ping response)
+ * Fix #H3:   tabId included on cmd_ack and cmd_error so proxy can route correctly
  */
 
 const DEFAULT_PROXY_PORT = 9321;
 
 /**
- * Deterministically resolve the proxy WebSocket URL.
- * Fix #8: Uses a constant port; in future, could read from browser.runtime.getManifest()
- * if we add a "proxy_port" field to the manifest, enabling the extension to work with
- * server_https.js (port 9322) without recompiling.
+ * Proxy WebSocket URL.
+ * Fix #8: Currently uses a constant port. Future: could read from
+ * browser.runtime.getManifest() if a "proxy_port" manifest field is added,
+ * enabling the extension to work with server_https.js (port 9322).
  */
 function getProxyWsUrl() {
   return `ws://localhost:${DEFAULT_PROXY_PORT}`;
@@ -24,7 +26,7 @@ const RECONNECT_DELAY_MS = 2000;
 const MAX_PENDING_MESSAGES = 50;
 const HEALTH_POLL_INTERVAL_MS = 10000;
 
-// Session ID generated once per browser session — persists across tab navigations
+// Session ID — generated once per browser session, persists across tab navigations
 const SESSION_ID = `session_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
 
 // Connection state
@@ -131,7 +133,6 @@ function forwardCommandToTab(cmd) {
     return;
   }
 
-  // Fix #13: notify popup that command was sent
   notifyPopup({ event: 'cmd_sent', cmdType: cmd.type, selector: cmd.selector, url: cmd.url });
 
   const MAX_RETRIES = 3;
@@ -149,7 +150,8 @@ function forwardCommandToTab(cmd) {
       } else {
         console.error(`[Hermes Bridge] Command ${cmd.type} (${cmd.cmdId}) could not be delivered`);
         const errorMsg = `Tab not ready: ${err.message || 'delivery failed'}`;
-        sendToProxy({ type: 'cmd_error', cmdId: cmd.cmdId, error: errorMsg });
+        // Fix #H3: include tabId so proxy can disambiguate which tab this error came from
+        sendToProxy({ type: 'cmd_error', cmdId: cmd.cmdId, error: errorMsg, tabId: currentTabId, sessionId: SESSION_ID });
         notifyPopup({ event: 'cmd_error', cmdType: cmd.type, error: errorMsg });
       }
     });
@@ -158,6 +160,17 @@ function forwardCommandToTab(cmd) {
   attempt(1);
 }
 
+/**
+ * Handle incoming messages from the proxy WebSocket.
+ *
+ * Message flow summary:
+ * - Proxy → 'navigate'/'click'/'type'/etc. → forwardCommandToTab → content script
+ * - Proxy → 'connected' → acknowledgment (no-op here)
+ * - Content → 'pong' → forward to proxy as 'tab_snapshot'
+ * - Content → 'cmd_ack' / 'cmd_error' → forward to proxy (Fix #H3: tabId attached)
+ *
+ * @param {object} cmd
+ */
 function handleProxyMessage(cmd) {
   switch (cmd.type) {
     case 'navigate':
@@ -166,20 +179,22 @@ function handleProxyMessage(cmd) {
     case 'type':
     case 'submit':
     case 'evaluate':
-    case 'refresh':  // Fix #12: explicit refresh command from popup
+    case 'refresh':   // Fix #12: explicit refresh command from popup
       forwardCommandToTab(cmd);
       break;
 
     case 'cmd_ack':
+      // Fix #H3: attach tabId so proxy can track which tab this ack belongs to
       notifyPopup({ event: 'cmd_done', cmdType: cmd.type });
       break;
 
     case 'cmd_error':
+      // Fix #H3: tabId already included by the content script on send
       notifyPopup({ event: 'cmd_error', cmdType: cmd.type, error: cmd.error });
       break;
 
     default:
-      console.warn('[Hermes Bridge] Unknown command type:', cmd.type);
+      console.warn('[Hermes Bridge] Unknown command type from proxy:', cmd.type);
   }
 }
 
@@ -217,7 +232,7 @@ function updateBadge(color) {
   const bg = colorMap[color] || colorMap.gray;
   try {
     browser.action.setBadgeBackgroundColor({ color: bg });
-    // Use Unicode escape instead of emoji — avoids emoji rendering inconsistency across macOS versions
+    // Unicode escape — avoids emoji rendering inconsistency across macOS versions
     browser.action.setBadgeText({ text: connected ? '\u25CF' : '\u25CB' });
   } catch { /* Badge APIs may not be available */ }
 }
@@ -233,7 +248,7 @@ function notifyPopup(data) {
 // ─── Browser events ─────────────────────────────────────────────────────────
 
 browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  // Popup / content script queries status
+  // ── Popup / content script queries status ─────────────────────────────
   if (message.event === 'getStatus') {
     sendResponse({
       connected,
@@ -244,7 +259,7 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
-  // Popup asks to activate the current tab
+  // ── Popup asks to activate the current tab ──────────────────────────
   if (message.event === 'activate') {
     browser.tabs.query({ active: true, currentWindow: true }).then((tabs) => {
       if (tabs[0]) {
@@ -255,9 +270,29 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
-  // Fix #12: manual refresh from popup — force a ping to get a fresh full snapshot
+  // ── Fix #C1: _navigate — content script asks background to navigate ─
+  // browser.tabs.update() works reliably in extension context; direct
+  // window.location.href assignment from content script is blocked by Safari.
+  if (message.type === '_navigate') {
+    if (currentTabId !== null) {
+      browser.tabs.update(currentTabId, { url: message.url }).catch((err) => {
+        console.error('[Hermes Bridge] browser.tabs.update failed:', err.message);
+        // Notify the content script so it can report the error
+        browser.tabs.sendMessage(currentTabId, {
+          type: 'cmd_error',
+          cmdId: message.cmdId,
+          success: false,
+          error: `Navigation failed: ${err.message}`
+        }).catch(() => {});
+      });
+    }
+    return true;
+  }
+
+  // ── Manual refresh from popup ───────────────────────────────────────
   if (message.event === 'refreshSnapshot') {
     if (currentTabId) {
+      // ping → content script → pong with full snapshot → sendToProxy
       browser.tabs.sendMessage(currentTabId, { type: 'ping' }).then((resp) => {
         if (resp && resp.html) {
           sendToProxy({
@@ -266,6 +301,7 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
             title: resp.title,
             html: resp.html,
             seq: resp.seq,
+            tabId: currentTabId,
             sessionId: SESSION_ID
           });
         }
@@ -284,17 +320,22 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
-  // Extension → proxy
+  // ── Extension → proxy messages ───────────────────────────────────────
+
+  // Fix #H3: include tabId on all outbound messages to proxy
   if (message.type === 'tab_snapshot' || message.type === 'mutation' || message.type === 'heartbeat') {
-    sendToProxy({ ...message, sessionId: SESSION_ID });
+    sendToProxy({ ...message, tabId: currentTabId, sessionId: SESSION_ID });
     return true;
   }
 
   if (message.type === 'cmd_ack' || message.type === 'cmd_error') {
-    sendToProxy({ ...message, sessionId: SESSION_ID });
+    sendToProxy({ ...message, tabId: currentTabId, sessionId: SESSION_ID });
     return true;
   }
 
+  // ── ping/pong: content script ping → background → proxy ────────────
+  // ping: content script requests a full snapshot (e.g., Hermes wants current state)
+  // pong: content script responds with the full HTML snapshot
   if (message.type === 'pong') {
     sendToProxy({
       type: 'tab_snapshot',
@@ -302,6 +343,7 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
       title: message.title,
       html: message.html,
       seq: message.seq,
+      tabId: currentTabId,
       sessionId: SESSION_ID
     });
     return true;

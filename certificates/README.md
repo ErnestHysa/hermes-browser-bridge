@@ -28,7 +28,12 @@ Or manually:
 4. Expand the certificate, click **Trust**, set to **Always Trust**
 5. Authenticate with your Mac password
 
-### Step 2: After macOS Update
+### Step 1: Verify the CA cert (optional)
+
+```bash
+# Verify the CA is correctly formed and has the expected properties
+openssl x509 -in ~/Desktop/DEVPROJECTS/hermes-browser-bridge/certificates/ca.crt -text -noout | head -20
+```
 
 Apple may reset CA trust after a macOS update. Re-run the command above after updates.
 

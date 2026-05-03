@@ -40,7 +40,7 @@ The Safari extension requires a native binary (`SafariWebExtensionHandler`) to b
 ```bash
 cd ~/Desktop/DEVPROJECTS/hermes-browser-bridge
 swiftc \
-  -target arm64-apple-macosx15.0 \
+  -target arm64-apple-macosx13.0 \
   -sdk $(xcrun --sdk macosx --show-sdk-path) \
   extension_safari/Contents/MacOS/SafariWebExtensionHandler.swift \
   -o extension_safari/Contents/MacOS/SafariWebExtensionHandler

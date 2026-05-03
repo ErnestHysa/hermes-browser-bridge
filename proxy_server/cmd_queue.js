@@ -53,7 +53,11 @@ class CommandQueue extends EventEmitter {
    */
   ack(cmdId, result) {
     const entry = this.pending.get(cmdId);
-    if (!entry) return;
+    // M10 FIX: warn if cmdId not in pending queue
+    if (!entry) {
+      console.warn(`[CmdQueue] cmd_ack for unknown cmdId: ${cmdId} — may have already timed out`);
+      return;
+    }
 
     clearTimeout(entry.timer);
     this.pending.delete(cmdId);
@@ -69,7 +73,11 @@ class CommandQueue extends EventEmitter {
    */
   error(cmdId, error) {
     const entry = this.pending.get(cmdId);
-    if (!entry) return;
+    // M10 FIX: warn if cmdId not in pending queue
+    if (!entry) {
+      console.warn(`[CmdQueue] cmd_error for unknown cmdId: ${cmdId} — may have already timed out`);
+      return;
+    }
 
     clearTimeout(entry.timer);
     this.pending.delete(cmdId);

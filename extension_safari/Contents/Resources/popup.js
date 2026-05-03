@@ -124,7 +124,7 @@ async function init() {
     const resp = await browser.runtime.sendMessage({ event: 'getStatus' });
     if (resp && resp.connected) {
       // Fix #11: restore last URL from sessionStorage on init
-      const url = resp.url || sessionStorage.getItem('hermes_last_url') || resp.url;
+      const url = resp.url || sessionStorage.getItem('hermes_last_url');
       setState('active', { url: resp.url || url });
     } else if (resp && resp.url) {
       // Not connected yet but we have a URL — show it as inactive URL

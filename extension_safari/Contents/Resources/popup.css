@@ -161,8 +161,9 @@ header {
   padding-top: 4px;
 }
 
-/* Fix #13: command log */
+/* Fix #H5: .cmd-log needs display:block so .hidden can toggle it */
 .cmd-log {
+  display: block;
   padding: 8px 12px;
 }
 
@@ -205,4 +206,9 @@ header {
 
 #cmd-log-list li.error {
   color: var(--accent-red);
+}
+
+/* Fix #H5: pending command styling */
+#cmd-log-list li.pending {
+  color: var(--accent-yellow);
 }
