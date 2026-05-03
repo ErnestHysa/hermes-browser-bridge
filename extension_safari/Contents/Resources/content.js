@@ -5,7 +5,7 @@
 
 const FULL_SNAPSHOT_INTERVAL_MS = 2000;
 
-// State — FIX #6: use a Map instead of a single pendingCmdId so parallel commands work
+// State — parallel command tracking via Map
 /** @type {Map<string, {resolve: function, reject: function}>} */
 const pendingCommands = new Map();
 
@@ -31,7 +31,7 @@ function getPageSnapshot() {
 // ─── Mutation Observer ───────────────────────────────────────────────────────
 
 function setupMutationObserver() {
-  // FIX #3: guard against null body (complex pages may not have it yet)
+  // Guard against null body (complex pages may not have it yet)
   if (!document.body) {
     console.warn('[Hermes Bridge] document.body not ready, retrying…');
     setTimeout(setupMutationObserver, 200);
@@ -56,13 +56,18 @@ function setupMutationObserver() {
     // Debounce: wait 100ms for DOM to settle
     clearTimeout(debounceTimer);
     debounceTimer = setTimeout(() => {
-      // Send incremental mutation data
+      // H4 FIX: also observe characterData so text-node changes are captured
       const mutationsData = mutations.map(m => ({
         type: m.type,
         target: m.target.nodeName,
+        targetId: m.target.id || null,
+        targetClass: m.target.className || null,
         added: m.addedNodes.length,
         removed: m.removedNodes.length,
-        text: m.target.nodeValue || ''
+        text: m.target.nodeValue || '',
+        // M2 FIX: include actual added/removed node names for meaningful diffs
+        addedNodeNames: Array.from(m.addedNodes).map(n => n.nodeName),
+        removedNodeNames: Array.from(m.removedNodes).map(n => n.nodeName)
       }));
       sendToBackground({ type: 'mutation', mutations: mutationsData, url: window.location.href });
 
@@ -76,14 +81,14 @@ function setupMutationObserver() {
     }, 100);
   });
 
+  // H4 FIX: added characterData to capture text-node changes (contenteditable, autofill)
   observer.observe(document.body, {
     childList: true,
     subtree: true,
     attributes: false,
-    characterData: false
+    characterData: true
   });
 
-  // FIX #13: store interval handle so we can clear it on unload
   snapshotInterval = setInterval(flush, FULL_SNAPSHOT_INTERVAL_MS);
 }
 
@@ -91,24 +96,21 @@ function setupMutationObserver() {
 
 /**
  * Send a message to the background script.
- * Returns a promise that resolves on success or rejects on delivery failure.
  * @param {object} msg
  * @returns {Promise<void>}
  */
 function sendToBackground(msg) {
   return browser.runtime.sendMessage(msg).catch((err) => {
     console.error('[Hermes Bridge] Failed to deliver message to background:', err.message);
-    throw err; // re-throw so callers know delivery failed
+    throw err;
   });
 }
 
 // ─── Command Execution ───────────────────────────────────────────────────────
 
 /**
- * Wraps eval in a sandboxed Function so page scope isn't polluted.
- * FIX #2: Removed direct eval — using Function constructor instead which is
- * slightly safer (no direct access to local scope). The evaluate command
- * intentionally runs JS in the page context — users must trust the page.
+ * Wraps script execution in a sandboxed Function constructor.
+ * Runs in the page's global context — users must trust the page.
  * @param {string} script
  * @returns {any}
  */
@@ -117,10 +119,21 @@ function safeEvaluate(script) {
   return (new Function(script))();
 }
 
+// C2 FIX: navigate resolves on page load, not immediately
+function setupNavigateResolver(cmdId, url) {
+  const handler = () => {
+    window.removeEventListener('load', handler);
+    window.removeEventListener('pageshow', handler);
+    resolveCommand(cmdId, `Navigated to ${url}`);
+  };
+  window.addEventListener('load', handler);
+  window.addEventListener('pageshow', handler);
+}
+
 const CMD_HANDLERS = {
   navigate(cmd) {
+    setupNavigateResolver(cmd.cmdId, cmd.url);
     window.location.href = cmd.url;
-    resolveCommand(cmd.cmdId, `Navigated to ${cmd.url}`);
   },
 
   click(cmd) {
@@ -138,31 +151,47 @@ const CMD_HANDLERS = {
     resolveCommand(cmd.cmdId, `Scrolled to (${cmd.x}, ${cmd.y})`);
   },
 
+  // H1 FIX: batch-set value then fire input once — works with React/Vue synthetic events
   type(cmd) {
     const el = document.querySelector(cmd.selector);
     if (!el) {
       rejectCommand(cmd.cmdId, `Element not found: ${cmd.selector}`);
       return;
     }
-    // Focus, clear, then type
     el.focus();
-    el.value = '';
-    const inputEvent = new Event('input', { bubbles: true });
-    for (const ch of cmd.text) {
-      el.value += ch;
-      el.dispatchEvent(inputEvent);
+    // Set full value at once — React/Vue see this as a single coherent change
+    const nativeInputSetter = Object.getOwnPropertyDescriptor(
+      window.HTMLInputElement.prototype, 'value'
+    ) || Object.getOwnPropertyDescriptor(
+      window.HTMLTextAreaElement.prototype, 'value'
+    );
+    if (nativeInputSetter) {
+      nativeInputSetter.set.call(el, cmd.text);
+    } else {
+      el.value = cmd.text;
     }
+    // Single input event — React/Vue synthetic systems register for this
+    el.dispatchEvent(new Event('input', { bubbles: true }));
     el.dispatchEvent(new Event('change', { bubbles: true }));
     resolveCommand(cmd.cmdId, `Typed "${cmd.text}" into: ${cmd.selector}`);
   },
 
+  // H2 FIX: click the submit button instead of calling native form.submit()
+  // which bypasses JS event handlers
   submit(cmd) {
-    const el = cmd.selector ? document.querySelector(cmd.selector) : document.querySelector('form');
-    if (!el) {
+    const form = cmd.selector ? document.querySelector(cmd.selector) : document.querySelector('form');
+    if (!form) {
       rejectCommand(cmd.cmdId, `Form not found: ${cmd.selector || 'any form'}`);
       return;
     }
-    el.submit();
+    // Find the submit button and click it — fires all JS submit handlers
+    const submitBtn = form.querySelector('button[type="submit"], input[type="submit"]');
+    if (submitBtn) {
+      submitBtn.click();
+    } else {
+      // Fallback: dispatch a submit event on the form (still respects JS handlers)
+      form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    }
     resolveCommand(cmd.cmdId, `Submitted form: ${cmd.selector || 'form'}`);
   },
 
@@ -176,13 +205,14 @@ const CMD_HANDLERS = {
   }
 };
 
-// FIX #6: per-command tracking with Map
+// Per-command tracking with Map
 function resolveCommand(cmdId, result) {
   const pending = pendingCommands.get(cmdId);
   if (pending) {
     pending.resolve(result);
     pendingCommands.delete(cmdId);
   }
+  // L8 FIX: normalize cmd_ack result as { result } for consistent formatting
   sendToBackground({ type: 'cmd_ack', cmdId, success: true, result });
 }
 
@@ -192,6 +222,7 @@ function rejectCommand(cmdId, error) {
     pending.reject(new Error(error));
     pendingCommands.delete(cmdId);
   }
+  // L8 FIX: normalize error as { error } in cmd_error
   sendToBackground({ type: 'cmd_error', cmdId, success: false, error });
 }
 
@@ -199,20 +230,18 @@ function rejectCommand(cmdId, error) {
 
 browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'ping') {
-    // Respond with current page state
     const snap = getPageSnapshot();
     sendResponse({ type: 'pong', ...snap });
-    return true; // async response
+    return true;
   }
 
   const handler = CMD_HANDLERS[message.type];
   if (handler) {
     const { cmdId } = message;
-    // Wrap in promise so sync handlers still work
     Promise.resolve().then(() => handler(message)).catch((e) => {
       rejectCommand(cmdId, e.message);
     });
-    return true; // async
+    return true;
   }
 
   return false;
@@ -220,13 +249,11 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 // ─── Cleanup on page unload ───────────────────────────────────────────────────
 
-// FIX #13: clear the interval when the page unloads to prevent memory leaks
 window.addEventListener('unload', () => {
   if (snapshotInterval !== null) {
     clearInterval(snapshotInterval);
     snapshotInterval = null;
   }
-  // Reject any pending commands so they don't hang forever
   for (const [cmdId, pending] of pendingCommands) {
     pending.reject(new Error('Tab navigated away'));
   }
@@ -241,7 +268,6 @@ setTimeout(() => {
   sendToBackground({ type: 'tab_snapshot', ...snap }).then(() => {
     setupMutationObserver();
   }).catch(() => {
-    // Page may be restricted — still try to observe mutations
     setupMutationObserver();
   });
 }, 500);

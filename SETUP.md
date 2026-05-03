@@ -1,4 +1,4 @@
-# Hermes Browser Bridge — Setup Guide
+# Hermes Browser Bridge — Setup Guide v1.2.0
 
 **For macOS (Apple Silicon/Intel) · Safari · Node.js v18+**
 

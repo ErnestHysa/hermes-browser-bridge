@@ -5,7 +5,11 @@
 
 const PROXY_WS_URL = 'ws://localhost:9321';
 const RECONNECT_DELAY_MS = 2000;
-const MAX_PENDING_MESSAGES = 50; // FIX #24: cap queued messages
+const MAX_PENDING_MESSAGES = 50;
+const HEALTH_POLL_INTERVAL_MS = 10000;
+
+// L4 FIX: generate a session ID once per browser session
+const SESSION_ID = `session_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
 
 // Connection state
 let socket = null;
@@ -14,6 +18,7 @@ let currentTabId = null;
 let currentTabUrl = null;
 let pendingMessages = [];
 let reconnectTimer = null;
+let healthPollTimer = null;
 
 // ─── WebSocket ──────────────────────────────────────────────────────────────
 
@@ -27,7 +32,7 @@ function connect() {
   socket.addEventListener('open', () => {
     connected = true;
     updateBadge('green');
-    // Flush queued messages (oldest first)
+    startHealthPoll();
     while (pendingMessages.length > 0) {
       const msg = pendingMessages.shift();
       sendToProxy(msg);
@@ -47,8 +52,8 @@ function connect() {
   socket.addEventListener('close', () => {
     connected = false;
     updateBadge('gray');
+    stopHealthPoll();
     notifyPopup({ event: 'disconnected' });
-    // Attempt reconnect with backoff
     if (reconnectTimer) clearTimeout(reconnectTimer);
     reconnectTimer = setTimeout(connect, RECONNECT_DELAY_MS);
   });
@@ -62,15 +67,42 @@ function connect() {
 
 function sendToProxy(msg) {
   if (socket && socket.readyState === WebSocket.OPEN) {
-    socket.send(JSON.stringify(msg));
+    // L4 FIX: attach sessionId to every outbound message
+    socket.send(JSON.stringify({ ...msg, sessionId: SESSION_ID }));
   } else {
-    // FIX #24: cap queue — evict oldest if full (FIFO)
     if (pendingMessages.length >= MAX_PENDING_MESSAGES) {
       pendingMessages.shift();
       console.warn('[Hermes Bridge] Pending message queue full, dropping oldest message');
     }
-    pendingMessages.push(msg);
-    connect(); // trigger reconnect
+    pendingMessages.push({ ...msg, sessionId: SESSION_ID });
+    connect();
+  }
+}
+
+// ─── Health polling ─────────────────────────────────────────────────────────
+
+// M7 FIX: poll the proxy /health endpoint every 10s to detect silent disconnects
+function startHealthPoll() {
+  stopHealthPoll();
+  healthPollTimer = setInterval(async () => {
+    try {
+      const res = await fetch('http://localhost:9321/health');
+      const health = await res.json();
+      if (!health.connected && connected) {
+        // Proxy lost our connection but we think we're connected — force reconnect
+        console.warn('[Hermes Bridge] Proxy reports no WS client; forcing reconnect');
+        socket.close();
+      }
+    } catch {
+      // Proxy down — will be caught by the close event handler
+    }
+  }, HEALTH_POLL_INTERVAL_MS);
+}
+
+function stopHealthPoll() {
+  if (healthPollTimer !== null) {
+    clearInterval(healthPollTimer);
+    healthPollTimer = null;
   }
 }
 
@@ -78,7 +110,6 @@ function sendToProxy(msg) {
 
 /**
  * Forward a command to the content script in the active tab.
- * FIX #15: Added retry logic — up to 3 attempts with delay between.
  * @param {object} cmd
  */
 function forwardCommandToTab(cmd) {
@@ -92,15 +123,17 @@ function forwardCommandToTab(cmd) {
 
   function attempt(attemptNum) {
     browser.tabs.sendMessage(currentTabId, cmd).then(() => {
-      // Success — command delivered
+      // Success
     }).catch((err) => {
+      // M4 FIX: log the actual error instead of silently ignoring it
+      if (err && err.message) {
+        console.warn(`[Hermes Bridge] Tab message delivery attempt ${attemptNum}/${MAX_RETRIES} failed: ${err.message}`);
+      }
       if (attemptNum < MAX_RETRIES) {
-        console.warn(`[Hermes Bridge] Command delivery failed, retry ${attemptNum + 1}/${MAX_RETRIES}`);
         setTimeout(() => attempt(attemptNum + 1), RETRY_DELAY_MS * (attemptNum + 1));
       } else {
-        console.error(`[Hermes Bridge] Command ${cmd.type} (${cmd.cmdId}) could not be delivered:`, err.message);
-        // Notify proxy that the command failed to reach the content script
-        sendToProxy({ type: 'cmd_error', cmdId: cmd.cmdId, error: `Tab not ready: ${err.message}` });
+        console.error(`[Hermes Bridge] Command ${cmd.type} (${cmd.cmdId}) could not be delivered after ${MAX_RETRIES} attempts`);
+        sendToProxy({ type: 'cmd_error', cmdId: cmd.cmdId, error: `Tab not ready: ${err.message || 'delivery failed'}` });
       }
     });
   }
@@ -128,18 +161,17 @@ function handleProxyMessage(cmd) {
 async function setActiveTab(tabId, tabUrl = null) {
   currentTabId = tabId;
   currentTabUrl = tabUrl ?? currentTabUrl;
-  // Ping the tab to confirm content script is alive
   try {
     await browser.tabs.sendMessage(tabId, { type: 'ping' });
   } catch {
     // Content script not yet loaded — that's fine
+    // M4 FIX: log at debug level instead of silent swallow
+    console.debug('[Hermes Bridge] Content script not yet ready in tab', tabId);
   }
 }
 
-// FIX #23: onUpdated should only update for the active tab
 browser.tabs.onActivated.addListener(async (activeInfo) => {
   currentTabId = activeInfo.tabId;
-  // Try to get the URL for the newly activated tab
   try {
     const tab = await browser.tabs.get(activeInfo.tabId);
     currentTabUrl = tab.url;
@@ -148,7 +180,6 @@ browser.tabs.onActivated.addListener(async (activeInfo) => {
   }
 });
 
-// FIX #23: only update currentTabId if the updated tab is the active one
 browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (tab.active && changeInfo.status === 'complete') {
     currentTabId = tabId;
@@ -182,8 +213,7 @@ function notifyPopup(data) {
 browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // Popup / content script queries status
   if (message.event === 'getStatus') {
-    // FIX #5: include currentTabUrl in the response
-    sendResponse({ connected, currentTabId, url: currentTabUrl });
+    sendResponse({ connected, currentTabId, url: currentTabUrl, sessionId: SESSION_ID });
     return true;
   }
 
@@ -198,29 +228,28 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
-  // FIX #4: handle disconnect event from popup
   if (message.event === 'disconnect') {
     currentTabId = null;
     currentTabUrl = null;
-    pageMirror?.setConnected(false);
     updateBadge('gray');
     notifyPopup({ event: 'disconnected' });
     return true;
   }
 
   // Extension → proxy (tab data, heartbeats, command responses)
+  // L4 FIX: attach sessionId to all outgoing messages
   if (message.type === 'tab_snapshot' || message.type === 'mutation' || message.type === 'heartbeat') {
-    sendToProxy(message);
+    sendToProxy({ ...message, sessionId: SESSION_ID });
     return true;
   }
 
   if (message.type === 'cmd_ack' || message.type === 'cmd_error') {
-    sendToProxy(message);
+    sendToProxy({ ...message, sessionId: SESSION_ID });
     return true;
   }
 
   if (message.type === 'pong') {
-    sendToProxy({ type: 'tab_snapshot', url: message.url, title: message.title, html: message.html });
+    sendToProxy({ type: 'tab_snapshot', url: message.url, title: message.title, html: message.html, sessionId: SESSION_ID });
     return true;
   }
 });

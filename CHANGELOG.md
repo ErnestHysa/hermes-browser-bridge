@@ -4,6 +4,43 @@ All notable changes to Hermes Browser Bridge are documented here.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.2.0] — 2026-05-03
+
+### Added
+- **Rate limiting** — Token-bucket limiter caps commands at 5/second per client; excess returns HTTP 429
+- **permessage-deflate compression** — WebSocket traffic compressed, reducing bandwidth on heavy pages
+- **Health polling** — Background script polls `/health` every 10s to detect silent proxy disconnects
+- **`sessionId` on all messages** — Every extension→proxy message carries a session ID for multi-session tracking
+- **Swift handler browser info** — `SafariWebExtensionHandler` now returns browser version on request
+- **Per-session page state** — `page_mirror.js` tracks snapshots per sessionId (prepares for multi-tab)
+- **`rateLimitRemaining` in response** — POST /command now returns remaining rate limit tokens
+
+### Fixed
+- **Info.plist binary name** — `CFBundleExecutable` now correctly set to `SafariWebExtensionHandler`
+- **Navigate resolves on page load** — `navigate` command waits for `load` event before acknowledging (was resolving immediately)
+- **type() with React/Vue** — Uses native input value setter instead of per-character events; React synthetic events work correctly
+- **submit() bypasses JS handlers** — Now clicks the submit button or dispatches a submit event instead of calling native `form.submit()`
+- **MutationObserver misses text changes** — Added `characterData: true` to capture text node changes in contenteditable and autofill
+- **Mutations carry actual node names** — `addedNodeNames` and `removedNodeNames` arrays now included for meaningful diffs
+- **Tab delivery errors swallowed** — Errors from `browser.tabs.sendMessage` now logged at warn level instead of silent catch
+- **Popup error state race** — Error set before connecting UI to prevent state ordering bugs
+- **Launchd KeepAlive conflict** — Removed conflicting `StartCalendarInterval` dict; `KeepAlive: true` alone handles restart
+- **Launchd node path hardcoded** — Now uses `node` (no path) to respect user's PATH
+- **Launchd WorkingDirectory fragile** — Now uses absolute path directly (not a symlink)
+- **CORS open to all origins** — `Access-Control-Allow-Origin` tightened to `http://localhost:*`
+- **Redundant `host_permissions`** — Removed `host_permissions: ["<all_urls>"]`; `activeTab` alone is sufficient for Manifest V3
+- **Inconsistent versions** — All files now consistently report version `1.1.0` / build `11`
+- **`ws` npm version mismatch** — Unified to `^8.20.0` in package.json
+
+### Changed
+- **Server code deduplicated** — `server.js` and `server_https.js` now share all logic via `proxy_lib.js`; no more copy-paste
+- **Icon generator** — Rewritten in pure Node.js (no `canvas` dep); generates PNG icons with a geometric H-bridge design
+
+### Security
+- **CORS tightened** — REST API now only allows `http://localhost:*` origins
+
+---
+
 ## [1.1.0] — 2026-05-03
 
 ### Added
@@ -56,9 +93,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] — Future
 
-### Planned for v1.2
+### Planned for v1.3
 - Basic Auth on WebSocket + REST endpoints
-- Rate limiting (max commands per second)
 - Command idempotency keys (prevent double-execution on retry)
 - Chrome extension parity (same WebSocket approach)
 - HTTPS/TLS support for the proxy (using certificates/ca.crt)
@@ -68,3 +104,4 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Headless mode (no popup, auto-attach on browser launch)
 - Multiple tab support (switch active tab from Hermes)
 - Video frame capture for visual page understanding
+- Multi-session proxy (multiple browser sessions simultaneously)

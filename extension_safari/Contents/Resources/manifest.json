@@ -3,7 +3,7 @@
   "default_locale": "en",
   "name": "__MSG_extension_name__",
   "description": "__MSG_extension_description__",
-  "version": "1.0",
+  "version": "1.1.0",
   "icons": {
     "16": "images/icon-16.png",
     "48": "images/icon-48.png",
@@ -32,8 +32,5 @@
   },
   "permissions": [
     "activeTab"
-  ],
-  "host_permissions": [
-    "<all_urls>"
   ]
 }

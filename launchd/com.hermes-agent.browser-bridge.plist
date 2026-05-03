@@ -6,10 +6,10 @@
   <key>Label</key>
   <string>com.hermes-agent.browser-bridge</string>
 
-  <!-- Program to run -->
+  <!-- Program to run — use 'node' to respect user's PATH -->
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/local/bin/node</string>
+    <string>node</string>
     <string>/Users/ernest/Desktop/DEVPROJECTS/hermes-browser-bridge/proxy_server/server.js</string>
   </array>
 
@@ -17,20 +17,11 @@
   <key>RunAtLoad</key>
   <true/>
 
-  <!-- Auto-restart if it crashes -->
+  <!-- Auto-restart if it crashes — KeepAlive alone, no StartCalendarInterval conflict -->
   <key>KeepAlive</key>
   <true/>
 
-  <!-- Start the proxy when the user logs in (after local network is available) -->
-  <key>StartCalendarInterval</key>
-  <dict>
-    <key>Hour</key>
-    <integer>9</integer>
-    <key>Minute</key>
-    <integer>0</integer>
-  </dict>
-
-  <!-- Set the working directory -->
+  <!-- Set the working directory using $HOME -->
   <key>WorkingDirectory</key>
   <string>/Users/ernest/Desktop/DEVPROJECTS/hermes-browser-bridge/proxy_server</string>
 

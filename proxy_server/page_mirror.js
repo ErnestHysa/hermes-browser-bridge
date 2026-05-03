@@ -1,6 +1,7 @@
 /**
  * page_mirror.js — In-memory page state cache
  * Stores the latest DOM snapshot and mutation buffer from the extension.
+ * C3 FIX: tracks state per sessionId so multiple browser sessions coexist.
  */
 
 const HTML_TTL_MS = 5000;
@@ -9,38 +10,47 @@ const MUTATION_BUFFER_MAX = 100;
 
 class PageMirror {
   constructor() {
-    this.url = '';
-    this.title = '';
-    this.html = '';
-    this.lastHtmlUpdate = 0;
-    this.lastMutationUpdate = 0;
-    this.seq = 0; // snapshot sequence number
+    /**
+     * Per-session page state.
+     * Key: sessionId (string)
+     * Value: { url, title, html, lastHtmlUpdate, seq }
+     * @type {Map<string, {url: string, title: string, html: string, lastHtmlUpdate: number, seq: number}>}
+     */
+    this._sessions = new Map();
+
+    /** @type {Array<{sessionId: string, mutations: object[], url: string, ts: number}>} */
+    this._mutationBuffer = [];
+
     this.connected = false;
     this.tabId = null;
-    /** @type {Array<{mutations: object[], url: string, ts: number}>} */
-    this._mutationBuffer = [];
   }
 
   /**
-   * Update the full page snapshot.
+   * Update the full page snapshot for a session.
+   * @param {string} sessionId
    * @param {{ url: string, title: string, html: string, seq?: number }} snapshot
    */
-  updateSnapshot({ url, title, html, seq }) {
-    this.url = url;
-    this.title = title;
-    this.html = html;
-    this.lastHtmlUpdate = Date.now();
-    this.seq = seq ?? (this.seq + 1);
+  updateSnapshot(sessionId, { url, title, html, seq }) {
+    let session = this._sessions.get(sessionId);
+    if (!session) {
+      session = { url: '', title: '', html: '', lastHtmlUpdate: 0, seq: 0 };
+      this._sessions.set(sessionId, session);
+    }
+    session.url = url;
+    session.title = title;
+    session.html = html;
+    session.lastHtmlUpdate = Date.now();
+    session.seq = seq ?? (session.seq + 1);
   }
 
   /**
-   * Add mutation data to the ring buffer.
-   * Mutations are stored with a timestamp so stale ones can be filtered out.
+   * Add mutation data to the ring buffer, tagged by session.
+   * @param {string} sessionId
    * @param {{ mutations: object[], url: string }} mutationData
    */
-  addMutations({ mutations, url }) {
-    this.lastMutationUpdate = Date.now();
-    this._mutationBuffer.push({ mutations, url, ts: Date.now() });
+  addMutations(sessionId, { mutations, url }) {
+    const ts = Date.now();
+    this._mutationBuffer.push({ sessionId, mutations, url, ts });
     if (this._mutationBuffer.length > MUTATION_BUFFER_MAX) {
       this._mutationBuffer.shift();
     }
@@ -48,22 +58,46 @@ class PageMirror {
 
   /**
    * Get the current page state for Hermes.
-   * @returns {{ url: string, title: string, html: string, seq: number, connected: boolean, tabId: (string|null), lastUpdate: number, mutations: object[] }}
+   * Returns the most recently updated session's state.
+   * @returns {{ url: string, title: string, html: string, seq: number, connected: boolean, tabId: (string|null), lastUpdate: number, mutations: object[], htmlStale: boolean }}
    */
   getState() {
+    // Find the session with the most recent update
+    let latestSession = null;
+    let latestUpdate = 0;
+    for (const session of this._sessions.values()) {
+      if (session.lastHtmlUpdate > latestUpdate) {
+        latestUpdate = session.lastHtmlUpdate;
+        latestSession = session;
+      }
+    }
+
+    if (!latestSession) {
+      return {
+        url: '',
+        title: '',
+        html: '',
+        htmlStale: true,
+        seq: 0,
+        connected: this.connected,
+        tabId: this.tabId,
+        lastUpdate: 0,
+        mutations: this.getMutations()
+      };
+    }
+
     const now = Date.now();
-    const htmlFresh = (now - this.lastHtmlUpdate) < HTML_TTL_MS;
+    const htmlFresh = (now - latestSession.lastHtmlUpdate) < HTML_TTL_MS;
 
     return {
-      url: this.url,
-      title: this.title,
-      // Return empty html if stale so Hermes knows data is outdated
-      html: htmlFresh ? this.html : '',
+      url: latestSession.url,
+      title: latestSession.title,
+      html: htmlFresh ? latestSession.html : '',
       htmlStale: !htmlFresh,
-      seq: this.seq,
+      seq: latestSession.seq,
       connected: this.connected,
       tabId: this.tabId,
-      lastUpdate: this.lastHtmlUpdate,
+      lastUpdate: latestSession.lastHtmlUpdate,
       mutations: this.getMutations()
     };
   }
@@ -76,7 +110,7 @@ class PageMirror {
     const now = Date.now();
     return this._mutationBuffer
       .filter(m => (now - m.ts) < MUTATION_TTL_MS)
-      .map(m => ({ mutations: m.mutations, url: m.url, ts: m.ts }));
+      .map(m => ({ sessionId: m.sessionId, mutations: m.mutations, url: m.url, ts: m.ts }));
   }
 
   /**
@@ -96,7 +130,11 @@ class PageMirror {
    * @returns {boolean}
    */
   isFresh() {
-    return (Date.now() - this.lastHtmlUpdate) < HTML_TTL_MS;
+    let latest = 0;
+    for (const session of this._sessions.values()) {
+      if (session.lastHtmlUpdate > latest) latest = session.lastHtmlUpdate;
+    }
+    return (Date.now() - latest) < HTML_TTL_MS;
   }
 }
 

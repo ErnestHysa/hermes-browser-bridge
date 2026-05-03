@@ -115,12 +115,16 @@ async function init() {
 // ─── Button handlers ─────────────────────────────────────────────────────────
 
 activateBtn.addEventListener('click', async () => {
-  setState('connecting');
   try {
+    setState('connecting');
     await browser.runtime.sendMessage({ event: 'activate' });
-    // Response is handled by the onMessage listener above
+    // Response handled by the onMessage listener; don't set state here
+    // since 'tab_activated' or 'connected' will arrive asynchronously
   } catch (e) {
-    setState('error', { message: e.message });
+    // Only set error if we haven't already transitioned to 'active'
+    if (state !== 'active') {
+      setState('error', { message: e.message });
+    }
   }
 });
 
