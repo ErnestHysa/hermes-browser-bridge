@@ -80,6 +80,18 @@ function onBgMessage(msg) {
   } else if (msg.event === 'cmd_error') {
     pendingCmdId = null;
     addCmdLog('error', `${msg.cmdType}: ${msg.error}`);
+  } else if (msg.event === 'backpressure') {
+    // Fix #14: show backpressure PAUSED state in popup
+    if (msg.paused) {
+      pendingCmdId = null;
+      addCmdLog('pending', 'PAUSED — Hermes is catching up');
+    } else {
+      addCmdLog('success', 'Resumed — Hermes is up to date');
+    }
+  } else if (msg.event === 'hermes_session') {
+    // Fix #15: show which session Hermes is subscribed to
+    const el = document.querySelector('.hermes-session-hint');
+    if (el) el.textContent = `Session: ${msg.sessionId.slice(0, 12)}…`;
   }
 }
 

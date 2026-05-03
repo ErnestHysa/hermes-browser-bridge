@@ -54,6 +54,14 @@ function connect() {
     backpressurePaused = false;
     updateBadge('green');
     startHealthPoll();
+    // Fix #7: Persist sessionId across service worker restarts
+    chrome.storage.local.get(['hermesSessionId'], (result) => {
+      if (result.hermesSessionId) {
+        SESSION_ID = result.hermesSessionId;
+      } else {
+        chrome.storage.local.set({ hermesSessionId: SESSION_ID });
+      }
+    });
     while (pendingMessages.length > 0) {
       const msg = pendingMessages.shift();
       sendToProxy(msg);
@@ -149,6 +157,14 @@ function forwardCommandToTab(tabId, cmd) {
         } else {
           console.error(`[Hermes Bridge] Command ${cmd.type} (${cmd.cmdId}) delivery failed: ${chrome.runtime.lastError.message}`);
           const errorMsg = `Tab not ready: ${chrome.runtime.lastError.message}`;
+          // Notify via runtime message AND proxy so Hermes sees the error
+          chrome.runtime.sendMessage({
+            type: 'cmd_error',
+            cmdId: cmd.cmdId,
+            error: errorMsg,
+            tabId,
+            sessionId: SESSION_ID
+          }).catch(() => {});
           sendToProxy({ type: 'cmd_error', cmdId: cmd.cmdId, error: errorMsg, tabId, sessionId: SESSION_ID });
           notifyPopup({ event: 'cmd_error', cmdType: cmd.type, error: errorMsg });
         }

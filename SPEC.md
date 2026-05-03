@@ -90,8 +90,9 @@ Injected into every page at `document_idle`. Responsibilities:
 
 **WebSocket to Proxy**
 - Connects to `ws://localhost:9321` on extension load
-- Sends `session_announce` with its `sessionId` after connect
-- On reconnect: re-sends `session_announce` with same `sessionId` so proxy can re-associate
+- Sends `hello` handshake on connect (includes sessionId, extension version)
+- After `hello` the proxy assigns/associates the session
+- On reconnect: re-sends `hello` with same `sessionId` so proxy can re-associate
 
 **Message Routing**
 - Extension (content) → proxy: `tab_snapshot`, `mutation`, `cmd_ack`, `cmd_error`, `content_error`, `heartbeat`
@@ -141,14 +142,14 @@ For Hermes Agent's real-time push connection:
 
 ```
 1. Client connects to ws://localhost:9321/hermes
-2. Client sends: { type: 'session_announce', sessionId: 'abc123' }
+2. Client sends: { type: 'subscribe', sessionId: 'abc123' }
 3. Proxy sends: { type: 'subscribed', sessionId: 'abc123' }
 4. Proxy pushes: { type: 'command', cmdId: '...', type: 'click', selector: '#btn' }
 5. Client (Hermes) sends: { type: 'ack', cmdId: '...' } (optional)
 6. Proxy receives ack/error from extension, forwards to Hermes WS
 ```
 
-The proxy routes commands to the correct session based on the `sessionId` in `session_announce`.
+The proxy routes commands to the correct session based on the `sessionId` in `subscribe`.
 If Hermes sends a `command` without announcing first, it is routed to the most recently active session.
 
 **HTTP Endpoint `/command`**
@@ -203,19 +204,20 @@ Tracks pending commands awaiting `cmd_ack` or `cmd_error` from the extension.
 
 ```javascript
 PORT: 9321,                    // HTTP/WebSocket port
-RATE_LIMIT_RPS: 5,             // Max commands per second per session
+RATE_LIMIT_RPS: 20,           // Max commands per second per session
 CMD_TIMEOUT_MS: 30000,        // Command timeout (ms)
 MAX_HTML_BYTES: 10 * 1024 * 1024,  // Max HTML snapshot size (10MB)
-MAX_STRUCTURAL_CHANGES: 200,  // Max mutations per batch
+MAX_STRUCTURAL_CHANGES: 500,  // Max mutations per batch
 FULL_SNAPSHOT_INTERVAL_MS: 3000,   // ms between full HTML snapshots
 MAJOR_MUTATION_DEBOUNCE_MS: 300,   // ms to wait before full snapshot after major mutation
 HEARTBEAT_INTERVAL_MS: 15000,  // content.js → background.js heartbeat interval
-BACKPRESSURE_THRESHOLD: 50,   // Mutations queued before backpressure kicks in
+BACKPRESSURE_THRESHOLD_MS: 500, // ms of estimated send time above which backpressure triggers
 MAX_PENDING_MESSAGES: 100,    // Extension → proxy pending queue depth
 MAX_IDEMPOTENCY_CACHE: 1000,   // Max entries in the idempotency cache
 IDEMPOTENCY_TTL_MS: 60000,    // How long idempotency keys live (ms)
 SESSION_MAX_AGE_MS: 3600000,  // Evict sessions inactive for 1 hour
 MAX_SESSIONS: 100,             // Max concurrent sessions before LRU eviction
+MUTATION_BUFFER_MAX: 500,      // Max mutations per session ring buffer
 ```
 
 ---
@@ -242,7 +244,7 @@ MAX_SESSIONS: 100,             // Max concurrent sessions before LRU eviction
 |---|---|---|
 | Safari 16+ (macOS) | Safari Web Extension | ✅ Implemented |
 | Chrome 120+ (macOS/Windows/Linux) | Manifest V3 Web Extension | ✅ Implemented |
-| Firefox 120+ | Web Extension (MV3) | Not tested — should work with minor API changes (`browser.*` vs `chrome.*`) |
+| Firefox 120+ | Web Extension (MV3) | Not currently supported — Firefox MV3 extensions require a different architecture and distribution model |
 
 ---
 
@@ -260,9 +262,10 @@ MAX_SESSIONS: 100,             // Max concurrent sessions before LRU eviction
 
 ## 7. Version History
 
-| Version | Date | Changes |
+|| Version | Date | Changes ||
 |---|---|---|
-| 1.3.0 | 2026-05-03 | R25 audit fixes: Hermes WS push redesign, backpressure, session management, command cancellation, Safari + Chrome extension parity, Prometheus metrics, requestIdleCallback, $HOME launchd path, popup listener cleanup, HTTPS shutdown fix, chunked WS |
-| 1.2.0 | 2026-04 | Hermes WebSocket push endpoint added |
-| 1.1.0 | 2026-04 | HTTPS variant, command queue, idempotency cache |
-| 1.0.0 | 2026-03 | Initial release: Safari extension + HTTP proxy |
+|| 1.3.1 | 2026-05-03 | R26 audit fixes: RunAtLoad, backpressure threshold 500ms, mutation buffer 500, rate limit 20 rps, nodemon dev script, navigate handler (Safari), clearNavigateHandlers guard, Chrome popup pendingCmdId fix, Chrome storage persistence, cmd delivery error forwarding, x,y coordinate click, manifest page exclusions, Prometheus format (# TYPE/# HELP), conditional HTML snapshots, popup PAUSED indicator, SPEC.md/config.js sync ||
+|| 1.3.0 | 2026-05-03 | R25 audit fixes: Hermes WS push redesign, backpressure, session management, command cancellation, Safari + Chrome extension parity, Prometheus metrics, requestIdleCallback, $HOME launchd path, popup listener cleanup, HTTPS shutdown fix, chunked WS ||
+|| 1.2.0 | 2026-04 | Hermes WebSocket push endpoint added ||
+|| 1.1.0 | 2026-04 | HTTPS variant, command queue, idempotency cache ||
+|| 1.0.0 | 2026-03 | Initial release: Safari extension + HTTP proxy ||

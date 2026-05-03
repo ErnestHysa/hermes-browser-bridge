@@ -145,6 +145,14 @@ function forwardCommandToTab(cmd) {
       } else {
         console.error(`[Hermes Bridge] Command ${cmd.type} (${cmd.cmdId}) could not be delivered`);
         const errorMsg = `Tab not ready: ${err.message || 'delivery failed'}`;
+        // Also notify the extension's background via browser.runtime so Hermes sees it
+        browser.runtime.sendMessage({
+          type: 'cmd_error',
+          cmdId: cmd.cmdId,
+          error: errorMsg,
+          tabId: currentTabId,
+          sessionId: SESSION_ID
+        }).catch(() => {});
         sendToProxy({ type: 'cmd_error', cmdId: cmd.cmdId, error: errorMsg, tabId: currentTabId, sessionId: SESSION_ID });
         notifyPopup({ event: 'cmd_error', cmdType: cmd.type, error: errorMsg });
       }

@@ -6,8 +6,11 @@
  *   npx playwright install chromium
  *   node tests/smoke.test.js
  *
- * Or with @playwright/test:
- *   npx playwright test tests/smoke.test.js
+ * For running smoke tests (requires the proxy server to already be running):
+ *   node tests/smoke.test.js
+ *
+ * For running the shell smoke test (starts/stops the proxy automatically):
+ *   bash tests/smoke_test.sh
  *
  * These are LOCAL smoke tests — they verify the proxy server, WebSocket,
  * and HTTP endpoints without requiring the Safari/Chrome extension to be installed.

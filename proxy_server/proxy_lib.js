@@ -168,13 +168,21 @@ function formatPrometheus() {
     if (values.length === 0) continue;
     const sum = values.reduce((a, b) => a + b, 0);
     const count = values.length;
-    lines.push(`# TYPE hbs_command_duration_seconds histogram [type=${type}]`);
+    lines.push(`# TYPE hbs_command_duration_seconds histogram`);
     lines.push(`hbs_command_duration_seconds_sum{type="${type}"} ${(sum / 1000).toFixed(4)}`);
     lines.push(`hbs_command_duration_seconds_count{type="${type}"} ${count}`);
   }
 
   for (const entry of metrics.histograms.htmlBytes) {
+    lines.push(`# TYPE hbs_html_bytes gauge`);
+    lines.push(`# HELP hbs_html_bytes HTML snapshot size in bytes received by proxy`);
     lines.push(`hbs_html_bytes ${entry.value} ${entry.ts}`);
+  }
+
+  for (const entry of metrics.histograms.mutationBufferSize) {
+    lines.push(`# TYPE hbs_mutation_buffer_size gauge`);
+    lines.push(`# HELP hbs_mutation_buffer_size Number of mutations in buffer`);
+    lines.push(`hbs_mutation_buffer_size ${entry.value} ${entry.ts}`);
   }
 
   return lines.join('\n');

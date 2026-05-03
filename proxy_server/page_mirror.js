@@ -12,7 +12,7 @@
 
 const HTML_TTL_MS = 5000;
 const MUTATION_TTL_MS = 30000;
-const MUTATION_BUFFER_MAX = 100;
+const MUTATION_BUFFER_MAX = 500;
 const SESSION_TTL_MS = 300000; // 5 minutes after disconnect
 const DEFAULT_MAX_HTML_BYTES = 10 * 1024 * 1024; // 10MB
 

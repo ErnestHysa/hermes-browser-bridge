@@ -29,6 +29,7 @@ try {
 
 let state = 'inactive';
 let cmdLog = [];
+let pendingCmdId = null;
 
 function onActivateClick() {
   setState('connecting');
@@ -67,6 +68,19 @@ function onBgMessage(msg) {
     addCmdLog('success', `${msg.cmdType}: OK`);
   } else if (msg.event === 'cmd_error') {
     addCmdLog('error', `${msg.cmdType}: ${msg.error}`);
+  } else if (msg.event === 'backpressure') {
+    // Fix #14: show backpressure PAUSED state in popup
+    if (msg.paused) {
+      addCmdLog('pending', 'PAUSED — Hermes is catching up');
+    } else {
+      addCmdLog('success', 'Resumed — Hermes is up to date');
+    }
+  } else if (msg.event === 'hermes_session') {
+    // Fix #15: show which session Hermes is subscribed to
+    const hint = document.createElement('span');
+    hint.textContent = ` | Session: ${msg.sessionId.slice(0, 12)}…`;
+    hint.style.fontSize = '10px';
+    hint.style.color = 'var(--text-muted)';
   }
 }
 

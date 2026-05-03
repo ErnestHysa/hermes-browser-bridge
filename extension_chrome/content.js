@@ -22,7 +22,15 @@ let debounceTimer = null;
 let navigateFailTimer = null;
 let lastNavigateCmdId = null;
 
-let _navLoadHandler = null;
+// Fix #13: skip periodic full HTML send when page hasn't changed
+let lastSnapshotHash = '';
+function snapshotHash() {
+  const body = document.body;
+  const sample = (body && body.textContent) ? body.textContent.slice(0, 200) : '';
+  return `${document.title}:${document.contentType}:${sample.length}:${(body && body.childElementCount) || 0}:${sample}`;
+}
+
+// ─── Navigate handler (Chrome) ─────────────────────────────────────────────────
 let _navPageShowHandler = null;
 
 function clearNavigateHandlers() {
@@ -192,7 +200,12 @@ function setupMutationObserver() {
   if (snapshotInterval !== null) clearInterval(snapshotInterval);
   snapshotInterval = setInterval(() => {
     const snap = getFullPageSnapshot();
-    sendToBackground({ type: 'tab_snapshot', ...snap, incremental: false });
+    const hash = snapshotHash();
+    // Fix #13: only send if the DOM state actually changed
+    if (hash !== lastSnapshotHash) {
+      lastSnapshotHash = hash;
+      sendToBackground({ type: 'tab_snapshot', ...snap, incremental: false });
+    }
   }, FULL_SNAPSHOT_INTERVAL_MS);
 }
 
@@ -235,6 +248,31 @@ const CMD_HANDLERS = {
   },
 
   click(cmd) {
+    // Support coordinate-based click: { x, y } with optional selector
+    if (cmd.x !== undefined && cmd.y !== undefined) {
+      const clickEvent = new MouseEvent('click', {
+        clientX: cmd.x,
+        clientY: cmd.y,
+        bubbles: true,
+        cancelable: true
+      });
+      if (cmd.selector) {
+        const el = document.querySelector(cmd.selector);
+        if (el) {
+          el.dispatchEvent(clickEvent);
+        } else {
+          pendingCommands.delete(cmd.cmdId);
+          sendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, success: false, error: `Element not found: ${cmd.selector}` });
+          return;
+        }
+      } else {
+        document.elementFromPoint(cmd.x, cmd.y)?.dispatchEvent(clickEvent);
+      }
+      pendingCommands.delete(cmd.cmdId);
+      sendToBackground({ type: 'cmd_ack', cmdId: cmd.cmdId, success: true, result: `Clicked at (${cmd.x}, ${cmd.y})` });
+      return;
+    }
+
     const el = document.querySelector(cmd.selector);
     if (!el) {
       pendingCommands.delete(cmd.cmdId);

@@ -235,19 +235,39 @@ curl http://localhost:9321/metrics
 
 ## Step 8: (Optional) HTTPS Proxy
 
-For accessing the proxy from other machines on your network, use the HTTPS variant:
+For accessing the proxy from other machines on your network (e.g., a second Mac on the same LAN), use the HTTPS variant:
 
 ```bash
 cd ~/Desktop/DEVPROJECTS/hermes-browser-bridge/proxy_server
 node server_https.js
 ```
 
-Runs on `https://localhost:9322`. You must first install the CA cert:
+Runs on `https://localhost:9322`. Before using HTTPS, install the CA cert so your browser trusts the proxy's TLS certificate:
+
 ```bash
+# Generate a local CA + server cert if you haven't already:
+cd ~/Desktop/DEVPROJECTS/hermes-browser-bridge
+mkdir -p certificates
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+  -keyout certificates/ca.key -out certificates/ca.crt \
+  -days 397 -subj "/CN=HermesBrowserBridge CA" -nodes
+
+# Install the CA cert as trusted (requires sudo for system keychain):
 sudo security add-trusted-cert -d -r trustRoot \
   -k /Library/Keychains/System.keychain \
   ~/Desktop/DEVPROJECTS/hermes-browser-bridge/certificates/ca.crt
+
+# For macOS Sonoma 14+ you may also need:
+sudo security add-trusted-cert -d -r trustAsRoot \
+  -k /Library/Keychains/System.keychain \
+  ~/Desktop/DEVPROJECTS/hermes-browser-bridge/certificates/ca.crt
 ```
+
+After installing the CA cert, point your browser to `https://localhost:9322` instead of `http://localhost:9321`.
+
+> **Security note for production:** The CA cert approach is fine for personal/local use. For multi-user or internet-facing deployments, use ACME (Let's Encrypt) certificates or a proper PKI. The HTTPS variant also supports serving a valid cert from Let's Encrypt or another CA — just replace the cert/key paths in `server_https.js`.
+
+> **End-to-end encryption (future):** When the proxy is accessed over a network instead of localhost, add a pre-shared key (HMAC) or TLS mTLS so traffic cannot be intercepted in transit. This is on the roadmap as `encryptedTransport` in SPEC.md.
 
 ---
 

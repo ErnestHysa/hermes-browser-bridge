@@ -31,6 +31,14 @@ let debounceTimer = null;
 let navigateFailTimer = null;
 let lastNavigateCmdId = null;
 
+// Fix #13: skip periodic full HTML send when page hasn't changed
+let lastSnapshotHash = '';
+function snapshotHash() {
+  const body = document.body;
+  const sample = (body && body.textContent) ? body.textContent.slice(0, 200) : '';
+  return `${document.title}:${document.contentType}:${sample.length}:${(body && body.childElementCount) || 0}:${sample}`;
+}
+
 // ─── Navigate handler leak fix ─────────────────────────────────────────────────
 
 /** @type {((...args: any[]) => void)|null} */
@@ -139,6 +147,7 @@ function _buildStructuralSnapshot(changedTexts = []) {
 function captureInitialSnapshot() {
   // Synchronous snapshot before observer touches anything
   const snap = getFullPageSnapshot();
+  lastSnapshotHash = snapshotHash();
   sendToBackground({ type: 'tab_snapshot', ...snap, incremental: false, _initial: true })
     .then(() => {
       // Observer starts only after first snapshot is confirmed sent
@@ -243,7 +252,12 @@ function setupMutationObserver() {
   if (snapshotInterval !== null) clearInterval(snapshotInterval);
   snapshotInterval = setInterval(() => {
     const snap = getFullPageSnapshot();
-    sendToBackground({ type: 'tab_snapshot', ...snap, incremental: false });
+    const hash = snapshotHash();
+    // Fix #13: only send if the DOM state actually changed
+    if (hash !== lastSnapshotHash) {
+      lastSnapshotHash = hash;
+      sendToBackground({ type: 'tab_snapshot', ...snap, incremental: false });
+    }
   }, FULL_SNAPSHOT_INTERVAL_MS);
 }
 
@@ -260,12 +274,84 @@ function sendToBackground(msg) {
 
 const CMD_HANDLERS = {
   navigate(cmd) {
-    setupNavigateResolver(cmd.cmdId, cmd.url);
+    // Clean up any previous navigate handlers before setting up new ones
+    clearNavigateHandlers();
+    lastNavigateCmdId = cmd.cmdId;
+
+    // Fail-safe: if page doesn't fire load/pageshow within 10s, treat as blocked
+    navigateFailTimer = setTimeout(() => {
+      if (lastNavigateCmdId === cmd.cmdId) {
+        clearNavigateHandlers();
+        pendingCommands.delete(cmd.cmdId);
+        sendToBackground({
+          type: 'cmd_error',
+          cmdId: cmd.cmdId,
+          success: false,
+          error: `Navigation to ${cmd.url} was blocked or timed out`
+        });
+      }
+    }, 10000);
+
+    _navLoadHandler = () => {
+      // Page finished loading
+      clearNavigateHandlers();
+      pendingCommands.delete(cmd.cmdId);
+      sendToBackground({
+        type: 'cmd_ack',
+        cmdId: cmd.cmdId,
+        success: true,
+        result: `Navigated to ${cmd.url}`
+      });
+    };
+
+    _navPageShowHandler = () => {
+      // pageshow fires on bfcache restore too — treat as navigation success
+      if (lastNavigateCmdId === cmd.cmdId) {
+        clearNavigateHandlers();
+        pendingCommands.delete(cmd.cmdId);
+        sendToBackground({
+          type: 'cmd_ack',
+          cmdId: cmd.cmdId,
+          success: true,
+          result: `Navigated to ${cmd.url}`
+        });
+      }
+    };
+
+    window.addEventListener('load', _navLoadHandler);
+    window.addEventListener('pageshow', _navPageShowHandler);
     sendToBackground({ type: '_navigate', cmdId: cmd.cmdId, url: cmd.url })
       .catch(() => {});
   },
 
   click(cmd) {
+    // Support coordinate-based click: { x, y } with optional selector for element visibility check
+    if (cmd.x !== undefined && cmd.y !== undefined) {
+      const clickEvent = new MouseEvent('click', {
+        clientX: cmd.x,
+        clientY: cmd.y,
+        bubbles: true,
+        cancelable: true
+      });
+      // If a selector is provided, click the element at those coordinates (if it exists)
+      if (cmd.selector) {
+        const el = document.querySelector(cmd.selector);
+        if (el) {
+          el.dispatchEvent(clickEvent);
+        } else {
+          pendingCommands.delete(cmd.cmdId);
+          sendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, success: false, error: `Element not found: ${cmd.selector}` });
+          return;
+        }
+      } else {
+        // Click at raw coordinates
+        document.elementFromPoint(cmd.x, cmd.y)?.dispatchEvent(clickEvent);
+      }
+      pendingCommands.delete(cmd.cmdId);
+      sendToBackground({ type: 'cmd_ack', cmdId: cmd.cmdId, success: true, result: `Clicked at (${cmd.x}, ${cmd.y})` });
+      return;
+    }
+
     const el = document.querySelector(cmd.selector);
     if (!el) {
       pendingCommands.delete(cmd.cmdId);

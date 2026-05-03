@@ -12,13 +12,13 @@
 
 // ─── Rate Limiting (Fix #P3-14) ───────────────────────────────────────────────
 
-const RATE_LIMIT_RPS = parseInt(process.env.HBS_RATE_LIMIT_RPS || '5', 10);
+const RATE_LIMIT_RPS = parseInt(process.env.HBS_RATE_LIMIT_RPS || '20', 10);
 const RATE_LIMIT_BURST = parseInt(process.env.HBS_RATE_LIMIT_BURST || '10', 10);
 
 // ─── Backpressure (Fix #P2-8) ─────────────────────────────────────────────────
 
 // ms of estimated send time above which backpressure is triggered
-const BACKPRESSURE_THRESHOLD_MS = parseInt(process.env.HBS_BACKPRESSURE_THRESHOLD_MS || '2000', 10);
+const BACKPRESSURE_THRESHOLD_MS = parseInt(process.env.HBS_BACKPRESSURE_THRESHOLD_MS || '500', 10);
 
 // ─── Metrics (Fix #P2-9) ───────────────────────────────────────────────────────
 
