@@ -40,10 +40,17 @@ class PageMirror {
     this._lastSeqPerSession = new Map();
 
     /**
-     * Mutation ring buffer — all mutations, tagged by sessionId.
-     * @type {Array<{sessionId: string, mutations: object[], url: string, seq: number, ts: number}>}
+     * H4: Per-session mutation buffers — each session gets its own ring buffer.
+     * Key: sessionId. Value: array of {mutations, url, seq, ts}.
+     * This prevents an active session from evicting another session's mutations.
+     * @type {Map<string, Array<{mutations: object[], url: string, seq: number, ts: number}>}
      */
-    this._mutationBuffer = [];
+    this._mutationBuffers = new Map();
+
+    /**
+     * H4: Per-buffer constants. Each session buffer maxes out independently.
+     */
+    this._mutationBufferMax = MUTATION_BUFFER_MAX;  // 500 per session
 
     /**
      * Global connected flag — true when at least one session is connected.
@@ -128,16 +135,10 @@ class PageMirror {
 
   /**
    * Evict sessions disconnected for longer than SESSION_TTL_MS.
+   * Public entry point — delegates to internal (used by background timer).
    */
   evictStaleSessions() {
-    const now = Date.now();
-    for (const [sessionId, session] of this._sessions) {
-      if (!session.connected && (now - session.lastHtmlUpdate) > this._sessionTtlMs) {
-        this._sessions.delete(sessionId);
-        this._lastSeqPerSession.delete(sessionId);
-        this._mutationBuffer = this._mutationBuffer.filter(m => m.sessionId !== sessionId);
-      }
-    }
+    this._evictStaleSessionsInternal();
   }
 
   /**
@@ -147,15 +148,18 @@ class PageMirror {
    */
   addMutations(sessionId, { mutations, url, seq }) {
     const ts = Date.now();
-    // Fix #4: Warn when dropping oldest mutation due to buffer overflow
-    if (this._mutationBuffer.length >= MUTATION_BUFFER_MAX) {
-      console.warn(`[PageMirror] Mutation buffer full — dropping oldest entry for session ${sessionId}`);
+    if (!this._mutationBuffers.has(sessionId)) {
+      this._mutationBuffers.set(sessionId, []);
     }
-    this._mutationBuffer.push({ sessionId, mutations, url, seq, ts });
-    if (this._mutationBuffer.length > MUTATION_BUFFER_MAX) {
-      // Fix #4: Signal when oldest mutations are dropped due to buffer overflow
-      const dropped = this._mutationBuffer.shift();
-      log('warn', `Mutation buffer overflow — dropped ${dropped.mutations.length} oldest mutation(s) for session ${dropped.sessionId}`);
+    const buf = this._mutationBuffers.get(sessionId);
+    // H4: Warn when dropping oldest mutation for this specific session's buffer
+    if (buf.length >= this._mutationBufferMax) {
+      console.warn(`[PageMirror] Mutation buffer full for session ${sessionId} — dropping oldest entry`);
+    }
+    buf.push({ mutations, url, seq, ts });
+    if (buf.length > this._mutationBufferMax) {
+      const dropped = buf.shift();
+      log('warn', `Mutation buffer overflow for session ${sessionId} — dropped ${dropped.mutations.length} mutation(s)`);
     }
   }
 
@@ -168,7 +172,15 @@ class PageMirror {
    * @returns {{ url: string, title: string, html: string, seq: number, connected: boolean, tabId: (string|null), lastUpdate: number, mutations: object[], htmlStale: boolean }}
    */
   getState(sessionId, lastSeq = 0) {
-    this.evictStaleSessions();
+    // S2: Only run eviction on read if we haven't run it recently (debounce to once per 5s)
+    // The background timer handles the regular eviction; this is a safety net.
+    const now = Date.now();
+    if (!this._lastEvictCheck || (now - this._lastEvictCheck) > 5000) {
+      this._lastEvictCheck = now;
+      const before = this._anyConnected;
+      this._evictStaleSessionsInternal();
+      this._anyConnected = Array.from(this._sessions.values()).some(s => s.connected);
+    }
 
     let targetSession = this._sessions.get(sessionId);
     let actualSessionId = sessionId;
@@ -193,12 +205,12 @@ class PageMirror {
       };
     }
 
-    const now = Date.now();
     const htmlFresh = (now - targetSession.lastHtmlUpdate) < HTML_TTL_MS;
 
-    // Only return mutations for this session with seq > lastSeq
-    const mutations = this._mutationBuffer
-      .filter(m => m.sessionId === actualSessionId && m.seq > lastSeq && (now - m.ts) < MUTATION_TTL_MS)
+    // H4: Get mutations from this session's dedicated buffer, not a global one
+    const sessionMutations = this._mutationBuffers.get(actualSessionId) || [];
+    const mutations = sessionMutations
+      .filter(m => m.seq > lastSeq && (now - m.ts) < MUTATION_TTL_MS)
       .map(m => ({ mutations: m.mutations, url: m.url, seq: m.seq, ts: m.ts }));
 
     return {
@@ -212,6 +224,18 @@ class PageMirror {
       lastUpdate: targetSession.lastHtmlUpdate,
       mutations
     };
+  }
+
+  /** Internal eviction without the per-read debounce check — used by background timer */
+  _evictStaleSessionsInternal() {
+    const now = Date.now();
+    for (const [sessionId, session] of this._sessions) {
+      if (!session.connected && (now - session.lastHtmlUpdate) > this._sessionTtlMs) {
+        this._sessions.delete(sessionId);
+        this._lastSeqPerSession.delete(sessionId);
+        this._mutationBuffers.delete(sessionId);
+      }
+    }
   }
 
   /**

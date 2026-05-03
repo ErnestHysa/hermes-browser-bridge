@@ -30,6 +30,46 @@ let navigateFailTimer = null;
 let lastNavigateCmdId = null;
 let backpressurePaused = false;  // Fix #6: stop MutationObserver batching when Hermes is slow
 
+// C1: Mutation batching — buffer mutations and flush in batches to avoid flooding the pipeline
+const MUTATION_FLUSH_INTERVAL_MS = 500;   // flush buffered mutations every 500ms
+const MUTATION_BUFFER_MAX = 100;          // flush immediately if buffer reaches this
+/** @type {{mutations: object[], url: string, seq: number}[]} */
+let _mutationSendBuffer = [];
+let _mutationFlushTimer = null;
+
+function _flushMutationBuffer() {
+  if (_mutationSendBuffer.length === 0) return;
+  const toSend = _mutationSendBuffer.splice(0, _mutationSendBuffer.length);
+  sendToBackground({
+    type: 'mutation_batch',
+    mutations: toSend,
+    url: toSend[0]?.url || window.location.href,
+    seq: toSend[toSend.length - 1]?.seq || 0
+  });
+}
+
+function _scheduleMutationFlush() {
+  if (_mutationFlushTimer !== null) return;
+  _mutationFlushTimer = setTimeout(() => {
+    _mutationFlushTimer = null;
+    _flushMutationBuffer();
+  }, MUTATION_FLUSH_INTERVAL_MS);
+}
+
+function _pushMutationToBuffer(mutationEntry) {
+  _mutationSendBuffer.push(mutationEntry);
+  // Flush immediately if buffer is full (avoid dropping individual entries)
+  if (_mutationSendBuffer.length >= MUTATION_BUFFER_MAX) {
+    if (_mutationFlushTimer !== null) {
+      clearTimeout(_mutationFlushTimer);
+      _mutationFlushTimer = null;
+    }
+    _flushMutationBuffer();
+    return;
+  }
+  _scheduleMutationFlush();
+}
+
 // Fix #13: skip periodic full HTML send when page hasn't changed
 let lastSnapshotHash = '';
 function snapshotHash() {
@@ -224,10 +264,10 @@ function setupMutationObserver() {
       }
     }
 
-    // Fix #6: When backpressure is active, skip sending mutation events to reduce load
+    // C1: When backpressure is active, skip batching — mutations are buffered
+    // individually so we can drop them if needed rather than send a huge batch
     if (!backpressurePaused) {
-      sendToBackground({
-        type: 'mutation',
+      _pushMutationToBuffer({
         mutations: mutationsData,
         url: window.location.href,
         seq: window._snapshotSeq || 0
@@ -513,6 +553,12 @@ window.addEventListener('unload', () => {
     clearTimeout(debounceTimer);
     debounceTimer = null;
   }
+  // C1: Flush any pending buffered mutations before unloading
+  if (_mutationFlushTimer !== null) {
+    clearTimeout(_mutationFlushTimer);
+    _mutationFlushTimer = null;
+  }
+  _flushMutationBuffer();
   clearNavigateHandlers();
   for (const [cmdId, pending] of pendingCommands) {
     if (pending.reject && !pending.settled) {

@@ -11,6 +11,7 @@
 const { EventEmitter } = require('node:events');
 
 const DEFAULT_TIMEOUT_MS = 30000;
+const MAX_COMPLETED = 2000; // H1: hard cap to prevent unbounded memory growth
 
 class CommandQueue extends EventEmitter {
   constructor(timeoutMs = DEFAULT_TIMEOUT_MS) {
@@ -19,6 +20,8 @@ class CommandQueue extends EventEmitter {
     this.pending = new Map();
     /** @type {Map<string, { status: string, result?: any, error?: string, timestamp: number }>} */
     this.completed = new Map();
+    /** H1: Track oldest entry timestamp for eviction ordering */
+    this._completedOrder = [];  // ordered array of cmdId (oldest first)
     this.timeoutMs = timeoutMs;
   }
 
@@ -30,6 +33,14 @@ class CommandQueue extends EventEmitter {
    * @param {object} cmd
    * @param {number} [submittedAt] — timestamp when command was first queued, for metrics
    */
+  /** H1: Enforce MAX_COMPLETED size cap — evict oldest entries when exceeded */
+  _capCompleted() {
+    while (this._completedOrder.length >= MAX_COMPLETED) {
+      const oldest = this._completedOrder.shift();
+      this.completed.delete(oldest);
+    }
+  }
+
   add(cmdId, cmd, submittedAt = Date.now()) {
     return new Promise((resolve, reject) => {
       this.completed.delete(cmdId);
@@ -56,6 +67,8 @@ class CommandQueue extends EventEmitter {
     clearTimeout(entry.timer);
     this.pending.delete(cmdId);
     this.completed.set(cmdId, { status: 'cancelled', timestamp: Date.now() });
+      this._completedOrder.push(cmdId);
+      this._capCompleted(); // H1: enforce MAX_COMPLETED cap
     entry.resolve({ success: false, error: 'cancelled' });
     this.emit('cancel', cmdId, entry.cmd);
     return true;
@@ -75,6 +88,8 @@ class CommandQueue extends EventEmitter {
     clearTimeout(entry.timer);
     this.pending.delete(cmdId);
     this.completed.set(cmdId, { status: 'done', result, timestamp: Date.now() });
+      this._completedOrder.push(cmdId);
+      this._capCompleted(); // H1: enforce MAX_COMPLETED cap
     entry.resolve({ success: true, result });
     this.emit('ack', cmdId, result);
   }
@@ -93,6 +108,8 @@ class CommandQueue extends EventEmitter {
     clearTimeout(entry.timer);
     this.pending.delete(cmdId);
     this.completed.set(cmdId, { status: 'error', error, timestamp: Date.now() });
+      this._completedOrder.push(cmdId);
+      this._capCompleted(); // H1: enforce MAX_COMPLETED cap
     entry.resolve({ success: false, error });
     this.emit('error', cmdId, error);
   }

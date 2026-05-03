@@ -14,8 +14,11 @@
 
 const DEFAULT_PROXY_PORT = 9321;
 
+// M4: Configurable proxy port — defaults to 9321, can be updated at runtime
+let _proxyPort = DEFAULT_PROXY_PORT;
+
 function getProxyWsUrl() {
-  return `ws://localhost:${DEFAULT_PROXY_PORT}`;
+  return `ws://localhost:${_proxyPort}`;
 }
 
 const PROXY_WS_URL = getProxyWsUrl();
@@ -43,22 +46,40 @@ function connect() {
     return;
   }
 
-  socket = new WebSocket(PROXY_WS_URL);
+  socket = new WebSocket(getProxyWsUrl());
 
   socket.addEventListener('open', () => {
     connected = true;
     backpressurePaused = false; // P2-8
     updateBadge('green');
     startHealthPoll();
+    // C2: Send hello with auth token so proxy knows this is a legitimate extension
+    // Token is optional on the proxy side when HBS_AUTH_TOKEN is not set (dev mode)
+    socket.send(JSON.stringify({
+      type: 'hello',
+      token: typeof HBS_AUTH_TOKEN !== 'undefined' ? HBS_AUTH_TOKEN : null,
+      extension: 'safari',
+      version: browser.runtime.getManifest?.version || 'unknown'
+    }));
     // Fix #6: Notify content script that backpressure is cleared on reconnect
     if (currentTabId) {
       browser.tabs.sendMessage(currentTabId, { type: 'backpressure', paused: false }).catch(() => {});
     }
+    // S3: Send session_info so the proxy knows our metadata
+    socket.send(JSON.stringify({
+      type: 'session_info',
+      sessionId: SESSION_ID,
+      extension: 'safari',
+      version: browser.runtime.getManifest?.version || 'unknown',
+      tabId: currentTabId
+    }));
     while (pendingMessages.length > 0) {
       const msg = pendingMessages.shift();
       sendToProxy(msg);
     }
     notifyPopup({ event: 'connected' });
+    // S6: Notify popup of the Hermes session ID so it can display it
+    notifyPopup({ event: 'hermes_session', sessionId: SESSION_ID });
   });
 
   socket.addEventListener('message', (event) => {
@@ -267,6 +288,13 @@ function notifyPopup(data) {
 // ─── Browser events ─────────────────────────────────────────────────────────
 
 browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type === 'setProxyPort' && typeof message.port === 'number') {
+    // M4: Allow popup/options to update proxy port at runtime
+    _proxyPort = message.port;
+    sendResponse({ ok: true, port: _proxyPort });
+    return true;
+  }
+
   if (message.event === 'getStatus') {
     sendResponse({
       connected,
@@ -334,9 +362,10 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   // Extension → proxy messages
-  if (message.type === 'tab_snapshot' || message.type === 'mutation' || message.type === 'heartbeat') {
+  if (message.type === 'tab_snapshot' || message.type === 'mutation' || message.type === 'mutation_batch' || message.type === 'heartbeat') {
     // P2-8: don't send if backpressure paused (mutation events are high-volume)
-    if (message.type === 'mutation' && backpressurePaused) return true;
+    // C1: mutation_batch is already batched on the content side so we send it regardless
+    if ((message.type === 'mutation' || message.type === 'mutation_batch') && backpressurePaused) return true;
     sendToProxy({ ...message, tabId: currentTabId, sessionId: SESSION_ID });
     return true;
   }

@@ -23,6 +23,7 @@
 const { WebSocketServer } = require('ws');
 const { createHash } = require('crypto');
 const { randomUUID } = require('node:crypto');
+const { createGzip } = require('zlib');  // S5: gzip compression
 
 const { CommandQueue } = require('./cmd_queue');
 const { PageMirror } = require('./page_mirror');
@@ -38,6 +39,7 @@ const PRUNE_INTERVAL_MS = 120000;
 const RATE_LIMIT_RPS = cfg.RATE_LIMIT_RPS;        // P3-14: from config.js
 const RATE_LIMIT_BURST = cfg.RATE_LIMIT_BURST;
 const BACKPRESSURE_THRESHOLD_MS = cfg.BACKPRESSURE_THRESHOLD_MS; // P2-8: from config.js
+const WS_SEND_TIMEOUT_MS = 30000;  // H2: force-close socket if send() blocks for >30s
 
 // ─── Structured Logging ────────────────────────────────────────────────────────
 
@@ -48,7 +50,13 @@ const BACKPRESSURE_THRESHOLD_MS = cfg.BACKPRESSURE_THRESHOLD_MS; // P2-8: from c
  * @param {object} extras
  */
 const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
-const CURRENT_LOG_LEVEL = LOG_LEVELS[cfg.LOG_LEVEL] ?? LOG_LEVELS.info;
+const CURRENT_LOG_LEVEL = LOG_LEVELS[cfg.LOG_LEVEL] !== undefined ? LOG_LEVELS[cfg.LOG_LEVEL] : LOG_LEVELS.info;  // L1: use explicit undefined check — 0 (debug) is falsy but valid
+
+/** L2: Warn + fallback for missing message fields */
+function _warnDefault(field, value) {
+  log('warn', `WS message missing '${field}' — using 'default'`, { field, value });
+  return 'default';
+}
 
 function log(level, msg, extras = {}) {
   if (LOG_LEVELS[level] === undefined || LOG_LEVELS[level] < CURRENT_LOG_LEVEL) return;
@@ -116,15 +124,33 @@ function metricGauge(name, value) {
   if (metrics.gauges[name] !== undefined) metrics.gauges[name] = value;
 }
 
+// M2: Track last TTL cleanup time to avoid running on every push
+let _metricLastCleanup = 0;
+const METRIC_TTL_MS = 60000;        // entries older than this are pruned
+const METRIC_MAX_PER_TYPE = 1000;   // hard cap per histogram+type
+
 function metricHistogramPush(histName, value, labels = {}) {
   const type = labels.type || 'unknown';
   if (!metrics.histograms[histName][type]) {
     metrics.histograms[histName][type] = [];
   }
   metrics.histograms[histName][type].push({ value, labels, ts: Date.now() });
-  // Keep last 1000 entries per type
-  if (metrics.histograms[histName][type].length > 1000) {
-    metrics.histograms[histName][type].shift();
+  // M2: Periodic TTL cleanup — run at most every 60s to avoid O(n) on every call
+  const now = Date.now();
+  if (!_metricLastCleanup || (now - _metricLastCleanup) > METRIC_TTL_MS) {
+    _metricLastCleanup = now;
+    for (const [histName2, entries] of Object.entries(metrics.histograms)) {
+      for (const [type, arr] of Object.entries(entries)) {
+        const cutoff = now - METRIC_TTL_MS;
+        // Remove expired entries
+        const valid = arr.filter(e => e.ts > cutoff);
+        // Enforce hard cap
+        if (valid.length > METRIC_MAX_PER_TYPE) {
+          valid.splice(0, valid.length - METRIC_MAX_PER_TYPE);
+        }
+        metrics.histograms[histName2][type] = valid;
+      }
+    }
   }
 }
 
@@ -279,10 +305,13 @@ class IdempotencyCache {
 // ─── Rate Limiter ─────────────────────────────────────────────────────────────
 
 class RateLimiter {
-  constructor(maxTokens = RATE_LIMIT_RPS, windowMs = 1000) {  // P3-14: default from config
+  /** L3: Added burst support — rate limiter refills tokens gradually but allows
+   * burst up to burstSize on first request after idle period. */
+  constructor(maxTokens = RATE_LIMIT_RPS, windowMs = 1000, burstSize = RATE_LIMIT_BURST) {
     this.maxTokens = maxTokens;
     this.windowMs = windowMs;
-    this.tokens = maxTokens;
+    this.burstSize = burstSize;
+    this.tokens = burstSize; // L3: start fully burst-ready
     this.lastRefill = Date.now();
   }
 
@@ -299,7 +328,9 @@ class RateLimiter {
     const now = Date.now();
     const elapsed = now - this.lastRefill;
     if (elapsed >= this.windowMs) {
-      this.tokens = this.maxTokens;
+      // L3: Refill gradually — each ms of elapsed time restores 1 token (capped at maxTokens)
+      const refill = Math.min(this.maxTokens, Math.floor(elapsed / this.windowMs * this.maxTokens));
+      this.tokens = Math.min(this.maxTokens, this.tokens + refill);
       this.lastRefill = now;
     }
   }
@@ -390,7 +421,11 @@ class HermesPushManager {
     this._clients = new Map();
     /** @type {Map<string, Set<import('ws').WebSocket>>} sessionId → set of subscribed clients */
     this._sessionSubscriptions = new Map();
+    /** H3: Callback to forward session_bridge to extension — set by createProxy */
+    this._onSessionBridge = null;
   }
+
+  setOnSessionBridge(cb) { this._onSessionBridge = cb; }  // H3
 
   subscribe(ws, sessionId, reqId) {
     // Unsubscribe from previous session if any
@@ -416,6 +451,16 @@ class HermesPushManager {
       if (set) set.delete(ws);
       this._clients.delete(ws);
       metricGauge('hermesClients', this._clients.size);
+    }
+  }
+
+  /**
+   * H3: Forward a session_bridge message to the extension WebSocket.
+   * Called when Hermes sends { type: 'session_bridge', sessionId, previousSessionId }.
+   */
+  broadcastSessionBridge(newSessionId, oldSessionId) {
+    if (this._onSessionBridge) {
+      this._onSessionBridge(newSessionId, oldSessionId);
     }
   }
 
@@ -455,6 +500,13 @@ function createProxy({ httpServer, tlsOptions, version }) {
   const idempotencyCache = new IdempotencyCache();
   const backpressure = new BackpressureManager();
   const hermesPush = new HermesPushManager();
+  hermesPush.setOnSessionBridge((newId, oldId) => {
+    // H3: When Hermes sends session_bridge, forward to the extension WebSocket
+    const extWs = sessionSockets.get(oldId);
+    if (extWs && extWs.readyState === 1) {
+      extWs.send(JSON.stringify({ type: 'session_bridge', sessionId: newId, previousSessionId: oldId }));
+    }
+  });
 
   /** @type {Map<string, RateLimiter>} */
   const rateLimiters = new Map();
@@ -463,7 +515,7 @@ function createProxy({ httpServer, tlsOptions, version }) {
   function getSessionMeta(sessionId) {
     if (!sessionMeta.has(sessionId)) {
       sessionMeta.set(sessionId, {
-        limiter: new RateLimiter(RATE_LIMIT_RPS, 1000),  // P3-14: from config
+        limiter: new RateLimiter(RATE_LIMIT_RPS, 1000, RATE_LIMIT_BURST),  // L3: from config
         lastSeen: Date.now()
       });
     }
@@ -475,17 +527,43 @@ function createProxy({ httpServer, tlsOptions, version }) {
   /** @type {Map<string, import('ws').WebSocket>} */
   const sessionSockets = new Map();
 
-  // ── Utility ────────────────────────────────────────────────────────────────
+  // ── Utility ────────────────────────────────────────────────────────────────────
 
   function jsonResponse(res, statusCode, data, extraHeaders = {}) {
+    const json = JSON.stringify(data);
+    const acceptEncoding = (res.req && res.req.headers && res.req.headers['accept-encoding']) || '';
+
+    // S5: gzip — if client accepts gzip and response > 1KB, compress
+    if (acceptEncoding.includes('gzip') && json.length > 1024) {
+      const gzip = createGzip();
+      const headers = {
+        'Content-Type': 'application/json',
+        'Content-Encoding': 'gzip',
+        'X-Content-Type-Options': 'nosniff',  // M10
+        'X-Frame-Options': 'DENY',            // M10
+        'X-XSS-Protection': '1; mode=block',  // M10
+        'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',  // M10
+        ...extraHeaders
+      };
+      res.writeHead(statusCode, headers);
+      gzip.pipe(res);
+      gzip.write(json);
+      gzip.end();
+      return;
+    }
+
     res.writeHead(statusCode, {
       'Content-Type': 'application/json',
-      'Access-Control-Allow-Origin': 'http://localhost:*',  // P3-16: tightened to localhost
+      'Access-Control-Allow-Origin': 'http://localhost:*',  // P3-16
       'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type',
+      'X-Content-Type-Options': 'nosniff',  // M10
+      'X-Frame-Options': 'DENY',            // M10
+      'X-XSS-Protection': '1; mode=block',  // M10
+      'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',  // M10
       ...extraHeaders
     });
-    res.end(JSON.stringify(data));
+    res.end(json);
   }
 
   function parseBody(req) {
@@ -522,10 +600,13 @@ function createProxy({ httpServer, tlsOptions, version }) {
       backpressure.markWriting(sessionId, ws);
     }
     try {
+      _resetSendTimeout();  // H2: start send timeout
       ws.send(data, () => {
+        _clearSendTimeout();  // H2: send completed
         backpressure.markDone(sessionId, ws);
       });
     } catch (e) {
+      _clearSendTimeout();  // H2: send failed
       backpressure.markDone(sessionId, ws);
     }
     return true;
@@ -608,6 +689,17 @@ function createProxy({ httpServer, tlsOptions, version }) {
         return;
       }
 
+      // Forward session_bridge from Hermes to the extension WebSocket
+      if (msg.type === 'session_bridge') {
+        const newId = msg.sessionId;
+        const oldId = msg.previousSessionId;
+        if (newId && oldId) {
+          hermesPush.broadcastSessionBridge(newId, oldId);
+        }
+        ws.send(JSON.stringify({ type: 'session_bridge_ack', sessionId: newId, previousSessionId: oldId }));
+        return;
+      }
+
       // P0-1: Unsubscribe
       if (msg.type === 'unsubscribe') {
         hermesPush.unsubscribe(ws);
@@ -640,6 +732,7 @@ function createProxy({ httpServer, tlsOptions, version }) {
       }
     });
 
+    _clearSendTimeout();  // H2: clear send timeout on close
     ws.on('close', () => {
       hermesPush.unsubscribe(ws);
       log('info', 'Hermes WS client disconnected', { reqId });
@@ -672,6 +765,18 @@ function createProxy({ httpServer, tlsOptions, version }) {
     const reqId = randomUUID().slice(0, 8);
     const remoteIp = req.socket.remoteAddress || 'unknown';
 
+    // C2: Authenticate extension connections via token in hello message.
+    // Extensions must send { type: 'hello', token: <HBS_AUTH_TOKEN> } within
+    // a short window after connecting. Connections without a valid token are rejected.
+    let extAuthenticated = false;
+    const expectedToken = process.env.HBS_AUTH_TOKEN || null;
+    const authTimeout = setTimeout(() => {
+      if (!extAuthenticated) {
+        log('warn', 'Extension WS auth timeout — no hello received', { reqId, remoteIp });
+        ws.close(1008, 'Auth required');
+      }
+    }, 5000);
+
     // P3-15: Improved origin validation — 'null' is Safari's file:// context
     const origin = req.headers['origin'];
     const validOrigins = [
@@ -690,6 +795,20 @@ function createProxy({ httpServer, tlsOptions, version }) {
     log('info', 'Extension WS connected', { reqId, origin: origin || 'null', remoteIp });
     metricIncr('wsConnections');
 
+    // H2: Send timeout — detect unresponsive extension sockets
+    let _sendTimeoutTimer = null;
+    function _clearSendTimeout() {
+      if (_sendTimeoutTimer !== null) { clearTimeout(_sendTimeoutTimer); _sendTimeoutTimer = null; }
+    }
+    function _resetSendTimeout() {
+      _clearSendTimeout();
+      _sendTimeoutTimer = setTimeout(() => {
+        log('warn', `WS send timeout for extension — closing socket`, { reqId, sessionId });
+        metrics.counters.wsSendTimeouts = (metrics.counters.wsSendTimeouts || 0) + 1;
+        ws.terminate();
+      }, WS_SEND_TIMEOUT_MS);
+    }
+
     // isAlive tracking now handled by ws library's ping/pong protocol
 
     ws.on('message', (raw) => {
@@ -698,6 +817,26 @@ function createProxy({ httpServer, tlsOptions, version }) {
       try { msg = JSON.parse(raw); }
       catch (e) {
         log('warn', 'WS invalid JSON', { reqId, raw: String(raw).slice(0, 100) });
+        return;
+      }
+
+      // C2: Require 'hello' message with valid token before accepting any other messages
+      if (!extAuthenticated) {
+        if (msg.type === 'hello') {
+          clearTimeout(authTimeout);
+          // No token required if HBS_AUTH_TOKEN is not set (dev mode)
+          if (expectedToken && msg.token !== expectedToken) {
+            log('warn', 'Extension WS auth failed — invalid token', { reqId, remoteIp });
+            ws.close(1008, 'Invalid token');
+            return;
+          }
+          extAuthenticated = true;
+          log('info', 'Extension WS authenticated', { reqId, remoteIp });
+          ws.send(JSON.stringify({ type: 'connected', message: 'Proxy ready' }));
+          return;
+        }
+        log('warn', 'Extension WS sent message before hello — rejecting', { reqId, type: msg.type });
+        ws.close(1008, 'Send hello first');
         return;
       }
 
@@ -717,11 +856,27 @@ function createProxy({ httpServer, tlsOptions, version }) {
         }
 
         case 'mutation':
-          pageMirror.addMutations(sessionId, msg);
+        case 'mutation_batch':
+          // C1: mutation_batch carries an array of pre-batched mutation entries from Safari
+          // Each entry has {mutations, url, seq}. Forward each to pageMirror individually
+          if (msg.type === 'mutation_batch' && Array.isArray(msg.mutations)) {
+            for (const entry of msg.mutations) {
+              pageMirror.addMutations(sessionId, { ...entry, seq: entry.seq || msg.seq });
+            }
+          } else {
+            pageMirror.addMutations(sessionId, msg);
+          }
           break;
 
         case 'heartbeat':
           sessionSockets.set(sessionId, ws);
+          break;
+
+        case 'session_info':
+          // S3: Extension sends session metadata on connect
+          log('info', `session_info from extension`, { reqId, sessionId, version: msg.version, tabId: msg.tabId });
+          // Acknowledge with our version
+          ws.send(JSON.stringify({ type: 'session_info_ack', sessionId, version: PROXY_VERSION }));
           break;
 
         case 'cmd_ack': {
@@ -762,7 +917,9 @@ function createProxy({ httpServer, tlsOptions, version }) {
       }
     });
 
+    _clearSendTimeout();  // H2: clear send timeout on close
     ws.on('close', () => {
+      clearTimeout(authTimeout);
       for (const [sid, sws] of sessionSockets) {
         if (sws === ws) {
           sessionSockets.delete(sid);
@@ -776,10 +933,9 @@ function createProxy({ httpServer, tlsOptions, version }) {
     });
 
     ws.on('error', (err) => {
+      clearTimeout(authTimeout);
       log('error', 'Extension WS error', { reqId, err: err.message });
     });
-
-    ws.send(JSON.stringify({ type: 'connected', message: 'Proxy ready' }));
   });
 
   // Heartbeat — use ws library's built-in ping/pong (Fix #28)
@@ -832,6 +988,43 @@ function createProxy({ httpServer, tlsOptions, version }) {
       return;
     }
 
+    // ── GET /metrics/stream (S1) ───────────────────────────────────────────────
+    // Server-Sent Events stream of live metrics — restricted to localhost
+    if (req.method === 'GET' && path === '/metrics/stream') {
+      const remoteIp = req.socket.remoteAddress || '';
+      if (!remoteIp.includes('127.0.0.1') && !remoteIp.includes('::1') && !remoteIp.includes('localhost')) {
+        res.writeHead(403, { 'Content-Type': 'text/plain' });
+        res.end('Forbidden: /metrics/stream only available from localhost');
+        return;
+      }
+
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no'
+      });
+
+      // Send initial metrics immediately
+      metricGauge('uptimeSeconds', Math.floor(process.uptime()));
+      metricGauge('pendingCommands', cmdQueue.size);
+      res.write(`data: ${JSON.stringify(_buildMetrics())}\n\n`);
+
+      // S1: Push updates every second
+      const metricsInterval = setInterval(() => {
+        if (res.writableEnded) { clearInterval(metricsInterval); return; }
+        try {
+          metricGauge('uptimeSeconds', Math.floor(process.uptime()));
+          metricGauge('pendingCommands', cmdQueue.size);
+          res.write(`data: ${JSON.stringify(_buildMetrics())}\n\n`);
+        } catch (e) { clearInterval(metricsInterval); }
+      }, 1000);
+
+      req.on('close', () => clearInterval(metricsInterval));
+      metrics.counters.sseStreams = (metrics.counters.sseStreams || 0) + 1;
+      return;
+    }
+
     // ── GET /health ─────────────────────────────────────────────────────────
     if (req.method === 'GET' && path === '/health') {
       jsonResponse(res, 200, {
@@ -857,15 +1050,19 @@ function createProxy({ httpServer, tlsOptions, version }) {
       return;
     }
 
-    // ── GET /sessions (Fix #P1-3) ───────────────────────────────────────────
+    // ── GET /sessions (Fix #P1-3, M6) ───────────────────────────────────────
     if (req.method === 'GET' && path === '/sessions') {
-      const sessions = Array.from(sessionSockets.entries()).map(([sid, ws]) => ({
-        sessionId: sid,
-        connected: ws.readyState === 1,
-        url: pageMirror.getState(sid).url || '',
-        title: pageMirror.getState(sid).title || '',
-        lastUpdate: pageMirror.getState(sid).lastUpdate || 0,
-      }));
+      // M6: Call getState() once per session instead of 4x per session (was O(4N²))
+      const sessions = Array.from(sessionSockets.entries()).map(([sid, ws]) => {
+        const state = pageMirror.getState(sid);
+        return {
+          sessionId: sid,
+          connected: ws.readyState === 1,
+          url: state.url || '',
+          title: state.title || '',
+          lastUpdate: state.lastUpdate || 0,
+        };
+      });
       jsonResponse(res, 200, { sessions, total: sessions.length });
       return;
     }
@@ -1002,12 +1199,7 @@ function createProxy({ httpServer, tlsOptions, version }) {
         idempotencyCache.record(sessionId, idempotencyKey, cmdId, body);
       }
 
-      cmdQueue.add(cmdId, cmd, submittedAt).then((result) => {
-        log('info', `CMD resolved`, { reqId, cmdId, sessionId, type, success: result.success });
-      }).catch((err) => {
-        log('warn', `CMD caught`, { reqId, cmdId, sessionId, err: err.message });
-      });
-
+      cmdQueue.add(cmdId, cmd, submittedAt);  // S4: promise is handled internally by ack/error callbacks — no .then() needed
       sendToExtension(sessionId, cmd);
       log('info', `CMD → extension`, { reqId, cmdId, sessionId, type, selector: selector || null });
       metricIncr('commands', { type, status: 'pending' });
@@ -1073,6 +1265,8 @@ function createProxy({ httpServer, tlsOptions, version }) {
 
   // ── Graceful shutdown ─────────────────────────────────────────────────────
 
+  // M7: Graceful shutdown with force-kill guard — don't hang indefinitely
+  // Give sockets 5s to close gracefully, then force-exit
   function shutdown() {
     log('info', 'Shutdown signal received');
     clearInterval(heartbeat);
@@ -1090,6 +1284,12 @@ function createProxy({ httpServer, tlsOptions, version }) {
     wss.close();
     wssHermes.close();
     httpServer.close();
+
+    // M7: Force-kill after 5s to prevent indefinite hang
+    setTimeout(() => {
+      log('warn', 'Shutdown timeout — forcing process exit');
+      process.exit(1);
+    }, 5000);
   }
 
   return { httpServer, wss, pageMirror, cmdQueue, shutdown, hermesPush };

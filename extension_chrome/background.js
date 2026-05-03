@@ -54,6 +54,14 @@ function connect() {
     backpressurePaused = false;
     updateBadge('green');
     startHealthPoll();
+    // C2: Send hello with auth token so proxy knows this is a legitimate extension
+    // Token is optional on the proxy side when HBS_AUTH_TOKEN is not set (dev mode)
+    socket.send(JSON.stringify({
+      type: 'hello',
+      token: typeof HBS_AUTH_TOKEN !== 'undefined' ? HBS_AUTH_TOKEN : null,
+      extension: 'chrome',
+      version: chrome.runtime.getManifest().version || 'unknown'
+    }));
     // Notify content script that backpressure is cleared on reconnect
     if (currentTabId) {
       chrome.tabs.sendMessage(currentTabId, { type: 'backpressure', paused: false }).catch(() => {});
@@ -69,11 +77,29 @@ function connect() {
     }).catch(() => {
       // session storage unavailable — use volatile memory only
     });
+    // S3: Send session_info so the proxy knows our metadata
+    socket.send(JSON.stringify({
+      type: 'session_info',
+      sessionId: SESSION_ID,
+      extension: 'chrome',
+      version: chrome.runtime.getManifest().version || 'unknown',
+      tabId: currentTabId
+    }));
     while (pendingMessages.length > 0) {
       const msg = pendingMessages.shift();
       sendToProxy(msg);
     }
     notifyPopup({ event: 'connected' });
+  });
+
+  // M4: Allow popup/options to update proxy port at runtime
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message.type === 'setProxyPort' && typeof message.port === 'number') {
+      _proxyPort = message.port;
+      chrome.storage.local.set({ hbsProxyPort: message.port });
+      sendResponse({ ok: true, port: _proxyPort });
+    }
+    return true;
   });
 
   socket.addEventListener('message', (event) => {
@@ -342,8 +368,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   // Extension → proxy messages
-  if (message.type === 'tab_snapshot' || message.type === 'mutation' || message.type === 'heartbeat') {
-    if (message.type === 'mutation' && backpressurePaused) return true;
+  if (message.type === 'tab_snapshot' || message.type === 'mutation' || message.type === 'mutation_batch' || message.type === 'heartbeat') {
+    // C1: Don't send mutation_batch when backpressure paused — content script already dropped them
+    if ((message.type === 'mutation' || message.type === 'mutation_batch') && backpressurePaused) return true;
     sendToProxy({ ...message, tabId: currentTabId, sessionId: SESSION_ID });
     return true;
   }

@@ -22,6 +22,46 @@ let debounceTimer = null;
 let navigateFailTimer = null;
 let lastNavigateCmdId = null;
 
+// C1: Mutation batching — buffer mutations and flush in batches to avoid flooding the pipeline
+const MUTATION_FLUSH_INTERVAL_MS = 500;   // flush buffered mutations every 500ms
+const MUTATION_BUFFER_MAX = 100;          // flush immediately if buffer reaches this
+/** @type {{mutations: object[], url: string, seq: number}[]} */
+let _mutationSendBuffer = [];
+let _mutationFlushTimer = null;
+let backpressurePaused = false;  // C1: stop batching when Hermes is slow
+
+function _flushMutationBuffer() {
+  if (_mutationSendBuffer.length === 0) return;
+  const toSend = _mutationSendBuffer.splice(0, _mutationSendBuffer.length);
+  sendToBackground({
+    type: 'mutation_batch',
+    mutations: toSend,
+    url: toSend[0]?.url || window.location.href,
+    seq: toSend[toSend.length - 1]?.seq || 0
+  });
+}
+
+function _scheduleMutationFlush() {
+  if (_mutationFlushTimer !== null) return;
+  _mutationFlushTimer = setTimeout(() => {
+    _mutationFlushTimer = null;
+    _flushMutationBuffer();
+  }, MUTATION_FLUSH_INTERVAL_MS);
+}
+
+function _pushMutationToBuffer(mutationEntry) {
+  _mutationSendBuffer.push(mutationEntry);
+  if (_mutationSendBuffer.length >= MUTATION_BUFFER_MAX) {
+    if (_mutationFlushTimer !== null) {
+      clearTimeout(_mutationFlushTimer);
+      _mutationFlushTimer = null;
+    }
+    _flushMutationBuffer();
+    return;
+  }
+  _scheduleMutationFlush();
+}
+
 // Fix #13: skip periodic full HTML send when page hasn't changed
 let lastSnapshotHash = '';
 function snapshotHash() {
@@ -178,12 +218,14 @@ function setupMutationObserver() {
       }
     }
 
-    sendToBackground({
-      type: 'mutation',
-      mutations: mutationsData,
-      url: window.location.href,
-      seq: window._snapshotSeq || 0
-    });
+    // C1: Buffer mutations and send in batches; skip batching when backpressurePaused
+    if (!backpressurePaused) {
+      _pushMutationToBuffer({
+        mutations: mutationsData,
+        url: window.location.href,
+        seq: window._snapshotSeq || 0
+      });
+    }
 
     const major = mutations.some(m =>
       m.type === 'childList' && (m.addedNodes.length > 5 || m.removedNodes.length > 0)
@@ -361,6 +403,11 @@ function handleCancel(cmdId) {
 // ─── Message listener ───────────────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  // C1: Handle backpressure signal from background — pause/resume mutation batching
+  if (message.type === 'backpressure') {
+    backpressurePaused = message.paused;
+    return true;
+  }
   if (message.type === 'cancel') {
     handleCancel(message.cmdId);
     return true;
@@ -388,6 +435,12 @@ window.addEventListener('unload', () => {
   if (snapshotInterval !== null) { clearInterval(snapshotInterval); snapshotInterval = null; }
   if (pageObserver) { pageObserver.disconnect(); pageObserver = null; }
   if (debounceTimer !== null) { clearTimeout(debounceTimer); debounceTimer = null; }
+  // C1: Flush any pending buffered mutations before unloading
+  if (_mutationFlushTimer !== null) {
+    clearTimeout(_mutationFlushTimer);
+    _mutationFlushTimer = null;
+  }
+  _flushMutationBuffer();
   clearNavigateHandlers();
   for (const [cmdId, pending] of pendingCommands) {
     if (pending.reject && !pending.settled) pending.reject(new Error('Tab navigated away'));
