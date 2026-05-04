@@ -35,15 +35,16 @@ npm run build:icons
 npm run build:all
 ```
 
-**Safari requires a `.safariextension` bundle** for sideloading. After cloning the repo, run:
+**Safari requires a `.safariextension` bundle** for sideloading. After cloning the repo, build it with the included script:
 
 ```bash
 cd ~/Desktop/DEVPROJECTS/hermes-browser-bridge
-# Create the .safariextension bundle as a symlink to extension_safari
-ln -s extension_safari extension_safari.safariextension
+./build_safari_bundle.sh
 ```
 
-The `.safariextension` directory is gitignored — it is a development-time symlink. The source of truth is `extension_safari/`.
+This creates `extension_safari.safariextension/` with `manifest.json` at the root (Safari's requirement), alongside all extension files. The script is idempotent — safe to re-run.
+
+The `extension_safari/` directory is the source of truth; `extension_safari.safariextension/` is the generated Safari bundle (gitignored).
 
 Expected: **no output** (success). A warning about unused `profile` parameter in `SafariWebExtensionHandler.swift` is harmless.
 
