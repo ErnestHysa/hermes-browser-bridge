@@ -35,6 +35,16 @@ npm run build:icons
 npm run build:all
 ```
 
+**Safari requires a `.safariextension` bundle** for sideloading. After cloning the repo, run:
+
+```bash
+cd ~/Desktop/DEVPROJECTS/hermes-browser-bridge
+# Create the .safariextension bundle as a symlink to extension_safari
+ln -s extension_safari extension_safari.safariextension
+```
+
+The `.safariextension` directory is gitignored — it is a development-time symlink. The source of truth is `extension_safari/`.
+
 Expected: **no output** (success). A warning about unused `profile` parameter in `SafariWebExtensionHandler.swift` is harmless.
 
 If you see `error: cannot find 'SafariServices'` — run:
@@ -82,7 +92,7 @@ macOS Safari allows loading unpacked Web Extensions directly from the filesystem
 ```
 1. Safari → Develop menu → "Extensions…"
 2. Click the "+" button at the bottom of the Extensions list
-3. Navigate to: ~/Desktop/DEVPROJECTS/hermes-browser-bridge/extension_safari
+3. Navigate to: ~/Desktop/DEVPROJECTS/hermes-browser-bridge/extension_safari.safariextension
 4. Click "Open"
 5. Safari prompts: "Develop extension?" → Click "Install"
 ```
@@ -93,7 +103,7 @@ macOS Safari allows loading unpacked Web Extensions directly from the filesystem
 1. Safari → Settings… → Privacy & Security
 2. Scroll to "Extensions"
 3. Click "Install…" (or click "+" if available)
-4. Navigate to: ~/Desktop/DEVPROJECTS/hermes-browser-bridge/extension_safari
+4. Navigate to: ~/Desktop/DEVPROJECTS/hermes-browser-bridge/extension_safari.safariextension
 5. Click "Open"
 ```
 
