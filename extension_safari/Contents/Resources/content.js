@@ -8,590 +8,385 @@
  *             command and do not send cmd_ack/error.
  * Fix #P3-18: DOM serialization uses requestIdleCallback to avoid main-thread
  *             blocking on large pages (5000+ elements).
+ * Fix #17: Shared extension lib — imports shared code from extension_shared/shared-content.js.
  */
 
 'use strict';
 
-const FULL_SNAPSHOT_INTERVAL_MS = 2000;
-const MAJOR_MUTATION_DEBOUNCE_MS = 300;
-const MAX_STRUCTURAL_ELEMENTS = 2000;
+// ─── Load shared module (script tag approach for content scripts) ────────────────
 
-// ─── State ─────────────────────────────────────────────────────────────────────
-
-/** @type {Map<string, {resolve: function, reject: function, settled?: boolean}>} */
-const pendingCommands = new Map();
-/** @type {number|null} */
-let snapshotInterval = null;
-/** @type {MutationObserver|null} */
-let pageObserver = null;
-/** @type {number|null} */
-let debounceTimer = null;
-let navigateFailTimer = null;
-let lastNavigateCmdId = null;
-let backpressurePaused = false;  // Fix #6: stop MutationObserver batching when Hermes is slow
-
-// C1: Mutation batching — buffer mutations and flush in batches to avoid flooding the pipeline
-const MUTATION_FLUSH_INTERVAL_MS = 500;   // flush buffered mutations every 500ms
-const MUTATION_BUFFER_MAX = 100;          // flush immediately if buffer reaches this
-/** @type {{mutations: object[], url: string, seq: number}[]} */
-let _mutationSendBuffer = [];
-let _mutationFlushTimer = null;
-
-function _flushMutationBuffer() {
-  if (_mutationSendBuffer.length === 0) return;
-  const toSend = _mutationSendBuffer.splice(0, _mutationSendBuffer.length);
-  sendToBackground({
-    type: 'mutation_batch',
-    mutations: toSend,
-    url: toSend[0]?.url || window.location.href,
-    seq: toSend[toSend.length - 1]?.seq || 0
-  });
-}
-
-function _scheduleMutationFlush() {
-  if (_mutationFlushTimer !== null) return;
-  _mutationFlushTimer = setTimeout(() => {
-    _mutationFlushTimer = null;
-    _flushMutationBuffer();
-  }, MUTATION_FLUSH_INTERVAL_MS);
-}
-
-function _pushMutationToBuffer(mutationEntry) {
-  _mutationSendBuffer.push(mutationEntry);
-  // Flush immediately if buffer is full (avoid dropping individual entries)
-  if (_mutationSendBuffer.length >= MUTATION_BUFFER_MAX) {
-    if (_mutationFlushTimer !== null) {
-      clearTimeout(_mutationFlushTimer);
-      _mutationFlushTimer = null;
-    }
-    _flushMutationBuffer();
-    return;
-  }
-  _scheduleMutationFlush();
-}
-
-// Fix #13: skip periodic full HTML send when page hasn't changed
-let lastSnapshotHash = '';
-function snapshotHash() {
-  const body = document.body;
-  const sample = (body && body.textContent) ? body.textContent.slice(0, 200) : '';
-  return `${document.title}:${document.contentType}:${sample.length}:${(body && body.childElementCount) || 0}:${sample}`;
-}
-
-// ─── Navigate handler leak fix ─────────────────────────────────────────────────
-
-/** @type {((...args: any[]) => void)|null} */
-let _navLoadHandler = null;
-/** @type {((...args: any[]) => void)|null} */
-let _navPageShowHandler = null;
-
-function clearNavigateHandlers() {
-  if (_navLoadHandler) {
-    window.removeEventListener('load', _navLoadHandler);
-    _navLoadHandler = null;
-  }
-  if (_navPageShowHandler) {
-    window.removeEventListener('pageshow', _navPageShowHandler);
-    _navPageShowHandler = null;
-  }
-  if (navigateFailTimer !== null) {
-    clearTimeout(navigateFailTimer);
-    navigateFailTimer = null;
-  }
-  lastNavigateCmdId = null;
-}
-
-// ─── DOM Reading ───────────────────────────────────────────────────────────────
-
-/**
- * Full snapshot — sends complete outerHTML.
- * Uses requestIdleCallback when available to avoid main-thread jank.
- */
-function getFullPageSnapshot() {
-  try {
-    return {
-      url: window.location.href,
-      title: document.title,
-      html: document.documentElement.outerHTML,
-      seq: ++window._snapshotSeq || (window._snapshotSeq = 1)
-    };
-  } catch (e) {
-    return {
-      url: window.location.href,
-      title: document.title,
-      html: '',
-      seq: ++window._snapshotSeq || (window._snapshotSeq = 1),
-      error: e.message
-    };
-  }
-}
-
-/**
- * Structural snapshot — element counts + changed text from characterData mutations.
- * Uses requestIdleCallback when page has many elements to avoid blocking.
- * @param {string[]} changedTexts
- */
-function getStructuralSnapshot(changedTexts = []) {
-  const elementCount = (document.querySelectorAll('*').length || 0);
-
-  // Fix #7: For large pages, use requestIdleCallback with a forced-timeout fallback.
-  // If requestIdleCallback never fires (busy page), the setTimeout always resolves.
-  if (elementCount > MAX_STRUCTURAL_ELEMENTS && typeof requestIdleCallback !== 'undefined') {
-    return new Promise((resolve) => {
-      const snapshot = () => resolve(_buildStructuralSnapshot(changedTexts));
-      const id = requestIdleCallback(snapshot, { timeout: 500 });
-      // Safety net: if idle callback doesn't fire within 500ms, resolve anyway
-      setTimeout(() => {
-        try { snapshot(); } catch (_) {}
-      }, 600);
-    });
-  }
-  return Promise.resolve(_buildStructuralSnapshot(changedTexts));
-}
-
-function _buildStructuralSnapshot(changedTexts = []) {
-  try {
-    return {
-      url: window.location.href,
-      title: document.title,
-      // No html field in structural snapshots
-      structural: {
-        total: document.querySelectorAll('*').length,
-        forms: document.forms.length,
-        inputs: document.querySelectorAll('input').length,
-        buttons: document.querySelectorAll('button').length,
-        links: document.querySelectorAll('a').length,
-        images: document.querySelectorAll('img').length
-      },
-      changedTexts: changedTexts.slice(0, 10),
-      bodySample: document.body ? document.body.innerText.slice(0, 200) : '',
-      seq: window._snapshotSeq || 1
-    };
-  } catch (e) {
-    return {
-      url: window.location.href,
-      title: document.title,
-      structural: null,
-      changedTexts: [],
-      bodySample: '',
-      seq: window._snapshotSeq || 1,
-      error: e.message
-    };
-  }
-}
-
-// ─── Snapshot Sending ──────────────────────────────────────────────────────────
-
-/**
- * P1-4 Fix: Immediately capture and send the current page state synchronously,
- * BEFORE the MutationObserver is attached, so zero initial mutations are missed.
- * Then start the observer.
- */
-function captureInitialSnapshot() {
-  // Synchronous snapshot before observer touches anything
-  const snap = getFullPageSnapshot();
-  lastSnapshotHash = snapshotHash();
-  sendToBackground({ type: 'tab_snapshot', ...snap, incremental: false, _initial: true })
-    .then(() => {
-      // Observer starts only after first snapshot is confirmed sent
-      setupMutationObserver();
-    })
-    .catch(() => {
-      // Network hiccup — still start observer so we don't miss mutations
-      setupMutationObserver();
-    });
-}
-
-function sendStructuralSnapshot(changedTexts = []) {
-  const result = getStructuralSnapshot(changedTexts);
-  if (result instanceof Promise) {
-    result.then((snap) => {
-      sendToBackground({ type: 'tab_snapshot', ...snap, incremental: true });
-    });
-  } else {
-    sendToBackground({ type: 'tab_snapshot', ...result, incremental: true });
-  }
-}
-
-// ─── Mutation Observer ─────────────────────────────────────────────────────────
-
-function setupMutationObserver() {
-  if (!document.body) {
-    setTimeout(setupMutationObserver, 200);
-    return;
-  }
-
-  if (pageObserver) {
-    pageObserver.disconnect();
-    pageObserver = null;
-  }
-
-  if (debounceTimer !== null) {
-    clearTimeout(debounceTimer);
-    debounceTimer = null;
-  }
-
-  /** @type {string[]} */
-  const changedTexts = [];
-
-  const flush = () => {
-    clearTimeout(debounceTimer);
-    debounceTimer = null;
-    const texts = changedTexts.splice(0);
-    sendStructuralSnapshot(texts);
-  };
-
-  const observer = new MutationObserver((mutations) => {
-    if (debounceTimer !== null) {
-      clearTimeout(debounceTimer);
-    }
-
-    const mutationsData = mutations.map(m => ({
-      type: m.type,
-      target: m.target.nodeName,
-      targetId: m.target.id || null,
-      targetClass: m.target.className || null,
-      added: m.addedNodes.length,
-      removed: m.removedNodes.length,
-      text: m.target.nodeValue || '',
-      addedNodeNames: Array.from(m.addedNodes).map(n => n.nodeName),
-      removedNodeNames: Array.from(m.removedNodes).map(n => n.nodeName)
-    }));
-
-    for (const m of mutations) {
-      if (m.type === 'characterData') {
-        changedTexts.push(String(m.target.nodeValue || '').slice(0, 200));
-      }
-    }
-
-    // C1: When backpressure is active, skip batching — mutations are buffered
-    // individually so we can drop them if needed rather than send a huge batch
-    if (!backpressurePaused) {
-      _pushMutationToBuffer({
-        mutations: mutationsData,
-        url: window.location.href,
-        seq: window._snapshotSeq || 0
-      });
-    }
-
-    // Major DOM changes trigger full snapshot after debounce (even when paused)
-    const major = mutations.some(m =>
-      m.type === 'childList' && (m.addedNodes.length > 5 || m.removedNodes.length > 0)
-    );
-    if (major) {
-      if (debounceTimer !== null) clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(() => {
-        const snap = getFullPageSnapshot();
-        sendToBackground({ type: 'tab_snapshot', ...snap, incremental: false });
-      }, MAJOR_MUTATION_DEBOUNCE_MS);
-    }
-  });
-
-  pageObserver = observer;
-  observer.observe(document.body, {
-    childList: true,
-    subtree: true,
-    attributes: true,
-    attributeOldValue: true,
-    characterData: true
-  });
-
-  if (snapshotInterval !== null) clearInterval(snapshotInterval);
-  snapshotInterval = setInterval(() => {
-    const snap = getFullPageSnapshot();
-    const hash = snapshotHash();
-    // Fix #13: only send if the DOM state actually changed
-    if (hash !== lastSnapshotHash) {
-      lastSnapshotHash = hash;
-      sendToBackground({ type: 'tab_snapshot', ...snap, incremental: false });
-    }
-  }, FULL_SNAPSHOT_INTERVAL_MS);
-}
-
-// ─── Background communication ───────────────────────────────────────────────────
-
-function sendToBackground(msg) {
+// window._hermesSendToBackground must be defined BEFORE loading shared-content.js
+const _safariSendToBackground = (msg) => {
   return browser.runtime.sendMessage(msg).catch((err) => {
     console.error('[Hermes Bridge] sendToBackground failed:', err.message);
     throw err;
   });
-}
+};
+window._hermesSendToBackground = _safariSendToBackground;
+window._hermesPendingCommands = new Map();
 
-// ─── Command Execution ─────────────────────────────────────────────────────────
+// Load shared module if not already loaded, and wait for it to be ready.
+// Fix #16: Dynamic script injection is asynchronous — HermesShared functions may not
+// be available immediately after the script tag is appended. Poll until ready.
+(function loadSharedModule() {
+  function tryInit() {
+    if (typeof window.HermesShared !== 'undefined' && window.HermesShared.ready === true) {
+      initHermesContent();
+    } else {
+      setTimeout(tryInit, 10);
+    }
+  }
+  if (typeof window.HermesShared === 'undefined') {
+    // Safari uses a different path pattern for extension resources
+    const sharedScript = document.createElement('script');
+    sharedScript.src = browser.runtime.getURL('extension_shared/shared-content.js');
+    sharedScript.onload = () => { sharedScript.remove(); };
+    (document.head || document.documentElement).appendChild(sharedScript);
+  }
+  tryInit();
+})();
 
-const CMD_HANDLERS = {
-  navigate(cmd) {
-    // Clean up any previous navigate handlers before setting up new ones
-    clearNavigateHandlers();
-    lastNavigateCmdId = cmd.cmdId;
+function initHermesContent() {
+  // ─── State ─────────────────────────────────────────────────────────────────────
 
-    // Fail-safe: if page doesn't fire load/pageshow within 10s, treat as blocked
-    navigateFailTimer = setTimeout(() => {
-      if (lastNavigateCmdId === cmd.cmdId) {
-        clearNavigateHandlers();
-        pendingCommands.delete(cmd.cmdId);
-        sendToBackground({
-          type: 'cmd_error',
-          cmdId: cmd.cmdId,
-          success: false,
-          errorCode: 'NAVIGATE_TIMEOUT',
-          error: `Navigation to ${cmd.url} was blocked or timed out`
-        });
-      }
-    }, 10000);
+  let snapshotInterval = null;
+  let pageObserver = null;
+  let debounceTimer = null;
+  let lastSnapshotHash = '';
 
-    _navLoadHandler = () => {
-      // Page finished loading
-      clearNavigateHandlers();
-      pendingCommands.delete(cmd.cmdId);
-      sendToBackground({
-        type: 'cmd_ack',
-        cmdId: cmd.cmdId,
-        success: true,
-        result: `Navigated to ${cmd.url}`
+  // ─── Navigate Handler State (Safari-specific) ────────────────────────────────
+
+  let lastNavigateCmdId = null;
+
+  // ─── Snapshot Sending ──────────────────────────────────────────────────────────
+
+  /**
+   * P1-4 Fix: Immediately capture and send the current page state synchronously,
+   * BEFORE the MutationObserver is attached, so zero initial mutations are missed.
+   * Then start the observer.
+   */
+  function captureInitialSnapshot() {
+    // Synchronous snapshot before observer starts anything
+    const snap = window.HermesShared.getFullPageSnapshot();
+    lastSnapshotHash = window.HermesShared.snapshotHash();
+    window._hermesSendToBackground({ type: 'tab_snapshot', ...snap, incremental: false, _initial: true })
+      .then(() => {
+        // Observer starts only after first snapshot is confirmed sent
+        setupMutationObserver();
+      })
+      .catch(() => {
+        // Network hiccup — still start observer so we don't miss mutations
+        setupMutationObserver();
       });
+  }
+
+  function sendStructuralSnapshot(changedTexts = []) {
+    const result = window.HermesShared.getStructuralSnapshot(changedTexts);
+    if (result instanceof Promise) {
+      result.then((snap) => {
+        window._hermesSendToBackground({ type: 'tab_snapshot', ...snap, incremental: true });
+      });
+    } else {
+      window._hermesSendToBackground({ type: 'tab_snapshot', ...result, incremental: true });
+    }
+  }
+
+  // ─── Mutation Observer ─────────────────────────────────────────────────────────
+
+  function setupMutationObserver() {
+    if (!document.body) {
+      setTimeout(setupMutationObserver, 200);
+      return;
+    }
+
+    if (pageObserver) {
+      pageObserver.disconnect();
+      pageObserver = null;
+    }
+
+    if (debounceTimer !== null) {
+      clearTimeout(debounceTimer);
+      debounceTimer = null;
+    }
+
+    /** @type {string[]} */
+    const changedTexts = [];
+
+    const flush = () => {
+      // Fix #8: clear navigate handlers before major DOM changes to prevent
+      // handlers from a previous page firing on the new page's DOM
+      window.HermesShared.clearNavigateHandlers();
+      clearTimeout(debounceTimer);
+      debounceTimer = null;
+      const texts = changedTexts.splice(0);
+      sendStructuralSnapshot(texts);
     };
 
-    _navPageShowHandler = () => {
-      // pageshow fires on bfcache restore too — treat as navigation success
-      if (lastNavigateCmdId === cmd.cmdId) {
-        clearNavigateHandlers();
-        pendingCommands.delete(cmd.cmdId);
-        sendToBackground({
+    const observer = new MutationObserver((mutations) => {
+      if (debounceTimer !== null) {
+        clearTimeout(debounceTimer);
+      }
+
+      const mutationsData = mutations.map(m => ({
+        type: m.type,
+        target: m.target.nodeName,
+        targetId: m.target.id || null,
+        targetClass: m.target.className || null,
+        added: m.addedNodes.length,
+        removed: m.removedNodes.length,
+        text: m.target.nodeValue || '',
+        addedNodeNames: Array.from(m.addedNodes).map(n => n.nodeName),
+        removedNodeNames: Array.from(m.removedNodes).map(n => n.nodeName)
+      }));
+
+      for (const m of mutations) {
+        if (m.type === 'characterData') {
+          changedTexts.push(String(m.target.nodeValue || '').slice(0, 200));
+        }
+      }
+
+      // Fix #7: When paused, clear debounce timer and drop stale changedTexts
+      // so we don't send stale data on resume. Also drop mutations entirely.
+      if (window.HermesShared.backpressurePaused) {
+        if (debounceTimer !== null) { clearTimeout(debounceTimer); debounceTimer = null; }
+        changedTexts.splice(0);  // Reset stale data
+        return;  // Drop mutation — don't accumulate
+      }
+
+      // C1: Buffer mutations and send in batches
+      window.HermesShared._pushMutationToBuffer({
+        mutations: mutationsData,
+        url: window.location.href,
+        seq: window._snapshotSeq || 0
+      });
+
+      // Major DOM changes trigger full snapshot after debounce (even when paused)
+      // Fix #10: But only when NOT under backpressure — skip entirely when paused
+      const major = mutations.some(m =>
+        m.type === 'childList' && (m.addedNodes.length > 5 || m.removedNodes.length > 0)
+      );
+      if (major && !window.HermesShared.backpressurePaused) {
+        if (debounceTimer !== null) clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(() => {
+          const snap = window.HermesShared.getFullPageSnapshot();
+          window._hermesSendToBackground({ type: 'tab_snapshot', ...snap, incremental: false });
+        }, window.HermesShared.MAJOR_MUTATION_DEBOUNCE_MS);
+      }
+    });
+
+    pageObserver = observer;
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeOldValue: true,
+      characterData: true
+    });
+
+    if (snapshotInterval !== null) clearInterval(snapshotInterval);
+    // Fix #14: use adaptive interval — slow (10s) when Hermes is under backpressure, normal (2s) otherwise
+    const interval = window.HermesShared.backpressurePaused
+      ? window.HermesShared.SLOW_SNAPSHOT_INTERVAL_MS
+      : window.HermesShared.FULL_SNAPSHOT_INTERVAL_MS;
+    snapshotInterval = setInterval(() => {
+      const snap = window.HermesShared.getFullPageSnapshot();
+      const hash = window.HermesShared.snapshotHash();
+      // Fix #13: only send if the DOM state actually changed
+      if (hash !== lastSnapshotHash) {
+        lastSnapshotHash = hash;
+        window._hermesSendToBackground({ type: 'tab_snapshot', ...snap, incremental: false });
+      }
+    }, interval);
+  }
+
+  // ─── Command Execution (Safari-specific navigate handler) ─────────────────────────
+
+  const _safariCMDHandlers = {
+    navigate(cmd) {
+      // Clean up any previous navigate handlers before setting up new ones
+      window.HermesShared.clearNavigateHandlers();
+      lastNavigateCmdId = cmd.cmdId;
+
+      // Fail-safe: if page doesn't fire load/pageshow within 10s, treat as blocked
+      // Fix #3: Use HermesShared._navigateFailTimer so clearNavigateHandlers can cancel it
+      window.HermesShared._navigateFailHandler = () => {
+        if (lastNavigateCmdId === cmd.cmdId) {
+          lastNavigateCmdId = null;
+          window.HermesShared.clearNavigateHandlers();
+          window._hermesPendingCommands.delete(cmd.cmdId);
+          window._hermesSendToBackground({
+            type: 'cmd_error',
+            cmdId: cmd.cmdId,
+            success: false,
+            errorCode: 'NAVIGATE_TIMEOUT',
+            error: `Navigation to ${cmd.url} was blocked or timed out`
+          });
+        }
+      };
+      window.HermesShared._navigateFailTimer = setTimeout(window.HermesShared._navigateFailHandler, 10000);
+
+      window.HermesShared._navLoadHandler = () => {
+        // Page finished loading
+        window.HermesShared.clearNavigateHandlers();
+        window._hermesPendingCommands.delete(cmd.cmdId);
+        window._hermesSendToBackground({
           type: 'cmd_ack',
           cmdId: cmd.cmdId,
           success: true,
           result: `Navigated to ${cmd.url}`
         });
-      }
-    };
+      };
 
-    window.addEventListener('load', _navLoadHandler);
-    window.addEventListener('pageshow', _navPageShowHandler);
-    sendToBackground({ type: '_navigate', cmdId: cmd.cmdId, url: cmd.url })
-      .catch(() => {});
-  },
-
-  click(cmd) {
-    // Support coordinate-based click: { x, y } with optional selector for element visibility check
-    if (cmd.x !== undefined && cmd.y !== undefined) {
-      const clickEvent = new MouseEvent('click', {
-        clientX: cmd.x,
-        clientY: cmd.y,
-        bubbles: true,
-        cancelable: true
-      });
-      // If a selector is provided, click the element at those coordinates (if it exists)
-      if (cmd.selector) {
-        const el = document.querySelector(cmd.selector);
-        if (el) {
-          el.dispatchEvent(clickEvent);
-        } else {
-          pendingCommands.delete(cmd.cmdId);
-          sendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'ELEMENT_NOT_FOUND', error: `Element not found: ${cmd.selector}` });
-          return;
+      window.HermesShared._navPageShowHandler = () => {
+        // pageshow fires on bfcache restore too — treat as navigation success
+        if (lastNavigateCmdId === cmd.cmdId) {
+          window.HermesShared.clearNavigateHandlers();
+          window._hermesPendingCommands.delete(cmd.cmdId);
+          window._hermesSendToBackground({
+            type: 'cmd_ack',
+            cmdId: cmd.cmdId,
+            success: true,
+            result: `Navigated to ${cmd.url}`
+          });
         }
-      } else {
-        // Click at raw coordinates
-        document.elementFromPoint(cmd.x, cmd.y)?.dispatchEvent(clickEvent);
+      };
+
+      // Fix #8: wrap event listener setup in try/catch for restricted pages
+      try {
+        window.addEventListener('load', window.HermesShared._navLoadHandler);
+        window.addEventListener('pageshow', window.HermesShared._navPageShowHandler);
+      } catch (e) {
+        window.HermesShared.clearNavigateHandlers();
+        window._hermesPendingCommands.delete(cmd.cmdId);
+        window._hermesSendToBackground({
+          type: 'cmd_error',
+          cmdId: cmd.cmdId,
+          success: false,
+          errorCode: 'RESTRICTED_PAGE',
+          error: 'Cannot set up navigation listeners on this page'
+        });
+        return;
       }
-      pendingCommands.delete(cmd.cmdId);
-      sendToBackground({ type: 'cmd_ack', cmdId: cmd.cmdId, success: true, result: `Clicked at (${cmd.x}, ${cmd.y})` });
-      return;
+      window._hermesSendToBackground({ type: '_navigate', cmdId: cmd.cmdId, url: cmd.url })
+        .catch(() => {});
+    },
+
+    refresh(cmd) {
+      // Fix #10: Send snapshot then ack — never before the async send completes.
+      // Only sends cmd_ack after tab_snapshot is confirmed delivered.
+      const snap = window.HermesShared.getFullPageSnapshot();
+      window._hermesSendToBackground({ type: 'tab_snapshot', ...snap, incremental: false })
+        .then(() => {
+          window._hermesPendingCommands.delete(cmd.cmdId);
+          window._hermesSendToBackground({ type: 'cmd_ack', cmdId: cmd.cmdId, success: true, result: `Refreshed (seq ${snap.seq})` });
+        })
+        .catch(e => {
+          window._hermesPendingCommands.delete(cmd.cmdId);
+          window._hermesSendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'REFRESH_FAILED', error: e.message });
+        });
+    }
+  };
+
+  // Merge Safari-specific handlers with shared handlers
+  const CMD_HANDLERS = {
+    ...window.HermesShared.CMD_HANDLERS,
+    ..._safariCMDHandlers
+  };
+
+  // ─── Message listener ───────────────────────────────────────────────────────────
+
+  // Fix #6: Handle backpressure signal from background — pause/resume observer
+  browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    // Backpressure: pause observer when Hermes is overwhelmed
+    if (message.type === 'backpressure') {
+      window.HermesShared.backpressurePaused = message.paused;
+      return true;
     }
 
-    const el = document.querySelector(cmd.selector);
-    if (!el) {
-      pendingCommands.delete(cmd.cmdId);
-      sendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'ELEMENT_NOT_FOUND', error: `Element not found: ${cmd.selector}` });
-      return;
+    // P3-17: Handle cancel command type
+    if (message.type === 'cancel') {
+      window.HermesShared.handleCancel(message.cmdId);
+      return true;
     }
-    el.click();
-    pendingCommands.delete(cmd.cmdId);
-    sendToBackground({ type: 'cmd_ack', cmdId: cmd.cmdId, success: true, result: `Clicked: ${cmd.selector}` });
-  },
 
-  scroll(cmd) {
-    window.scrollTo(cmd.x || 0, cmd.y || 0);
-    pendingCommands.delete(cmd.cmdId);
-    sendToBackground({ type: 'cmd_ack', cmdId: cmd.cmdId, success: true, result: `Scrolled to (${cmd.x}, ${cmd.y})` });
-  },
+    if (message.type === 'ping') {
+      // Fix #14: Set up a pending command entry so ping returns cmd_ack, not fire-and-forget.
+      // This makes ping consistent with other commands and allows the background to wait for it.
+      const { cmdId } = message;
+      if (cmdId) {
+        window._hermesPendingCommands.set(cmdId, { resolve: null, reject: null, settled: false });
+      }
+      const snap = window.HermesShared.getFullPageSnapshot();
+      sendResponse({ type: 'pong', ...snap });
+      return true;
+    }
 
-  type(cmd) {
-    const el = document.querySelector(cmd.selector);
-    if (!el) {
-      pendingCommands.delete(cmd.cmdId);
-      sendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'ELEMENT_NOT_FOUND', error: `Element not found: ${cmd.selector}` });
-      return;
-    }
-    el.focus();
-    const nativeInputSetter = Object.getOwnPropertyDescriptor(
-      window.HTMLInputElement.prototype, 'value'
-    ) || Object.getOwnPropertyDescriptor(
-      window.HTMLTextAreaElement.prototype, 'value'
-    );
-    if (nativeInputSetter) {
-      nativeInputSetter.set.call(el, cmd.text);
-    } else {
-      el.value = cmd.text;
-    }
-    el.dispatchEvent(new Event('input', { bubbles: true }));
-    el.dispatchEvent(new Event('change', { bubbles: true }));
-    pendingCommands.delete(cmd.cmdId);
-    sendToBackground({ type: 'cmd_ack', cmdId: cmd.cmdId, success: true, result: `Typed "${cmd.text}" into: ${cmd.selector}` });
-  },
-
-  submit(cmd) {
-    const form = cmd.selector ? document.querySelector(cmd.selector) : document.querySelector('form');
-    if (!form) {
-      pendingCommands.delete(cmd.cmdId);
-      sendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'FORM_NOT_FOUND', error: `Form not found: ${cmd.selector || 'any form'}` });
-      return;
-    }
-    const submitBtn = form.querySelector('button[type="submit"], input[type="submit"]');
-    if (submitBtn) {
-      submitBtn.click();
-    } else {
-      form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
-    }
-    pendingCommands.delete(cmd.cmdId);
-    sendToBackground({ type: 'cmd_ack', cmdId: cmd.cmdId, success: true, result: `Submitted form: ${cmd.selector || 'form'}` });
-  },
-
-  evaluate(cmd) {
-    // SECURITY WARNING: new Function() executes arbitrary JS in the page context.
-    // Only use the evaluate command with scripts you trust. Malicious page scripts
-    // can observe/modify the evaluated result via prototype overrides.
-    try {
-      // eslint-disable-next-line no-new-func
-      const result = (new Function(cmd.script))();
-      pendingCommands.delete(cmd.cmdId);
-      sendToBackground({ type: 'cmd_ack', cmdId: cmd.cmdId, success: true, result });
-    } catch (e) {
-      pendingCommands.delete(cmd.cmdId);
-      sendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'REFRESH_FAILED', error: e.message });
-    }
-  },
-
-  refresh(cmd) {
-    // Fix #10: Send snapshot then ack — never before the async send completes.
-    // Only sends cmd_ack after tab_snapshot is confirmed delivered.
-    const snap = getFullPageSnapshot();
-    sendToBackground({ type: 'tab_snapshot', ...snap, incremental: false })
-      .then(() => {
-        pendingCommands.delete(cmd.cmdId);
-        sendToBackground({ type: 'cmd_ack', cmdId: cmd.cmdId, success: true, result: `Refreshed (seq ${snap.seq})` });
-      })
-      .catch(e => {
-        pendingCommands.delete(cmd.cmdId);
-        sendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'REFRESH_FAILED', error: e.message });
+    const handler = CMD_HANDLERS[message.type];
+    if (handler) {
+      const { cmdId } = message;
+      window._hermesPendingCommands.set(cmdId, { resolve: null, reject: null, settled: false });
+      Promise.resolve().then(() => handler(message)).catch((e) => {
+        if (!window._hermesPendingCommands.get(cmdId)?.settled) {
+          window._hermesPendingCommands.delete(cmdId);
+        }
       });
-  }
-};
-
-/**
- * P3-17 Fix: Handle cancel command — if this cmdId is pending, remove it
- * and do NOT send any ack/error back to the proxy.
- */
-function handleCancel(cmdId) {
-  if (!pendingCommands.has(cmdId)) return;
-  const entry = pendingCommands.get(cmdId);
-  entry.settled = true;
-  pendingCommands.delete(cmdId);
-  // Do NOT send cmd_ack or cmd_error — command was cancelled
-}
-
-// ─── Message listener ───────────────────────────────────────────────────────────
-
-// Fix #6: Handle backpressure signal from background — pause/resume observer
-browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  // Backpressure: pause observer when Hermes is overwhelmed
-  if (message.type === 'backpressure') {
-    backpressurePaused = message.paused;
-    return true;
-  }
-
-  // P3-17: Handle cancel command type
-  if (message.type === 'cancel') {
-    handleCancel(message.cmdId);
-    return true;
-  }
-
-  if (message.type === 'ping') {
-    const snap = getFullPageSnapshot();
-    sendResponse({ type: 'pong', ...snap });
-    return true;
-  }
-
-  const handler = CMD_HANDLERS[message.type];
-  if (handler) {
-    const { cmdId } = message;
-    pendingCommands.set(cmdId, { resolve: null, reject: null, settled: false });
-    Promise.resolve().then(() => handler(message)).catch((e) => {
-      if (!pendingCommands.get(cmdId)?.settled) {
-        pendingCommands.delete(cmdId);
-      }
-    });
-    return true;
-  }
-
-  return false;
-});
-
-// ─── Cleanup on page unload ────────────────────────────────────────────────────
-
-window.addEventListener('unload', () => {
-  if (snapshotInterval !== null) {
-    clearInterval(snapshotInterval);
-    snapshotInterval = null;
-  }
-  if (pageObserver) {
-    pageObserver.disconnect();
-    pageObserver = null;
-  }
-  if (debounceTimer !== null) {
-    clearTimeout(debounceTimer);
-    debounceTimer = null;
-  }
-  // C1: Flush any pending buffered mutations before unloading
-  if (_mutationFlushTimer !== null) {
-    clearTimeout(_mutationFlushTimer);
-    _mutationFlushTimer = null;
-  }
-  _flushMutationBuffer();
-  clearNavigateHandlers();
-  for (const [cmdId, pending] of pendingCommands) {
-    if (pending.reject && !pending.settled) {
-      pending.reject(new Error('Tab navigated away'));
+      return true;
     }
-  }
-  pendingCommands.clear();
-});
 
-// ─── Global error handlers (P1-4 / crash recovery) ──────────────────────────────
+    return false;
+  });
 
-window.addEventListener('error', (e) => {
-  sendToBackground({
-    type: 'content_error',
-    message: e.message,
-    filename: e.filename,
-    lineno: e.lineno,
-    colno: e.colno
-  }).catch(() => {});
-});
+  // ─── Cleanup on page unload ───────────────────────────────────────────────────
 
-window.addEventListener('unhandledrejection', (e) => {
-  sendToBackground({
-    type: 'content_error',
-    message: `unhandledrejection: ${e.reason}`,
-  }).catch(() => {});
-});
+  window.addEventListener('unload', () => {
+    if (snapshotInterval !== null) {
+      clearInterval(snapshotInterval);
+      snapshotInterval = null;
+    }
+    if (pageObserver) {
+      pageObserver.disconnect();
+      pageObserver = null;
+    }
+    if (debounceTimer !== null) {
+      clearTimeout(debounceTimer);
+      debounceTimer = null;
+    }
+    // C1: Flush any pending buffered mutations before unloading
+    window.HermesShared._flushMutationBuffer();
+    window.HermesShared.clearNavigateHandlers();
+    for (const [cmdId, pending] of window._hermesPendingCommands) {
+      if (pending.reject && !pending.settled) {
+        pending.reject(new Error('Tab navigated away'));
+      }
+    }
+    window._hermesPendingCommands.clear();
+  });
 
-// ─── Init ─────────────────────────────────────────────────────────────────────
+  // ─── Global error handlers (P1-4 / crash recovery) ──────────────────────────────
 
-window._snapshotSeq = 0;
+  window.addEventListener('error', (e) => {
+    window._hermesSendToBackground({
+      type: 'content_error',
+      message: e.message,
+      filename: e.filename,
+      lineno: e.lineno,
+      colno: e.colno
+    }).catch(() => {});
+  });
 
-// P1-4 Fix: Capture initial snapshot SYNCHRONOUSLY before observer starts
-// Use a small delay only to ensure document.body is ready
-const initDelay = document.body ? 0 : 100;
-setTimeout(captureInitialSnapshot, initDelay);
+  window.addEventListener('unhandledrejection', (e) => {
+    window._hermesSendToBackground({
+      type: 'content_error',
+      message: `unhandledrejection: ${e.reason}`,
+    }).catch(() => {});
+  });
+
+  // ─── Init ─────────────────────────────────────────────────────────────────────
+
+  window._snapshotSeq = 0;
+
+  // P1-4 Fix: Capture initial snapshot SYNCHRONOUSLY before observer starts
+  // Use a small delay only to ensure document.body is ready
+  const initDelay = document.body ? 0 : 100;
+  setTimeout(captureInitialSnapshot, initDelay);
+}

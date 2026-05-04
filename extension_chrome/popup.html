@@ -8,43 +8,53 @@
 </head>
 <body>
   <div class="container">
-    <!-- Header -->
     <div class="header">
       <div class="header-left">
+        <svg class="logo" width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <rect width="24" height="24" rx="5" fill="#89b4fa"/>
+          <path d="M7 12h10M12 7v10" stroke="#1e1e2e" stroke-width="2" stroke-linecap="round"/>
+        </svg>
         <span class="status-dot" id="status-dot"></span>
         <span class="status-text" id="status-text">Inactive</span>
       </div>
-      <span class="version" id="version-text"></span>
-      <span class="hermes-session-hint hidden" id="hermes-session-hint"></span>
+      <div class="header-right">
+        <span class="version" id="version-text">v1.0</span>
+      </div>
     </div>
 
-    <!-- URL display -->
     <div class="url-row" id="url-display">No tab active</div>
 
-    <!-- Info text -->
-    <p class="info-text" id="info-text">Click "Activate Tab" to give Hermes Agent access to your current page.</p>
-
-    <!-- Error panel -->
-    <div class="error-panel hidden" id="error-panel">
-      <span class="error-text" id="error-text"></span>
+    <div id="error-panel" class="error-panel hidden">
+      <span id="error-text"></span>
     </div>
 
-    <!-- Command log -->
-    <div class="cmd-log-panel hidden" id="cmd-log-panel">
+    <div id="cmd-log-panel" class="cmd-log-panel hidden">
       <div class="cmd-log-header">
-        <span>Commands</span>
-        <span class="cmd-count" id="cmd-count">0</span>
+        <span>Recent commands</span>
+        <span id="cmd-count" class="cmd-count">0</span>
       </div>
-      <ul class="cmd-log-list" id="cmd-log-list"></ul>
+      <ul id="cmd-log-list" class="cmd-log-list"></ul>
     </div>
 
-    <!-- Buttons -->
     <div class="button-row">
-      <button class="btn btn-primary" id="activate-btn">Activate Tab</button>
-      <button class="btn btn-secondary hidden" id="disconnect-btn">Disconnect</button>
-      <button class="btn btn-ghost hidden" id="refresh-btn">Refresh</button>
+      <button id="activate-btn" class="btn btn-primary">Activate Tab</button>
+      <button id="disconnect-btn" class="btn btn-secondary hidden">Disconnect</button>
+      <button id="refresh-btn" class="btn btn-secondary hidden">Refresh Snapshot</button>
+      <!-- Fix #13: cancel button for pending commands — calls DELETE /command/:cmdId -->
+      <button id="cancel-btn" class="btn btn-ghost hidden">Cancel</button>
+    </div>
+
+    <p id="info-text" class="info-text">Click "Activate Tab" to give Hermes Agent access to your current page.</p>
+
+    <div id="hermes-session-hint" class="hermes-session-hint hidden"></div>
+
+    <div class="footer">
+      <a id="dashboard-link" href="http://localhost:9321/dashboard" class="dashboard-link" title="Open Dashboard">Dashboard</a>
+      <span class="footer-sep">•</span>
+      <span>localhost:9321</span>
     </div>
   </div>
+
   <script src="popup.js"></script>
 </body>
 </html>

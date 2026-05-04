@@ -55,13 +55,20 @@
       Refresh Snapshot
     </button>
 
+    <!-- Fix #13: cancel button for pending commands — calls DELETE /command/:cmdId -->
+    <button id="cancel-btn" class="btn secondary hidden">
+      Cancel
+    </button>
+
     <div class="info">
       <p id="info-text">Click "Activate Tab" to give Hermes Agent access to your current page.</p>
     </div>
 
     <div class="footer">
+      <a id="dashboard-link" href="http://localhost:9321/dashboard" class="dashboard-link" title="Open Dashboard">Dashboard</a>
+      <span class="footer-sep">•</span>
       <span id="version-text">v1.0</span>
-      <span>·</span>
+      <span class="footer-sep">•</span>
       <span>localhost:9321</span>
     </div>
   </div>

@@ -7,6 +7,7 @@
 'use strict';
 
 const MAX_CMD_LOG = 5;
+const CMD_LOG_KEY = 'hermes_cmd_log'; // Fix #22: localStorage key for persistence
 
 const statusDot    = document.getElementById('status-dot');
 const statusText   = document.getElementById('status-text');
@@ -14,6 +15,8 @@ const urlDisplay   = document.getElementById('url-display');
 const activateBtn  = document.getElementById('activate-btn');
 const disconnectBtn = document.getElementById('disconnect-btn');
 const refreshBtn   = document.getElementById('refresh-btn');
+// Fix #13: Cancel button for pending commands — calls DELETE /command/:cmdId
+const cancelBtn    = document.getElementById('cancel-btn');
 const errorPanel   = document.getElementById('error-panel');
 const errorText    = document.getElementById('error-text');
 const infoText     = document.getElementById('info-text');
@@ -21,6 +24,7 @@ const versionText  = document.getElementById('version-text');
 const cmdLogPanel  = document.getElementById('cmd-log-panel');
 const cmdLogList   = document.getElementById('cmd-log-list');
 const cmdCount     = document.getElementById('cmd-count');
+const dashboardLink = document.getElementById('dashboard-link'); // Fix #21
 
 try {
   const manifest = chrome.runtime.getManifest();
@@ -29,8 +33,28 @@ try {
 } catch {}
 
 let state = 'inactive';
-let cmdLog = [];
+let cmdLog = []; // Fix #22: loaded from localStorage in loadCmdLog()
 let pendingCmdId = null;
+
+// Fix #22: Load command log from localStorage
+function loadCmdLog() {
+  try {
+    const stored = localStorage.getItem(CMD_LOG_KEY);
+    if (stored) {
+      cmdLog = JSON.parse(stored);
+      // Filter out entries older than 24 hours
+      const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+      cmdLog = cmdLog.filter(entry => entry.ts > cutoff);
+    }
+  } catch { cmdLog = []; }
+}
+
+// Fix #22: Save command log to localStorage
+function saveCmdLog() {
+  try {
+    localStorage.setItem(CMD_LOG_KEY, JSON.stringify(cmdLog));
+  } catch { /* storage full or unavailable */ }
+}
 
 function onActivateClick() {
   setState('connecting');
@@ -43,12 +67,57 @@ function onDisconnectClick() {
   chrome.runtime.sendMessage({ event: 'disconnect' }).catch(() => {});
   setState('inactive');
   cmdLog = [];
+  saveCmdLog(); // Fix #22: persist cleared log
   renderCmdLog();
 }
 
 function onRefreshClick() {
   chrome.runtime.sendMessage({ event: 'refreshSnapshot' }).catch(() => {});
   addCmdLog('pending', 'Refresh snapshot…');
+}
+
+// Fix #13: Cancel the currently pending command by calling DELETE /command/:cmdId
+function onCancelClick() {
+  if (!pendingCmdId) return;
+  const cmdIdToCancel = pendingCmdId;
+  pendingCmdId = null;
+  cancelBtn.classList.add('hidden');
+  fetch(`http://localhost:9321/command/${encodeURIComponent(cmdIdToCancel)}`, {
+    method: 'DELETE'
+  }).then(() => {
+    addCmdLog('error', `Cancelled: ${cmdIdToCancel}`);
+  }).catch(() => {
+    addCmdLog('error', 'Cancel failed');
+  });
+}
+
+// Fix #20: Keyboard shortcuts for quick actions
+function onKeyDown(e) {
+  // Ctrl/Cmd + Shift + H: Activate tab
+  if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'H') {
+    e.preventDefault();
+    if (!activateBtn.disabled && !activateBtn.classList.contains('hidden')) {
+      onActivateClick();
+    }
+  }
+  // Ctrl/Cmd + Shift + D: Disconnect
+  else if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'D') {
+    e.preventDefault();
+    if (!disconnectBtn.classList.contains('hidden')) {
+      onDisconnectClick();
+    }
+  }
+  // Ctrl/Cmd + Shift + R: Refresh snapshot
+  else if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'R') {
+    e.preventDefault();
+    if (!refreshBtn.classList.contains('hidden')) {
+      onRefreshClick();
+    }
+  }
+  // Escape: Close popup (via visibility change)
+  else if (e.key === 'Escape') {
+    window.close();
+  }
 }
 
 function onBgMessage(msg) {
@@ -68,12 +137,26 @@ function onBgMessage(msg) {
     setState('error', { message: msg.message });
   } else if (msg.event === 'cmd_sent') {
     pendingCmdId = msg.cmdId;
+    cancelBtn.classList.remove('hidden');  // Fix #13: show cancel button when command is pending
     addCmdLog('pending', `${msg.cmdType} → ${msg.selector || msg.url || '(action)'}`);
   } else if (msg.event === 'cmd_done') {
     pendingCmdId = null;
-    addCmdLog('success', `${msg.cmdType}: OK`);
+    cancelBtn.classList.add('hidden');
+    // Fix #15: If there's a pending "Refresh snapshot…" entry, update it in-place
+    // instead of adding a second entry.
+    let updated = false;
+    for (let i = 0; i < cmdLog.length; i++) {
+      if (cmdLog[i].type === 'pending' && cmdLog[i].detail === 'Refresh snapshot…') {
+        cmdLog[i] = { type: 'success', detail: 'Refreshed', ts: Date.now() };
+        updated = true;
+        break;
+      }
+    }
+    if (!updated) addCmdLog('success', `${msg.cmdType}: OK`);
+    else { saveCmdLog(); renderCmdLog(); }
   } else if (msg.event === 'cmd_error') {
     pendingCmdId = null;
+    cancelBtn.classList.add('hidden');
     addCmdLog('error', `${msg.cmdType}: ${msg.error}`);
   } else if (msg.event === 'backpressure') {
     // Fix #14: show backpressure PAUSED state in popup; clear pending command
@@ -96,6 +179,7 @@ function onBgMessage(msg) {
 function addCmdLog(type, detail) {
   cmdLog.unshift({ type, detail, ts: Date.now() });
   if (cmdLog.length > MAX_CMD_LOG) cmdLog.pop();
+  saveCmdLog(); // Fix #22: persist on every change
   renderCmdLog();
 }
 
@@ -129,6 +213,7 @@ function setState(newState, extra = {}) {
       infoText.textContent = 'Click "Activate Tab" to give Hermes Agent access to your current page.';
       urlDisplay.textContent = 'No tab active';
       sessionStorage.removeItem('hermes_last_url');
+      cancelBtn.classList.add('hidden');  // Fix #13
       break;
     case 'connecting':
       statusDot.classList.add('connecting');
@@ -136,6 +221,7 @@ function setState(newState, extra = {}) {
       infoText.textContent = 'Connecting to proxy server at localhost:9321…';
       activateBtn.disabled = true;
       activateBtn.classList.add('disabled');
+      cancelBtn.classList.add('hidden');  // Fix #13
       break;
     case 'active':
       statusDot.classList.add('connected');
@@ -152,10 +238,14 @@ function setState(newState, extra = {}) {
       infoText.textContent = 'Hermes Agent has full access to this tab.';
       break;
     case 'error':
-      statusDot.classList.add('disconnected');
+      statusDot.classList.add('error'); // Fix #23: distinct error dot color
       statusText.textContent = 'Error';
       errorPanel.classList.remove('hidden');
       errorText.textContent = extra.message || 'Connection failed.';
+      // Fix #23: Show retry button in error state instead of just info text
+      activateBtn.classList.remove('hidden');
+      activateBtn.disabled = false;
+      activateBtn.textContent = 'Retry';
       infoText.textContent = 'Make sure the proxy server is running: node proxy_server/server.js';
       break;
   }
@@ -163,10 +253,22 @@ function setState(newState, extra = {}) {
 
 async function init() {
   setState('inactive');
+  loadCmdLog(); // Fix #22: restore persisted command log
+  renderCmdLog(); // Render loaded log on startup
   chrome.runtime.onMessage.addListener(onBgMessage);
   activateBtn.addEventListener('click', onActivateClick);
   disconnectBtn.addEventListener('click', onDisconnectClick);
   refreshBtn.addEventListener('click', onRefreshClick);
+  cancelBtn.addEventListener('click', onCancelClick);  // Fix #13
+  document.addEventListener('keydown', onKeyDown); // Fix #20: keyboard shortcuts
+
+  // Fix #21: Dashboard link - open in new tab
+  if (dashboardLink) {
+    dashboardLink.addEventListener('click', (e) => {
+      e.preventDefault();
+      chrome.tabs.create({ url: dashboardLink.href });
+    });
+  }
 
   // Cleanup on close
   document.addEventListener('visibilitychange', () => {
@@ -175,6 +277,8 @@ async function init() {
       activateBtn.removeEventListener('click', onActivateClick);
       disconnectBtn.removeEventListener('click', onDisconnectClick);
       refreshBtn.removeEventListener('click', onRefreshClick);
+      cancelBtn.removeEventListener('click', onCancelClick);
+      document.removeEventListener('keydown', onKeyDown);
     }
   });
 

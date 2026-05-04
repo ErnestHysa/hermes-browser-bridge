@@ -234,6 +234,7 @@ function handleProxyMessage(cmd) {
       }
       break;
 
+    // S7: Use cmd.tabId if provided (proxy-directed command to specific tab), otherwise fall back to currentTabId
     case 'navigate':
     case 'click':
     case 'scroll':
@@ -241,7 +242,7 @@ function handleProxyMessage(cmd) {
     case 'submit':
     case 'evaluate':
     case 'refresh':
-      forwardCommandToTab(currentTabId, cmd);
+      forwardCommandToTab(cmd.tabId || currentTabId, cmd);
       break;
 
     case 'cmd_ack':

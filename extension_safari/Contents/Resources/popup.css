@@ -94,6 +94,11 @@ header {
   background: var(--accent-yellow);
 }
 
+/* Fix #23: error state dot */
+.status-dot.error {
+  background: var(--accent-red);
+}
+
 .url-row {
   margin-top: 6px;
   font-size: 11px;
@@ -175,6 +180,11 @@ header {
   padding-top: 4px;
 }
 
+.footer-sep::before {
+  content: "·";
+  color: var(--text-muted);
+}
+
 /* Fix #H5: .cmd-log needs display:block so .hidden can toggle it */
 .cmd-log {
   display: block;
@@ -225,4 +235,13 @@ header {
 /* Fix #H5: pending command styling */
 #cmd-log-list li.pending {
   color: var(--accent-yellow);
+}
+
+/* Fix #21: dashboard link */
+.dashboard-link {
+  color: var(--accent-blue);
+  text-decoration: none;
+}
+.dashboard-link:hover {
+  text-decoration: underline;
 }

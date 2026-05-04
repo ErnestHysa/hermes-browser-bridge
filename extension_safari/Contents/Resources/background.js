@@ -21,13 +21,44 @@ function getProxyWsUrl() {
   return `ws://localhost:${_proxyPort}`;
 }
 
-const PROXY_WS_URL = getProxyWsUrl();
+// Fix #18/#32: Removed stale `const PROXY_WS_URL = getProxyWsUrl()` — the const was
+// never used (site of first WS call already uses getProxyWsUrl() directly).
 const RECONNECT_DELAY_MS = 2000;
 const MAX_PENDING_MESSAGES = 50;
 const HEALTH_POLL_INTERVAL_MS = 10000;
 
-// Session ID — generated once per browser session, persists across tab navigations
-const SESSION_ID = `session_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+// Session ID — restored from storage.session on restart, otherwise generated fresh.
+// Fix #9: On Safari, the background script can be restarted by the OS under memory pressure.
+// Without persistence, a new SESSION_ID orphans the proxy's session state.
+// browser.storage.session is available in Manifest V3 Safari extensions.
+const SESSION_STORAGE_KEY = 'hermesSessionId';
+let SESSION_ID = `session_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+
+async function restoreSessionId() {
+  try {
+    const stored = await browser.storage.session.get([SESSION_STORAGE_KEY]);
+    if (stored[SESSION_STORAGE_KEY]) {
+      SESSION_ID = stored[SESSION_STORAGE_KEY];
+      console.log('[Hermes Bridge] Restored session ID:', SESSION_ID.slice(0, 12));
+    } else {
+      // First run — persist the generated ID so it survives restart
+      await persistSessionId();
+    }
+  } catch (e) {
+    console.warn('[Hermes Bridge] Could not restore session ID from storage:', e.message);
+  }
+}
+
+async function persistSessionId() {
+  try {
+    await browser.storage.session.set({ [SESSION_STORAGE_KEY]: SESSION_ID });
+  } catch (e) {
+    console.warn('[Hermes Bridge] Could not persist session ID:', e.message);
+  }
+}
+
+// Attempt to restore session on startup (may not complete before first connect)
+restoreSessionId();
 
 // Connection state
 let socket = null;
@@ -146,8 +177,8 @@ function stopHealthPoll() {
 
 // ─── Command routing ─────────────────────────────────────────────────────────
 
-function forwardCommandToTab(cmd) {
-  if (!currentTabId) {
+function forwardCommandToTab(tabId, cmd) {
+  if (!tabId) {
     console.warn('[Hermes Bridge] No active tab to forward command to');
     notifyPopup({ event: 'cmd_error', cmdType: cmd.type, error: 'No active tab' });
     return;
@@ -159,7 +190,7 @@ function forwardCommandToTab(cmd) {
   const RETRY_DELAY_MS = 300;
 
   function attempt(attemptNum) {
-    browser.tabs.sendMessage(currentTabId, cmd).then(() => {
+    browser.tabs.sendMessage(tabId, cmd).then(() => {
       // Success — cmd_ack or cmd_error arrives asynchronously via handleProxyMessage
     }).catch((err) => {
       if (err && err.message) {
@@ -211,6 +242,7 @@ function handleProxyMessage(cmd) {
       }
       break;
 
+    // S7: Use cmd.tabId if provided (proxy-directed command to specific tab), otherwise fall back to currentTabId
     case 'navigate':
     case 'click':
     case 'scroll':
@@ -218,7 +250,7 @@ function handleProxyMessage(cmd) {
     case 'submit':
     case 'evaluate':
     case 'refresh':
-      forwardCommandToTab(cmd);
+      forwardCommandToTab(cmd.tabId || currentTabId, cmd);
       break;
 
     case 'cmd_ack':
@@ -332,8 +364,12 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.event === 'refreshSnapshot') {
+    // Fix #5: Set up a pending command entry so the popup gets cmd_ack on completion.
+    // Without this, the pendingCmdId in popup.js never gets cleared for refresh commands.
     if (currentTabId) {
-      browser.tabs.sendMessage(currentTabId, { type: 'ping' }).then((resp) => {
+      const fakeCmdId = `refresh_${Date.now()}`;
+      pendingCmdId = fakeCmdId;
+      browser.tabs.sendMessage(currentTabId, { type: 'ping', cmdId: fakeCmdId }).then((resp) => {
         if (resp && resp.html) {
           sendToProxy({
             type: 'tab_snapshot',
@@ -344,8 +380,11 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
             tabId: currentTabId,
             sessionId: SESSION_ID
           });
+          pendingCmdId = null;
+          notifyPopup({ event: 'cmd_done', cmdType: 'refresh' });
         }
       }).catch(() => {
+        pendingCmdId = null;
         notifyPopup({ event: 'cmd_error', cmdType: 'refresh', error: 'Tab not ready' });
       });
     }

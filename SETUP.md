@@ -238,11 +238,11 @@ curl http://localhost:9321/metrics
 
 ## Step 8: (Optional) HTTPS Proxy
 
-For accessing the proxy from other machines on your network (e.g., a second Mac on the same LAN), use the HTTPS variant:
+For accessing the proxy from other machines on your network (e.g., a second Mac on the same LAN), use the `--https` flag:
 
 ```bash
 cd ~/Desktop/DEVPROJECTS/hermes-browser-bridge/proxy_server
-node server_https.js
+node server.js --https
 ```
 
 Runs on `https://localhost:9322`. Before using HTTPS, install the CA cert so your browser trusts the proxy's TLS certificate:
@@ -321,7 +321,7 @@ WebSocket cannot reach the proxy:
 | | |
 |---|---|
 | Start proxy | `node ~/Desktop/DEVPROJECTS/hermes-browser-bridge/proxy_server/server.js` |
-| Start HTTPS proxy | `node ~/Desktop/DEVPROJECTS/hermes-browser-bridge/proxy_server/server_https.js` |
+| Start HTTPS proxy | `node ~/Desktop/DEVPROJECTS/hermes-browser-bridge/proxy_server/server.js --https` |
 | Stop proxy | Ctrl+C in the proxy Terminal |
 | Health | `curl http://localhost:9321/health` |
 | Page state | `curl http://localhost:9321/page_state` |
@@ -339,8 +339,7 @@ WebSocket cannot reach the proxy:
 ```
 hermes-browser-bridge/
 ├── proxy_server/
-│   ├── server.js           ← HTTP + WebSocket proxy (main entry)
-│   ├── server_https.js     ← HTTPS + WSS variant (optional)
+│   ├── server.js           ← HTTP + WebSocket proxy (main entry; --https flag for TLS)
 │   ├── proxy_lib.js        ← Shared HTTP/WS logic, state management
 │   ├── page_mirror.js      ← DOM cache + mutation ring buffer
 │   ├── cmd_queue.js        ← Command queue with timeout + cancel support

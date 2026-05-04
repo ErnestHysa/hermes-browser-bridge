@@ -69,6 +69,7 @@ body {
   animation: pulse 1.2s ease-in-out infinite;
 }
 .status-dot.disconnected { background: var(--text-muted); }
+.status-dot.error { background: var(--error); } /* Fix #23: error state dot */
 
 @keyframes pulse {
   0%, 100% { opacity: 1; }
@@ -210,6 +211,15 @@ body {
 }
 
 .btn-ghost:hover { color: var(--text-primary); background: var(--bg-secondary); }
+
+/* Fix #21: dashboard link */
+.dashboard-link {
+  color: var(--accent-blue);
+  text-decoration: none;
+}
+.dashboard-link:hover {
+  text-decoration: underline;
+}
 
 /* Utility */
 .hidden { display: none !important; }

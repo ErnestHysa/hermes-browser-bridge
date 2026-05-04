@@ -8,6 +8,7 @@
  * Fix #8:   Disconnected sessions evicted after SESSION_TTL_MS of inactivity
  * Fix #M3:   maxHtmlBytes guard — rejects snapshots exceeding the configured size
  * Fix #L2:   getLastSeq(sessionId) exposed via HTTP GET /page_state?sessionId=...&lastSeq=N
+ * Fix #19:   PageStateCache refactor — extracted per-session state class used internally by PageMirror
  */
 
 const HTML_TTL_MS = 5000;
@@ -15,18 +16,28 @@ const MUTATION_TTL_MS = 30000;
 const MUTATION_BUFFER_MAX = 500;
 const DEFAULT_MAX_HTML_BYTES = 10 * 1024 * 1024; // 10MB
 
-class PageMirror {
+// ─── Per-Session State Cache ─────────────────────────────────────────────────
+
+/**
+ * #19: PageStateCache — handles per-session page state (html, title, url, lastUpdate, mutations).
+ *
+ * Each session stored independently so one session's state cannot evict another's.
+ * Mutation buffers are also per-session ring buffers.
+ *
+ * @private
+ */
+class PageStateCache {
   /**
-   * @param {{ maxHtmlBytes?: number }} options
+   * @param {number} sessionTtlMs - How long to keep a disconnected session before evicting it
    */
-  constructor(options = {}) {
-    this._maxHtmlBytes = options.maxHtmlBytes || DEFAULT_MAX_HTML_BYTES;
-    this._sessionTtlMs = options.sessionTtlMs || (5 * 60 * 1000); // default 5 min
+  constructor(sessionTtlMs = 5 * 60 * 1000) {
+    /** @type {number} */
+    this._sessionTtlMs = sessionTtlMs;
 
     /**
      * Per-session page state.
      * Key: sessionId (string)
-     * Value: { url, title, html, lastHtmlUpdate, seq, connected, tabId }
+     * Value: session data object
      * @type {Map<string, {url: string, title: string, html: string, lastHtmlUpdate: number, seq: number, connected: boolean, tabId: (string|null)}>}
      */
     this._sessions = new Map();
@@ -40,53 +51,27 @@ class PageMirror {
     this._lastSeqPerSession = new Map();
 
     /**
-     * H4: Per-session mutation buffers — each session gets its own ring buffer.
+     * Per-session mutation buffers — each session gets its own ring buffer.
      * Key: sessionId. Value: array of {mutations, url, seq, ts}.
      * This prevents an active session from evicting another session's mutations.
      * @type {Map<string, Array<{mutations: object[], url: string, seq: number, ts: number}>}
      */
     this._mutationBuffers = new Map();
 
-    /**
-     * H4: Per-buffer constants. Each session buffer maxes out independently.
-     */
-    this._mutationBufferMax = MUTATION_BUFFER_MAX;  // 500 per session
+    /** Per-buffer constant — max mutations per session buffer */
+    this._mutationBufferMax = MUTATION_BUFFER_MAX; // 500 per session
 
-    /**
-     * Global connected flag — true when at least one session is connected.
-     * Derived from session state, not a separate flag.
-     * @type {boolean}
-     */
+    /** @type {boolean} true when at least one session is currently connected */
     this._anyConnected = false;
-
-    // Fix #5: Start background eviction timer so disconnected sessions are
-    // cleaned up even when no active poll requests come in.
-    this._evictionTimer = null;
-  }
-
-  /**
-   * Start the background eviction interval. Called once after construction.
-   * Safe to call multiple times — only one interval runs at a time.
-   */
-  startEvictionTimer() {
-    if (this._evictionTimer) return; // already running
-    this._evictionTimer = setInterval(() => {
-      this.evictStaleSessions();
-    }, Math.max(30000, this._sessionTtlMs / 2)); // run at half TTL or 30s, whichever is larger
-  }
-
-  /**
-   * Stop the background eviction timer. Mainly for testing.
-   */
-  stopEvictionTimer() {
-    if (this._evictionTimer) {
-      clearInterval(this._evictionTimer);
-      this._evictionTimer = null;
-    }
   }
 
   // ─── Session management ─────────────────────────────────────────────────────
 
+  /**
+   * Get or create session data for a sessionId.
+   * @param {string} sessionId
+   * @returns {{url: string, title: string, html: string, lastHtmlUpdate: number, seq: number, connected: boolean, tabId: (string|null)}}
+   */
   _getSession(sessionId) {
     let session = this._sessions.get(sessionId);
     if (!session) {
@@ -98,23 +83,14 @@ class PageMirror {
 
   /**
    * Update the full page snapshot for a session.
-   * Fix #M3: enforces maxHtmlBytes — truncates or rejects oversized HTML.
    * @param {string} sessionId
    * @param {{ url: string, title: string, html: string, seq?: number }} snapshot
    */
   updateSnapshot(sessionId, { url, title, html, seq }) {
     const session = this._getSession(sessionId);
-
-    // Fix #M3: enforce max HTML size
-    let finalHtml = html;
-    if (html.length > this._maxHtmlBytes) {
-      console.warn(`[PageMirror] HTML snapshot for session ${sessionId} exceeds ${this._maxHtmlBytes} bytes (${html.length}) — truncating`);
-      finalHtml = html.slice(0, this._maxHtmlBytes);
-    }
-
     session.url = url;
     session.title = title;
-    session.html = finalHtml;
+    session.html = html;
     session.lastHtmlUpdate = Date.now();
     session.seq = seq ?? (session.seq + 1);
     session.connected = true;
@@ -122,7 +98,7 @@ class PageMirror {
   }
 
   /**
-   * Mark a session as disconnected.
+   * Mark a session as disconnected (but do not evict it yet).
    * @param {string} sessionId
    */
   disconnectSession(sessionId) {
@@ -134,15 +110,7 @@ class PageMirror {
   }
 
   /**
-   * Evict sessions disconnected for longer than SESSION_TTL_MS.
-   * Public entry point — delegates to internal (used by background timer).
-   */
-  evictStaleSessions() {
-    this._evictStaleSessionsInternal();
-  }
-
-  /**
-   * Add mutation data to the ring buffer, tagged by session.
+   * Add mutation data to the per-session ring buffer.
    * @param {string} sessionId
    * @param {{ mutations: object[], url: string, seq: number }} mutationData
    */
@@ -152,35 +120,24 @@ class PageMirror {
       this._mutationBuffers.set(sessionId, []);
     }
     const buf = this._mutationBuffers.get(sessionId);
-    // H4: Warn when dropping oldest mutation for this specific session's buffer
     if (buf.length >= this._mutationBufferMax) {
-      console.warn(`[PageMirror] Mutation buffer full for session ${sessionId} — dropping oldest entry`);
+      console.warn(`[PageStateCache] Mutation buffer full for session ${sessionId} — dropping oldest entry`);
     }
     buf.push({ mutations, url, seq, ts });
     if (buf.length > this._mutationBufferMax) {
       const dropped = buf.shift();
-      log('warn', `Mutation buffer overflow for session ${sessionId} — dropped ${dropped.mutations.length} mutation(s)`);
+      console.warn(`[PageStateCache] Mutation buffer overflow for session ${sessionId} — dropped ${dropped.mutations.length} mutation(s)`);
     }
   }
 
-  // ─── State for Hermes ───────────────────────────────────────────────────────
-
   /**
-   * Get the current page state for Hermes, scoped to a specific session.
+   * Get the current page state for a session, including delta mutations since lastSeq.
    * @param {string} sessionId
    * @param {number} [lastSeq=0]
    * @returns {{ url: string, title: string, html: string, seq: number, connected: boolean, tabId: (string|null), lastUpdate: number, mutations: object[], htmlStale: boolean }}
    */
   getState(sessionId, lastSeq = 0) {
-    // S2: Only run eviction on read if we haven't run it recently (debounce to once per 5s)
-    // The background timer handles the regular eviction; this is a safety net.
     const now = Date.now();
-    if (!this._lastEvictCheck || (now - this._lastEvictCheck) > 5000) {
-      this._lastEvictCheck = now;
-      const before = this._anyConnected;
-      this._evictStaleSessionsInternal();
-      this._anyConnected = Array.from(this._sessions.values()).some(s => s.connected);
-    }
 
     let targetSession = this._sessions.get(sessionId);
     let actualSessionId = sessionId;
@@ -207,14 +164,13 @@ class PageMirror {
 
     const htmlFresh = (now - targetSession.lastHtmlUpdate) < HTML_TTL_MS;
 
-    // H4: Get mutations from this session's dedicated buffer, not a global one
+    // Get mutations from this session's dedicated buffer
     const sessionMutations = this._mutationBuffers.get(actualSessionId) || [];
     const mutations = sessionMutations
       .filter(m => m.seq > lastSeq && (now - m.ts) < MUTATION_TTL_MS)
       .map(m => ({ mutations: m.mutations, url: m.url, seq: m.seq, ts: m.ts }));
 
-    // M2: Return a shallow copy so callers cannot mutate internal _states map entry.
-    // Mutations array is also cloned so callers can't splice into the ring buffer.
+    // Return a shallow copy so callers cannot mutate internal state
     return {
       url: targetSession.url,
       title: targetSession.title,
@@ -228,8 +184,11 @@ class PageMirror {
     };
   }
 
-  /** Internal eviction without the per-read debounce check — used by background timer */
-  _evictStaleSessionsInternal() {
+  /**
+   * Evict sessions disconnected for longer than _sessionTtlMs.
+   * Called by the background eviction timer.
+   */
+  evictStaleSessions() {
     const now = Date.now();
     for (const [sessionId, session] of this._sessions) {
       if (!session.connected && (now - session.lastHtmlUpdate) > this._sessionTtlMs) {
@@ -238,6 +197,7 @@ class PageMirror {
         this._mutationBuffers.delete(sessionId);
       }
     }
+    this._anyConnected = Array.from(this._sessions.values()).some(s => s.connected);
   }
 
   /**
@@ -255,7 +215,6 @@ class PageMirror {
 
   /**
    * Get the last-acknowledged seq for a session.
-   * Fix #L2: used by the HTTP handler to expose GET /page_state?sessionId=...
    * @param {string} sessionId
    * @returns {number}
    */
@@ -269,4 +228,123 @@ class PageMirror {
   }
 }
 
-module.exports = { PageMirror };
+// ─── Page Mirror ─────────────────────────────────────────────────────────────
+
+/**
+ * PageMirror wraps PageStateCache with maxHtmlBytes enforcement and eviction timer.
+ * The actual per-session state (html, title, url, lastUpdate, mutations[]) is
+ * managed by the internal PageStateCache instance (#19 refactor).
+ *
+ * @public
+ */
+class PageMirror {
+  /**
+   * @param {{ maxHtmlBytes?: number, sessionTtlMs?: number }} options
+   */
+  constructor(options = {}) {
+    this._maxHtmlBytes = options.maxHtmlBytes || DEFAULT_MAX_HTML_BYTES;
+    /** @type {PageStateCache} Internal per-session state cache (#19) */
+    this._cache = new PageStateCache(options.sessionTtlMs || (5 * 60 * 1000));
+
+    /** @type {ReturnType<typeof setInterval>|null} */
+    this._evictionTimer = null;
+  }
+
+  /**
+   * Start the background eviction interval. Called once after construction.
+   * Safe to call multiple times — only one interval runs at a time.
+   */
+  startEvictionTimer() {
+    if (this._evictionTimer) return;
+    this._evictionTimer = setInterval(() => {
+      this._cache.evictStaleSessions();
+    }, 30000);
+  }
+
+  /**
+   * Stop the background eviction timer. Mainly for testing.
+   */
+  stopEvictionTimer() {
+    if (this._evictionTimer) {
+      clearInterval(this._evictionTimer);
+      this._evictionTimer = null;
+    }
+  }
+
+  // ─── Passthrough to PageStateCache ───────────────────────────────────────
+
+  /**
+   * Update the full page snapshot for a session.
+   * Enforces maxHtmlBytes — truncates oversized HTML.
+   * @param {string} sessionId
+   * @param {{ url: string, title: string, html: string, seq?: number }} snapshot
+   */
+  updateSnapshot(sessionId, { url, title, html, seq }) {
+    let finalHtml = html;
+    if (html.length > this._maxHtmlBytes) {
+      console.warn(`[PageMirror] HTML snapshot for session ${sessionId} exceeds ${this._maxHtmlBytes} bytes (${html.length}) — truncating`);
+      finalHtml = html.slice(0, this._maxHtmlBytes);
+    }
+    this._cache.updateSnapshot(sessionId, { url, title, html: finalHtml, seq });
+  }
+
+  /**
+   * Mark a session as disconnected.
+   * @param {string} sessionId
+   */
+  disconnectSession(sessionId) {
+    this._cache.disconnectSession(sessionId);
+  }
+
+  /**
+   * Evict sessions disconnected for longer than the configured TTL.
+   * Public entry point — used by the background timer and prune loop.
+   */
+  evictStaleSessions() {
+    this._cache.evictStaleSessions();
+  }
+
+  /**
+   * Add mutation data to the per-session ring buffer.
+   * @param {string} sessionId
+   * @param {{ mutations: object[], url: string, seq: number }} mutationData
+   */
+  addMutations(sessionId, mutationData) {
+    this._cache.addMutations(sessionId, mutationData);
+  }
+
+  /**
+   * Get the current page state for Hermes, scoped to a specific session.
+   * @param {string} sessionId
+   * @param {number} [lastSeq=0]
+   * @returns {{ url: string, title: string, html: string, seq: number, connected: boolean, tabId: (string|null), lastUpdate: number, mutations: object[], htmlStale: boolean }}
+   */
+  getState(sessionId, lastSeq = 0) {
+    return this._cache.getState(sessionId, lastSeq);
+  }
+
+  /**
+   * Update the last-acknowledged seq for a session.
+   * @param {string} sessionId
+   * @param {number} seq
+   */
+  ackSessionSeq(sessionId, seq) {
+    this._cache.ackSessionSeq(sessionId, seq);
+  }
+
+  /**
+   * Get the last-acknowledged seq for a session.
+   * @param {string} sessionId
+   * @returns {number}
+   */
+  getLastSeq(sessionId) {
+    return this._cache.getLastSeq(sessionId);
+  }
+
+  /** @returns {boolean} true if at least one session is currently connected */
+  get connected() {
+    return this._cache.connected;
+  }
+}
+
+module.exports = { PageMirror, PageStateCache };

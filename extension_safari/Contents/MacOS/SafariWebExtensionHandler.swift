@@ -32,9 +32,9 @@ import os.log
  *            Safari browser version (not the extension bundle version).
  *            Uses correct API availability guards for both read and write.
  *
- * Compiled: swiftc -target arm64-apple-macosx15.0 -o SafariWebExtensionHandler SafariWebExtensionHandler.swift
+ * Compiled: swiftc -target arm64-apple-macosx14.0 -o SafariWebExtensionHandler SafariWebExtensionHandler.swift
  *           (binary is architecture-specific — compile on the target Apple Silicon machine)
- * Deployment: macOS 13.0+ (Ventura and later)
+ * Deployment: macOS 14.0+ (Sonoma and later)
  */
 
 class SafariWebExtensionHandler: NSObject, NSExtensionRequestHandling {

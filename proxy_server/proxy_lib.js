@@ -16,6 +16,9 @@
  * Fix #P3-15: Origin validation checks for null origin (Safari file:// context) explicitly.
  * Fix #P3-16: CORS headers tightened to localhost only (no more wildcard on non-root paths).
  * Fix #P3-17: Command cancellation — DELETE /command/:cmdId cancels pending commands.
+ * Fix #18:   Full TypeScript/JSDoc added to all exported classes and functions.
+ * Fix #19:   PageStateCache refactor — extracted as a separate class used internally
+ *             by PageMirror for per-session state (html, title, url, lastUpdate, mutations[]).
  */
 
 'use strict';
@@ -32,11 +35,21 @@ const CMD_HISTORY_MAX = 50;
 /** @type {Map<string, {cmdId: string, type: string, status: string, result?: string, error?: string, ts: number}[]>} */
 const _commandHistory = new Map();
 
+/**
+ * Retrieve command history for a session.
+ * @param {string} sessionId
+ * @returns {{cmdId: string, type: string, status: string, result?: string, error?: string, ts: number}[]}
+ */
 function _getHistory(sessionId) {
   if (!_commandHistory.has(sessionId)) _commandHistory.set(sessionId, []);
   return _commandHistory.get(sessionId);
 }
 
+/**
+ * Prepend an entry to the session's command history (bounded to CMD_HISTORY_MAX).
+ * @param {string} sessionId
+ * @param {{cmdId: string, type: string, status: string, result?: string, error?: string, ts: number}} entry
+ */
 function _pushHistory(sessionId, entry) {
   const hist = _getHistory(sessionId);
   hist.unshift(entry);
@@ -56,7 +69,9 @@ const IDEMPOTENCY_WINDOW_MS = cfg.IDEMPOTENCY_WINDOW_MS;
 const PRUNE_INTERVAL_MS = 120000;
 const RATE_LIMIT_RPS = cfg.RATE_LIMIT_RPS;        // P3-14: from config.js
 const RATE_LIMIT_BURST = cfg.RATE_LIMIT_BURST;
+const PER_SESSION_RATE_LIMIT = cfg.PER_SESSION_RATE_LIMIT;  // Fix #15: per-session burst from config
 const BACKPRESSURE_THRESHOLD_MS = cfg.BACKPRESSURE_THRESHOLD_MS; // P2-8: from config.js
+const SESSION_TIMEOUT_MS = cfg.SESSION_TIMEOUT_MS; // Fix #10: server-side session timeout
 const WS_SEND_TIMEOUT_MS = 30000;  // H2: force-close socket if send() blocks for >30s
 
 // ─── Structured Logging ────────────────────────────────────────────────────────
@@ -82,6 +97,8 @@ function _warnDefault(field, value) {
  * C3: Validate auth token from Authorization header or ?token= query param.
  * Returns { authorized: true } or { authorized: false, reason: string }.
  * Token is only required if HBS_AUTH_TOKEN env var is set (dev mode skips auth).
+ * @param {import('http').IncomingMessage} req
+ * @returns {{ authorized: boolean, reason?: string }}
  */
 function validateHttpAuth(req) {
   const expectedToken = process.env.HBS_AUTH_TOKEN || null;
@@ -94,6 +111,14 @@ function validateHttpAuth(req) {
   return { authorized: true };
 }
 
+/**
+ * Structured JSON logger — emits one JSON object per line to stdout.
+ * Only logs messages at or above the configured LOG_LEVEL.
+ *
+ * @param {string} level - One of: debug, info, warn, error
+ * @param {string} msg - Log message
+ * @param {object} [extras={}] - Additional fields to include in the entry
+ */
 function log(level, msg, extras = {}) {
   if (LOG_LEVELS[level] === undefined || LOG_LEVELS[level] < CURRENT_LOG_LEVEL) return;
   const entry = {
@@ -141,6 +166,11 @@ const metrics = {
   }
 };
 
+/**
+ * Increment a named counter metric.
+ * @param {string} counterPath - Dot-separated path, e.g. 'commands' or 'commands.total'
+ * @param {Record<string, string>} [labels={}] - Label key-value pairs
+ */
 function metricIncr(counterPath, labels = {}) {
   const parts = counterPath.split('.');
   let node = metrics.counters;
@@ -160,6 +190,11 @@ function metricIncr(counterPath, labels = {}) {
   node[last][key]++;
 }
 
+/**
+ * Set a gauge metric to a value.
+ * @param {string} name - Gauge name
+ * @param {number} value
+ */
 function metricGauge(name, value) {
   if (metrics.gauges[name] !== undefined) metrics.gauges[name] = value;
 }
@@ -169,6 +204,14 @@ let _metricLastCleanup = 0;
 const METRIC_TTL_MS = 60000;        // entries older than this are pruned
 const METRIC_MAX_PER_TYPE = 1000;   // hard cap per histogram+type
 
+/**
+ * Push a value to a named histogram. Entries older than METRIC_TTL_MS are pruned
+ * on a debounced schedule (at most every 60s to avoid O(n) on every call).
+ *
+ * @param {string} histName - Histogram name, e.g. 'commandDuration', 'htmlBytes'
+ * @param {number} value
+ * @param {Record<string, string>} [labels={}]
+ */
 function metricHistogramPush(histName, value, labels = {}) {
   const type = labels.type || 'unknown';
   if (!metrics.histograms[histName][type]) {
@@ -194,6 +237,10 @@ function metricHistogramPush(histName, value, labels = {}) {
   }
 }
 
+/**
+ * Format all collected metrics in Prometheus exposition format.
+ * @returns {string} Prometheus-compatible metrics text
+ */
 function formatPrometheus() {
   const lines = [];
   const emit = (...parts) => lines.push(parts.join(' '));
@@ -297,6 +344,12 @@ function formatPrometheus() {
 
 // ─── Idempotency Cache (Fix #P3-13 — SHA-256 hash of full command) ─────────────
 
+/**
+ * IdempotencyCache — prevents duplicate commands from being processed within the
+ * idempotency window. Uses SHA-256 of the full command JSON as the cache key (#P3-13).
+ *
+ * @public
+ */
 class IdempotencyCache {
   constructor() {
     /** @type {Map<string, { cmdId: string, timestamp: number }>} */
@@ -304,17 +357,33 @@ class IdempotencyCache {
   }
 
   /**
-   * Fix #P3-13: Use SHA-256 of full command JSON for idempotency key.
-   * Much stronger than the previous string-concat approach which could collide.
+   * Compute a SHA-256 hash of the command JSON and return the first 32 hex chars.
+   * @param {object} cmd
+   * @returns {string}
    */
   _hash(cmd) {
     return createHash('sha256').update(JSON.stringify(cmd)).digest('hex').slice(0, 32);
   }
 
+  /**
+   * Build the internal cache key from sessionId and idempotencyKey.
+   * @param {string} sessionId
+   * @param {string} idempotencyKey
+   * @returns {string}
+   */
   _key(sessionId, idempotencyKey) {
     return `${sessionId}:${idempotencyKey}`;
   }
 
+  /**
+   * Check whether a command with this idempotencyKey was already recorded for this session.
+   * Entries older than IDEMPOTENCY_WINDOW_MS are treated as not found (auto-evicted).
+   *
+   * @param {string} sessionId
+   * @param {string} idempotencyKey
+   * @param {object} cmd
+   * @returns {{ duplicate: boolean, existingCmdId: string|null }}
+   */
   check(sessionId, idempotencyKey, cmd) {
     if (!idempotencyKey) return { duplicate: false, existingCmdId: null };
     const k = this._key(sessionId, idempotencyKey);
@@ -328,12 +397,22 @@ class IdempotencyCache {
     return { duplicate: true, existingCmdId: entry.cmdId };
   }
 
+  /**
+   * Record a command's idempotency key so future duplicates can be detected.
+   * @param {string} sessionId
+   * @param {string} idempotencyKey
+   * @param {string} cmdId
+   * @param {object} cmd
+   */
   record(sessionId, idempotencyKey, cmdId, cmd) {
     if (!idempotencyKey) return;
     const k = this._key(sessionId, idempotencyKey);
     this._cache.set(k, { cmdId, timestamp: Date.now() });
   }
 
+  /**
+   * Remove all entries older than IDEMPOTENCY_WINDOW_MS.
+   */
   prune() {
     const cutoff = Date.now() - IDEMPOTENCY_WINDOW_MS;
     for (const [k, v] of this._cache) {
@@ -344,17 +423,32 @@ class IdempotencyCache {
 
 // ─── Rate Limiter ─────────────────────────────────────────────────────────────
 
+/**
+ * Token-bucket rate limiter with burst support.
+ *
+ * L3: Burst allows the first few requests after idle to proceed at full speed,
+ * then refills tokens gradually. Start fully burst-ready on construction.
+ *
+ * @public
+ */
 class RateLimiter {
-  /** L3: Added burst support — rate limiter refills tokens gradually but allows
-   * burst up to burstSize on first request after idle period. */
+  /**
+   * @param {number} [maxTokens=RATE_LIMIT_RPS] - Tokens per second (refill rate)
+   * @param {number} [windowMs=1000] - Refill window in milliseconds
+   * @param {number} [burstSize=RATE_LIMIT_BURST] - Max burst capacity
+   */
   constructor(maxTokens = RATE_LIMIT_RPS, windowMs = 1000, burstSize = RATE_LIMIT_BURST) {
     this.maxTokens = maxTokens;
     this.windowMs = windowMs;
     this.burstSize = burstSize;
-    this.tokens = burstSize; // L3: start fully burst-ready
+    this.tokens = burstSize;
     this.lastRefill = Date.now();
   }
 
+  /**
+   * Try to consume one token. Returns true if allowed, false if rate limited.
+   * @returns {boolean}
+   */
   tryConsume() {
     this._refill();
     if (this.tokens >= 1) {
@@ -364,17 +458,18 @@ class RateLimiter {
     return false;
   }
 
+  /** @private */
   _refill() {
     const now = Date.now();
     const elapsed = now - this.lastRefill;
     if (elapsed >= this.windowMs) {
-      // L3: Refill gradually — each ms of elapsed time restores 1 token (capped at maxTokens)
       const refill = Math.min(this.maxTokens, Math.floor(elapsed / this.windowMs * this.maxTokens));
       this.tokens = Math.min(this.maxTokens, this.tokens + refill);
       this.lastRefill = now;
     }
   }
 
+  /** @returns {number} Available tokens after refill */
   get available() {
     this._refill();
     return Math.floor(this.tokens);
@@ -384,45 +479,97 @@ class RateLimiter {
 // ─── Backpressure Manager (Fix #P2-8) ─────────────────────────────────────────
 
 /**
- * Fix #18: Per-session backpressure tracking.
+ * Per-session backpressure tracking (#18).
+ *
  * Each extension session has its own backpressure state — a slow session
- * doesn't pause other sessions.
+ * doesn't pause other sessions. When a session's send buffer is estimated to
+ * exceed BACKPRESSURE_THRESHOLD_MS, the manager sends {type: "backpressure", paused: true}
+ * to the extension WebSocket. When the send completes, it sends paused: false.
+ *
+ * @public
  */
 class BackpressureManager {
   constructor() {
-    /** @type {Map<string, {paused: boolean, ws: import('ws').WebSocket}>} */
+    /** @type {Map<string, {paused: boolean, ws: import('ws').WebSocket, pendingCount: number}>} */
     this._sessions = new Map();
   }
 
-  markWriting(sessionId, ws) {
-    // Only signal if this specific session isn't already paused
+  /**
+   * Increment the pending message count for a session.
+   * Fix #22: Track actual queue depth — backpressure kicks in when either the
+   * estimated send time exceeds BACKPRESSURE_THRESHOLD_MS OR there are more than
+   * 5 messages already buffered (depth-based backpressure).
+   * @param {string} sessionId
+   */
+  incrementPending(sessionId) {
     const entry = this._sessions.get(sessionId);
-    if (!entry || !entry.paused) {
-      this._sessions.set(sessionId, { paused: true, ws });
+    if (!entry) return;
+    entry.pendingCount++;
+  }
+
+  /**
+   * Decrement the pending message count when a message is confirmed sent.
+   * @param {string} sessionId
+   */
+  decrementPending(sessionId) {
+    const entry = this._sessions.get(sessionId);
+    if (!entry) return;
+    if (entry.pendingCount > 0) entry.pendingCount--;
+  }
+
+  /**
+   * Signal that a session is about to write a large payload (estimated slow).
+   * Only signals if the session isn't already paused.
+   * Fix #22: Also triggers when pending message depth exceeds MAX_PENDING_DEPTH.
+   * @param {string} sessionId
+   * @param {import('ws').WebSocket} ws
+   * @param {boolean} [forcePause] — force pause regardless of current state
+   */
+  markWriting(sessionId, ws, forcePause = false) {
+    const entry = this._sessions.get(sessionId);
+    if (!entry || (!entry.paused || forcePause)) {
+      this._sessions.set(sessionId, { ...(entry || {}), paused: true, ws, pendingCount: entry?.pendingCount || 0 });
       metricGauge('backpressureActive', 1);
       this._sendSignal(ws, true);
     }
   }
 
+  /**
+   * Signal that a session's write completed (buffer drained).
+   * Fix #22: Resume only when both conditions are met: estimated send time is
+   * back under threshold AND pending count is below resume threshold.
+   * @param {string} sessionId
+   * @param {import('ws').WebSocket} ws
+   */
   markDone(sessionId, ws) {
     const entry = this._sessions.get(sessionId);
     if (entry && entry.paused) {
-      entry.paused = false;
-      this._sendSignal(ws, false);
-      // Check if any session is still paused
-      const anyPaused = Array.from(this._sessions.values()).some(e => e.paused);
-      if (!anyPaused) {
-        metricGauge('backpressureActive', 0);
+      // Only resume when pending count has dropped well below the threshold
+      if (entry.pendingCount <= 2) {
+        entry.paused = false;
+        this._sendSignal(ws, false);
+        const anyPaused = Array.from(this._sessions.values()).some(e => e.paused);
+        if (!anyPaused) {
+          metricGauge('backpressureActive', 0);
+        }
       }
+      // If pending count is still high, keep backpressure active — don't clear it
     }
   }
 
+  /**
+   * @param {string} sessionId
+   * @returns {boolean}
+   */
   isPaused(sessionId) {
     const entry = this._sessions.get(sessionId);
     return entry ? entry.paused : false;
   }
 
-  /** Remove a session from backpressure tracking on disconnect */
+  /**
+   * Remove a session from backpressure tracking on disconnect.
+   * @param {string} sessionId
+   */
   removeSession(sessionId) {
     const entry = this._sessions.get(sessionId);
     if (entry && entry.paused) {
@@ -435,6 +582,7 @@ class BackpressureManager {
     }
   }
 
+  /** @private */
   _sendSignal(ws, paused) {
     if (ws && ws.readyState === 1) {
       ws.send(JSON.stringify({
@@ -449,11 +597,14 @@ class BackpressureManager {
 // ─── Hermes Push Client Manager (Fix #P0-1) ────────────────────────────────────
 
 /**
- * Hermes clients connect to ws://localhost:9321/hermes.
- * Each client sends a {type: "subscribe", sessionId: "..."} message.
- * The proxy then pushes only that session's updates to that client.
+ * Hermes Push Manager — manages Hermes WS client connections and per-session subscriptions.
  *
- * Hermes can also send commands over this socket (P0-1).
+ * Hermes clients connect to ws://localhost:9321/hermes and send a subscribe message
+ * with a sessionId. The proxy then pushes only that session's updates to that client.
+ * Hermes can also send commands over this socket which are forwarded to the
+ * appropriate extension session.
+ *
+ * @public
  */
 class HermesPushManager {
   constructor() {
@@ -467,10 +618,20 @@ class HermesPushManager {
     this._onSessionBridge = null;
   }
 
-  setOnSessionBridge(cb) { this._onSessionBridge = cb; }  // H3
+  /**
+   * Set the callback invoked when Hermes sends a session_bridge message.
+   * @param {(newSessionId: string, oldSessionId: string) => void} cb
+   */
+  setOnSessionBridge(cb) { this._onSessionBridge = cb; }
 
+  /**
+   * Subscribe a Hermes WS client to a session. The client will receive page updates
+   * for that session only. Re-subscribing to a different session atomically switches.
+   * @param {import('ws').WebSocket} ws
+   * @param {string} sessionId
+   * @param {string} reqId
+   */
   subscribe(ws, sessionId, reqId) {
-    // Unsubscribe from previous session if any
     const existing = this._clients.get(ws);
     if (existing) {
       const prevSet = this._sessionSubscriptions.get(existing.sessionId);
@@ -486,6 +647,10 @@ class HermesPushManager {
     log('info', 'Hermes WS subscribed to session', { reqId, sessionId });
   }
 
+  /**
+   * Unsubscribe a Hermes WS client from its current session.
+   * @param {import('ws').WebSocket} ws
+   */
   unsubscribe(ws) {
     const entry = this._clients.get(ws);
     if (entry) {
@@ -497,8 +662,24 @@ class HermesPushManager {
   }
 
   /**
+   * Fix #11: Remove all _cmdIdToWs entries associated with a disconnected Hermes WS.
+   * This prevents unbounded memory growth when long-running Hermes sessions disconnect
+   * without receiving cmd_error for all their pending commands.
+   * @param {import('ws').WebSocket} ws
+   */
+  _cleanupWsEntries(ws) {
+    for (const [cmdId, storedWs] of this._cmdIdToWs.entries()) {
+      if (storedWs === ws) {
+        this._cmdIdToWs.delete(cmdId);
+      }
+    }
+  }
+
+  /**
    * H3: Forward a session_bridge message to the extension WebSocket.
    * Called when Hermes sends { type: 'session_bridge', sessionId, previousSessionId }.
+   * @param {string} newSessionId
+   * @param {string} oldSessionId
    */
   broadcastSessionBridge(newSessionId, oldSessionId) {
     if (this._onSessionBridge) {
@@ -509,6 +690,8 @@ class HermesPushManager {
   /**
    * Push a page state update to all Hermes clients subscribed to this session.
    * Called by the proxy whenever pageMirror updates.
+   * @param {string} sessionId
+   * @param {object} payload
    */
   pushToSession(sessionId, payload) {
     const subscribers = this._sessionSubscriptions.get(sessionId);
@@ -523,16 +706,38 @@ class HermesPushManager {
 
   /**
    * Forward a command from Hermes to the correct extension session.
+   * @param {string} sessionId
+   * @param {object} command
    */
   forwardCommand(sessionId, command) {
     return sendToExtension(sessionId, command);
   }
 
+  /** @returns {number} Number of connected Hermes WS clients */
   get size() { return this._clients.size; }
 }
 
 // ─── Shared Proxy Factory ─────────────────────────────────────────────────────
 
+/**
+ * createProxy — factory that builds a fully-configured Hermes Browser Bridge proxy.
+ *
+ * Returns the HTTP server, WebSocket servers, pageMirror, command queue, and a
+ * shutdown function. The proxy handles:
+ * - Extension WebSocket connections (page snapshots, mutations, command acks)
+ * - Hermes WS push client connections (subscribes to session updates)
+ * - HTTP REST API (health, metrics, commands, session management)
+ *
+ * @param {{ httpServer: import('http').Server, tlsOptions?: object, version?: string }} options
+ * @returns {{
+ *   httpServer: import('http').Server,
+ *   wss: import('ws').WebSocketServer,
+ *   pageMirror: import('./page_mirror').PageMirror,
+ *   cmdQueue: import('./cmd_queue').CommandQueue,
+ *   shutdown: () => void,
+ *   hermesPush: HermesPushManager
+ * }}
+ */
 function createProxy({ httpServer, tlsOptions, version }) {
   const PROXY_VERSION = version || '1.0.0';
   const pageMirror = new PageMirror({ maxHtmlBytes: MAX_HTML_BYTES, sessionTtlMs: cfg.SESSION_TTL_MS });
@@ -557,7 +762,7 @@ function createProxy({ httpServer, tlsOptions, version }) {
   function getSessionMeta(sessionId) {
     if (!sessionMeta.has(sessionId)) {
       sessionMeta.set(sessionId, {
-        limiter: new RateLimiter(RATE_LIMIT_RPS, 1000, RATE_LIMIT_BURST),  // L3: from config
+        limiter: new RateLimiter(RATE_LIMIT_RPS, 1000, PER_SESSION_RATE_LIMIT),  // Fix #15: use per-session burst from config
         lastSeen: Date.now()
       });
     }
@@ -636,19 +841,30 @@ function createProxy({ httpServer, tlsOptions, version }) {
   /**
    * Send a message to a specific session's extension WebSocket.
    * Fix #P2-8: If the message is large (e.g. full HTML snapshot), signal backpressure.
+   * Fix #22: Also check depth-based backpressure — pause if session already has
+   * more than 5 messages buffered (indicated by pendingCount).
    */
   function sendToExtension(sessionId, msg, options = {}) {
     const ws = sessionSockets.get(sessionId);
     if (!ws || ws.readyState !== 1) return false;
     const data = JSON.stringify(msg);
     const estimatedMs = data.length / 10000; // ~10KB/ms throughput guess
-    if (estimatedMs > BACKPRESSURE_THRESHOLD_MS) {
-      backpressure.markWriting(sessionId, ws);
+
+    // Depth-based backpressure: if the session already has messages queued, pause
+    const entry = backpressure._sessions.get(sessionId);
+    const pendingCount = entry?.pendingCount || 0;
+    if (pendingCount > 5 || estimatedMs > BACKPRESSURE_THRESHOLD_MS) {
+      backpressure.markWriting(sessionId, ws, /* forcePause */ pendingCount > 5);
     }
+
+    // Fix #22: Increment pending count before sending
+    backpressure.incrementPending(sessionId);
+
     try {
       _resetSendTimeout();  // H2: start send timeout
       ws.send(data, () => {
         _clearSendTimeout();  // H2: send completed
+        backpressure.decrementPending(sessionId);  // Fix #22
         backpressure.markDone(sessionId, ws);
       });
     } catch (e) {
@@ -784,6 +1000,7 @@ const wss = new WebSocketServer(wssOptionsWithPing);
 
     _clearSendTimeout();  // H2: clear send timeout on close
     ws.on('close', () => {
+      hermesPush._cleanupWsEntries(ws);  // Fix #11: prevent _cmdIdToWs leaks on disconnect
       hermesPush.unsubscribe(ws);
       log('info', 'Hermes WS client disconnected', { reqId });
     });
@@ -983,13 +1200,13 @@ const wss = new WebSocketServer(wssOptionsWithPing);
           }
 
           // H1: Route cmd_error to the specific Hermes WS client that issued this command
+          // Fix #11: Sanitize error — send generic message, never expose internal error codes externally
           const targetWs = hermesPush._cmdIdToWs.get(msg.cmdId);
           if (targetWs && targetWs.readyState === 1) {
             targetWs.send(JSON.stringify({
               type: 'cmd_error',
               cmdId: msg.cmdId,
-              error: rawError,
-              code: errCode,        // S8: structured error code
+              error: 'Command failed. Please retry or contact support if the problem persists.',
               sessionId: sessionId,
               ts: Date.now()
             }));
@@ -1033,10 +1250,26 @@ const wss = new WebSocketServer(wssOptionsWithPing);
 
   // Prune old commands + idempotency cache + stale sessions
   // Fix #5: Session eviction now runs on a background interval, not just on getState()
+  // Fix #10: Evict sessions that have been inactive for SESSION_TIMEOUT_MS
   const pruneInterval = setInterval(() => {
     cmdQueue.prune(60000);
     idempotencyCache.prune();
     metricGauge('pendingCommands', cmdQueue.size);
+    // Fix #10: Evict sessions that have been inactive past SESSION_TIMEOUT_MS
+    const now = Date.now();
+    for (const [sid, meta] of sessionMeta) {
+      if (SESSION_TIMEOUT_MS > 0 && (now - meta.lastSeen) > SESSION_TIMEOUT_MS) {
+        log('info', 'Evicting session due to inactivity timeout', { sessionId: sid, inactiveMs: now - meta.lastSeen });
+        const ws = sessionSockets.get(sid);
+        if (ws) {
+          try { ws.close(1001, 'Session timed out'); } catch (_) {}
+          sessionSockets.delete(sid);
+          pageMirror.disconnectSession(sid);
+        }
+        sessionMeta.delete(sid);
+        metricGauge('connectedSessions', sessionSockets.size);
+      }
+    }
     // Evict sessions that have been disconnected past SESSION_TTL_MS
     const before = pageMirror.connected;
     pageMirror.evictStaleSessions();
@@ -1073,9 +1306,13 @@ const wss = new WebSocketServer(wssOptionsWithPing);
       return;
     }
 
-    // C3: Auth check for protected endpoints (non-GET, non-OPTIONS)
-    const protectedPaths = ['/command', '/sessions'];
-    const needsAuth = req.method !== 'GET' && protectedPaths.some(p => path.startsWith(p));
+    // C3: Auth check for protected endpoints
+    // Fix #6: GET /sessions and GET /sessions/:id expose all active tab URLs — require auth.
+    // POST /command and POST /sessions also require auth (already non-GET).
+    const protectedWritePaths = ['/command', '/sessions'];
+    const needsWriteAuth = req.method !== 'GET' && protectedWritePaths.some(p => path.startsWith(p));
+    const needsReadAuth = req.method === 'GET' && (path === '/sessions' || path.startsWith('/sessions/'));
+    const needsAuth = needsWriteAuth || needsReadAuth;
     if (needsAuth) {
       const auth = validateHttpAuth(req);
       if (!auth.authorized) {
@@ -1105,15 +1342,31 @@ const wss = new WebSocketServer(wssOptionsWithPing);
       // Send initial metrics immediately
       metricGauge('uptimeSeconds', Math.floor(process.uptime()));
       metricGauge('pendingCommands', cmdQueue.size);
-      res.write(`data: ${JSON.stringify(_buildMetrics())}\n\n`);
+      // Fix #8: _buildMetrics was undefined — inline the metrics object directly.
+      // Uses the same shape as the Prometheus formatter but as a JSON object for SSE.
+      function _buildMetricsJson() {
+        metricGauge('uptimeSeconds', Math.floor(process.uptime()));
+        metricGauge('pendingCommands', cmdQueue.size);
+        return {
+          uptimeSeconds: metrics.gauges.uptimeSeconds || 0,
+          connectedSessions: metrics.gauges.connectedSessions || 0,
+          pendingCommands: metrics.gauges.pendingCommands || 0,
+          hermesClients: metrics.gauges.hermesClients || 0,
+          backpressureActive: metrics.gauges.backpressureActive === 1,
+          wsConnections: metrics.counters.wsConnections || 0,
+          wsMessages: metrics.counters.wsMessages || { rx: 0, tx: 0 },
+          commands: metrics.counters.commands || {},
+          idempotencyRejections: metrics.counters.idempotencyRejections || 0,
+        };
+      }
+
+      res.write(`data: ${JSON.stringify(_buildMetricsJson())}\n\n`);
 
       // S1: Push updates every second
       const metricsInterval = setInterval(() => {
         if (res.writableEnded) { clearInterval(metricsInterval); return; }
         try {
-          metricGauge('uptimeSeconds', Math.floor(process.uptime()));
-          metricGauge('pendingCommands', cmdQueue.size);
-          res.write(`data: ${JSON.stringify(_buildMetrics())}\n\n`);
+          res.write(`data: ${JSON.stringify(_buildMetricsJson())}\n\n`);
         } catch (e) { clearInterval(metricsInterval); }
       }, 1000);
 
@@ -1405,6 +1658,7 @@ const wss = new WebSocketServer(wssOptionsWithPing);
     log('info', 'Shutdown signal received');
     clearInterval(heartbeat);
     clearInterval(pruneInterval);
+    pageMirror.stopEvictionTimer();  // Fix #21: stop eviction interval on shutdown
 
     // Fix #11: Close all extension WebSocket connections gracefully with code 1001 (going away)
     // This gives extensions a chance to handle the close event rather than treating it as a crash.
@@ -1429,4 +1683,9 @@ const wss = new WebSocketServer(wssOptionsWithPing);
   return { httpServer, wss, pageMirror, cmdQueue, shutdown, hermesPush };
 }
 
-module.exports = { createProxy, RateLimiter };
+module.exports = {
+  /** @type {typeof createProxy} */
+  createProxy,
+  /** @type {typeof RateLimiter} */
+  RateLimiter,
+};

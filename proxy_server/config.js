@@ -30,9 +30,11 @@ const METRICS_FLUSH_INTERVAL_MS = parseInt(process.env.HBS_METRICS_FLUSH_MS || '
 const CMD_TIMEOUT_MS = parseInt(process.env.HBS_CMD_TIMEOUT_MS || '30000', 10);
 const IDEMPOTENCY_WINDOW_MS = parseInt(process.env.HBS_IDEMPOTENCY_WINDOW_MS || '30000', 10);
 
-// ─── Session ──────────────────────────────────────────────────────────────────
+// ─── Session (Fix #5) ────────────────────────────────────────────────────────────
 
 const SESSION_TTL_MS = parseInt(process.env.HBS_SESSION_TTL_MS || '300000', 10);
+const SESSION_TIMEOUT_MS = parseInt(process.env.HBS_SESSION_TIMEOUT_MS || '600000', 10);
+const PER_SESSION_RATE_LIMIT = parseInt(process.env.HBS_PER_SESSION_RATE_LIMIT || '100', 10);
 
 // ─── HTML Snapshot Limits ─────────────────────────────────────────────────────
 
@@ -52,6 +54,8 @@ module.exports = {
   CMD_TIMEOUT_MS,
   IDEMPOTENCY_WINDOW_MS,
   SESSION_TTL_MS,
+  SESSION_TIMEOUT_MS,
+  PER_SESSION_RATE_LIMIT,
   MAX_BODY_BYTES,
   MAX_HTML_BYTES,
   LOG_LEVEL,

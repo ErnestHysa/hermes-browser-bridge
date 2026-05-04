@@ -115,8 +115,7 @@ Injected into every page at `document_idle`. Responsibilities:
 ### 2.3 Proxy Server (`proxy_server/`)
 
 **Files**
-- `server.js` — main entry: HTTP + WebSocket server on port 9321
-- `server_https.js` — TLS variant on port 9322 (uses certificates from `../certificates/`)
+- `server.js` — main entry: HTTP server on port 9321 (default); HTTPS on port 9322 with `--https` flag (uses certificates from `../certificates/`)
 - `proxy_lib.js` — shared logic (all HTTP handlers, WebSocket handling, state)
 - `page_mirror.js` — DOM cache + mutation ring buffer
 - `cmd_queue.js` — command queue with ack/error tracking and cancel support
