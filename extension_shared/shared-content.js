@@ -248,9 +248,17 @@ const CMD_HANDLERS = {
   },
 
   scroll(cmd) {
-    window.scrollTo(cmd.x || 0, cmd.y || 0);
-    window._hermesPendingCommands.delete(cmd.cmdId);
-    window._hermesSendToBackground({ type: 'cmd_ack', cmdId: cmd.cmdId, success: true, result: `Scrolled to (${cmd.x}, ${cmd.y})` });
+    const { clear: clearTimeout } = withCmdTimeout(cmd.cmdId, null);
+    try {
+      window.scrollTo(cmd.x || 0, cmd.y || 0);
+      clearTimeout();
+      window._hermesPendingCommands.delete(cmd.cmdId);
+      window._hermesSendToBackground({ type: 'cmd_ack', cmdId: cmd.cmdId, success: true, result: `Scrolled to (${cmd.x}, ${cmd.y})` });
+    } catch (e) {
+      clearTimeout();
+      window._hermesPendingCommands.delete(cmd.cmdId);
+      window._hermesSendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'SCROLL_ERROR', error: e.message });
+    }
   },
 
   type(cmd) {
@@ -304,6 +312,21 @@ const CMD_HANDLERS = {
   },
 
   evaluate(cmd) {
+    // R54: Pre-hoc script length check — prevent memory exhaustion before evaluation.
+    // A script large enough to cause heap problems when materialized is unreasonable
+    // regardless of what it returns. 50KB is a generous limit for any legitimate use.
+    const MAX_SCRIPT_CHARS = 50 * 1024;
+    if (cmd.script && cmd.script.length > MAX_SCRIPT_CHARS) {
+      window._hermesPendingCommands.delete(cmd.cmdId);
+      window._hermesSendToBackground({
+        type: 'cmd_error',
+        cmdId: cmd.cmdId,
+        errorCode: 'SCRIPT_TOO_LARGE',
+        error: `Script exceeds ${MAX_SCRIPT_CHARS} character limit (${cmd.script.length} chars)`
+      });
+      return;
+    }
+
     // F2: Wrap execution in a timeout to prevent infinite loops or heavy computation
     // from hanging the page's main thread. If the evaluated script runs longer than
     // 10 seconds, treat it as a failure so Hermes's cmd_queue can resolve promptly.
@@ -325,20 +348,28 @@ const CMD_HANDLERS = {
       clearTimeout(timeoutId);
       if (timedOut) return;  // timeout fired between Function() and clearTimeout
       window._hermesPendingCommands.delete(cmd.cmdId);
-      // F2: Enforce 1MB result size limit to prevent memory exhaustion.
-      // If the evaluated expression returns something very large (e.g. Array(1e8)),
-      // serialize and check the byte length before sending.
-      const serialized = JSON.stringify(result);
-      if (serialized.length > 1024 * 1024) {
-        window._hermesSendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'RESULT_TOO_LARGE', error: `Result exceeds 1MB limit (${serialized.length} bytes)` });
-        return;
-      }
+      // R54: Check result size incrementally during serialization so we never
+      // materialize a full 100MB JSON string in memory. Abort early if limit exceeded.
+      const RESULT_SIZE_LIMIT = 1024 * 1024;
+      let resultSizeBytes = 0;
+      const serialized = JSON.stringify(result, (k, v) => {
+        if (typeof v === 'string') {
+          resultSizeBytes += Buffer.byteLength(v, 'utf8');
+        } else if (typeof v === 'number' || typeof v === 'boolean' || v === null) {
+          resultSizeBytes += 30; // rough estimate
+        }
+        if (resultSizeBytes > RESULT_SIZE_LIMIT) {
+          throw new Error('RESULT_TOO_LARGE');
+        }
+        return v;
+      });
       window._hermesSendToBackground({ type: 'cmd_ack', cmdId: cmd.cmdId, success: true, result });
     } catch (e) {
       clearTimeout(timeoutId);
       if (timedOut) return;
       window._hermesPendingCommands.delete(cmd.cmdId);
-      window._hermesSendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'EVAL_ERROR', error: e.message });
+      const errorCode = (e.message === 'RESULT_TOO_LARGE') ? 'RESULT_TOO_LARGE' : 'EVAL_ERROR';
+      window._hermesSendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode, error: e.message });
     }
   },
 };

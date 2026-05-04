@@ -28,7 +28,8 @@ const METRICS_FLUSH_INTERVAL_MS = parseInt(process.env.HBS_METRICS_FLUSH_MS || '
 // F20: CORS / Origin validation — comma-separated list of allowed origins.
 // Defaults to localhost variants. Set to '*' to allow any origin (not recommended).
 // Safari file:// pages send origin 'null' — it's always allowed.
-const ALLOWED_ORIGINS = (process.env.HBS_ALLOWED_ORIGINS || 'null,http://localhost,http://localhost:9321,http://127.0.0.1,http://127.0.0.1:9321').split(',').map(o => o.trim());
+// R54: HTTPS origins added for deployments running the proxy with TLS enabled.
+const ALLOWED_ORIGINS = (process.env.HBS_ALLOWED_ORIGINS || 'null,http://localhost,http://localhost:9321,http://127.0.0.1,http://127.0.0.1:9321,https://localhost,https://localhost:9321,https://127.0.0.1,https://127.0.0.1:9321').split(',').map(o => o.trim());
 
 // ─── Command Queue ─────────────────────────────────────────────────────────────
 

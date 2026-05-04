@@ -131,9 +131,10 @@ function validateHttpAuth(req) {
  */
 function log(level, msg, extras = {}) {
   if (LOG_LEVELS[level] === undefined || LOG_LEVELS[level] < CURRENT_LOG_LEVEL) return;
+  // R54: Unified field names — { ts, lvl } — matching server.js and extension hbsLog().
   const entry = {
-    t: new Date().toISOString(),
-    level,
+    ts: new Date().toISOString(),
+    lvl: level,
     msg,
     pid: process.pid,
     ...extras
@@ -1117,7 +1118,7 @@ const wss = new WebSocketServer(wssOptionsWithPing);
     // F20: Origin validation — uses configurable ALLOWED_ORIGINS list from config.js.
     // Safari file:// pages send origin 'null' — always allowed.
     const origin = req.headers['origin'];
-    const validOrigins = config.ALLOWED_ORIGINS;
+    const validOrigins = cfg.ALLOWED_ORIGINS;
     if (origin && !validOrigins.includes(origin)) {
       log('warn', 'WS connection rejected — unauthorized origin', { reqId, origin, remoteIp });
       ws.close(1008, 'Unauthorized origin');
@@ -1146,20 +1147,25 @@ const wss = new WebSocketServer(wssOptionsWithPing);
     ws.on('message', (raw) => {
       metrics.counters.wsMessages.rx++;
 
-      // M4: Per-session WS message rate limiting — reject if session exceeds limit
-      {
-        const meta = getSessionMeta(sessionId);
-        if (!meta.limiter.tryConsume()) {
-          log('warn', 'Extension WS rate limit exceeded — dropping message', { reqId, sessionId, type: msg.type });
-          ws.send(JSON.stringify({ type: 'rate_limited', message: 'Too many messages — slow down', retryAfterMs: 100 }));
-          return;
-        }
-      }
+      // Parse message first so we have msg.sessionId for rate limiting and auth checks.
+      // Must happen before any branching that uses msg fields.
       let msg;
       try { msg = JSON.parse(raw); }
       catch (e) {
         log('warn', 'WS invalid JSON', { reqId, raw: String(raw).slice(0, 100) });
         return;
+      }
+
+      // M4: Per-session WS message rate limiting — reject if session exceeds limit.
+      // Use 'default' if sessionId is absent (same fallback used throughout the handler).
+      {
+        const sid = msg.sessionId || 'default';
+        const meta = getSessionMeta(sid);
+        if (!meta.limiter.tryConsume()) {
+          log('warn', 'Extension WS rate limit exceeded — dropping message', { reqId, sessionId: sid, type: msg.type });
+          ws.send(JSON.stringify({ type: 'rate_limited', message: 'Too many messages — slow down', retryAfterMs: 100 }));
+          return;
+        }
       }
 
       // C2: Require 'hello' message with valid token before accepting any other messages
@@ -1374,9 +1380,10 @@ const wss = new WebSocketServer(wssOptionsWithPing);
     }
     // Fix #9: Evict command history for sessions that are fully gone
     // (not in sessionSockets AND no Hermes client is subscribed to them)
+    // R54: Use _sessionSubscriptions inverse index — O(1) instead of O(n²).
     for (const [sid] of _commandHistory) {
       const hasExt = sessionSockets.has(sid);
-      const hasHermes = [...hermesPush._clients.values()].some(sids => sids.has(sid));
+      const hasHermes = hermesPush._sessionSubscriptions.has(sid) && hermesPush._sessionSubscriptions.get(sid).size > 0;
       if (!hasExt && !hasHermes) {
         _commandHistory.delete(sid);
       }
@@ -1398,7 +1405,9 @@ const wss = new WebSocketServer(wssOptionsWithPing);
   // ── HTTP REST API ──────────────────────────────────────────────────────────
 
   httpServer.on('request', async (req, res) => {
-    req.setTimeout(30000, () => {
+    // R54: Configurable per-request timeout via env var (default 30s).
+    const REQ_TIMEOUT_MS = parseInt(process.env.HBS_REQ_TIMEOUT_MS || '30000', 10);
+    req.setTimeout(REQ_TIMEOUT_MS, () => {
       if (!res.headersSent) {
         res.writeHead(408, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Request timeout' }));
@@ -1445,9 +1454,12 @@ const wss = new WebSocketServer(wssOptionsWithPing);
 
       res.writeHead(200, {
         'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
+        // R54: SSE buffering headers — prevent intermediaries from buffering this stream.
+        'Cache-Control': 'no-cache, no-store, must-revalidate',
         'Connection': 'keep-alive',
-        'X-Accel-Buffering': 'no'
+        'Keep-Alive': 'timeout=65, max=1000',
+        'X-Accel-Buffering': 'no',
+        'X-Request-Id': reqId  // R54: correlation ID for log tracing
       });
 
       // Send initial metrics immediately
@@ -1673,6 +1685,15 @@ const wss = new WebSocketServer(wssOptionsWithPing);
     if (req.method === 'POST' && path === '/command') {
       const sessionId = url.searchParams.get('sessionId');
 
+      // R54: Reject oversized bodies immediately — before spending a rate limit token.
+      // parseBody() also enforces MAX_BODY_BYTES, but checking Content-Length here
+      // prevents a flood of giant bodies from exhausting the event loop on every request.
+      const contentLength = parseInt(req.headers['content-length'] || '0', 10);
+      if (contentLength > MAX_BODY_BYTES) {
+        jsonResponse(res, 413, { error: `Request body exceeds ${MAX_BODY_BYTES} bytes` });
+        return;
+      }
+
       const meta = getSessionMeta(sessionId);
       if (!meta.limiter.tryConsume()) {
         jsonResponse(res, 429, {
@@ -1761,7 +1782,6 @@ const wss = new WebSocketServer(wssOptionsWithPing);
       sendToExtension(sessionId, cmd);
       log('info', `CMD → extension`, { reqId, cmdId, sessionId, type, selector: selector || null });
       metricIncr('commands', { type, status: 'pending' });
-      metrics.counters.commands.total++;
 
       jsonResponse(res, 202, {
         cmdId,
@@ -1848,6 +1868,7 @@ const wss = new WebSocketServer(wssOptionsWithPing);
         };
       });
       const activeSessionIds = Array.from(sessionSockets.keys());
+      // R54: Refresh logic moved to dashboard.js (strict CSP, no unsafe-inline).
       const dashHtml = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1904,37 +1925,41 @@ ${sessions.map(s => `
     ${s.recentCommands.length > 0 ? `
     <div class="card-title2">Recent Commands</div>
     <ul class="cmd-list">
-      ${s.recentCommands.map(c => `<li class="${c.status}">[${c.status}] ${c.type} — ${c.result || c.error || ''}</li>`).join('')}
+      ${s.recentCommands.map(c => `<li class="${c.status}">[${c.status}] ${_e(c.type)} — ${c.result || c.error || ''}</li>`).join('')}
     </ul>` : ''}
   </div>`).join('')}
 </div>
 <p class="refresh">Auto-refreshes every 5s</p>
-<script>
-let startTime = Date.now();
-function refresh() {
-  fetch('/health')
-    .then(r => r.json())
-    .then(d => {
-      document.getElementById('stat-sessions').textContent = d.activeSessions;
-      document.getElementById('stat-pending').textContent = d.pendingCommands;
-      document.getElementById('stat-hermes').textContent = d.hermesClients;
-      document.getElementById('stat-bp').textContent = d.backpressureActive ? '⏸' : '✅';
-      const elapsed = Math.floor((Date.now() - startTime) / 1000);
-      document.getElementById('uptime').textContent = \`up \${elapsed}s\`;
-    });
-}
-refresh();
-setInterval(refresh, 5000);
-</script>
+<script src="/dashboard.js"></script>
 </body>
 </html>`;
-      // Fix #10: Add Content-Security-Policy header to prevent XSS in dashboard
+      // R54: Strict CSP — no unsafe-inline. dashboard.js handles all dynamic refresh.
+      // nonce-based exemption would require per-request nonce generation (not worthwhile for localhost).
       res.writeHead(200, {
         'Content-Type': 'text/html; charset=utf-8',
         'X-Content-Type-Options': 'nosniff',
-        'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'"
+        'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; script-src 'self'"
       });
       res.end(dashHtml);
+      return;
+    }
+
+    // ── Serve dashboard.js (required by dashboard CSP) ───────────────────────
+    if (req.method === 'GET' && path === '/dashboard.js') {
+      const fs = require('node:fs');
+      const path2 = require('node:path');
+      const jsFile = path2.join(__dirname, 'dashboard.js');
+      try {
+        const jsContent = fs.readFileSync(jsFile, 'utf8');
+        res.writeHead(200, {
+          'Content-Type': 'application/javascript',
+          'Content-Security-Policy': "default-src 'none'"
+        });
+        res.end(jsContent);
+      } catch (_) {
+        res.writeHead(404);
+        res.end('Not found');
+      }
       return;
     }
 
@@ -1977,14 +2002,12 @@ setInterval(refresh, 5000);
   return { httpServer, wss, pageMirror, cmdQueue, shutdown, hermesPush };
 }
 
-// F25: Export hermesPush internals for testing — allows test scripts to inject fake
-// Hermes clients and verify session routing without a real Hermes agent connection.
-// Usage in tests: const { hermesPush } = require('./proxy_lib'); hermesPush._addSession(sid, fakeWs);
+// F25: Export createProxy and RateLimiter.
+// hermesPush is only accessible via the object returned from createProxy().
+// Usage in tests: const { hermesPush } = createProxy({ httpServer }); hermesPush._addSession(sid, fakeWs);
 module.exports = {
   /** @type {typeof createProxy} */
   createProxy,
   /** @type {typeof RateLimiter} */
   RateLimiter,
-  /** @type {hermesPush} Internal push client for Hermes agent subscriptions (F25) */
-  hermesPush,
 };

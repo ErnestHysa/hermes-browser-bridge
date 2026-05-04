@@ -43,6 +43,16 @@ try {
   versionText.textContent = `v${manifest.version || 'dev'}`;
 } catch { /* fallback */ }
 
+// R54: Dark mode support — mirrors Chrome popup's applyTheme() from F23.
+function applyTheme() {
+  if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+    document.body.classList.add('dark');
+  } else {
+    document.body.classList.remove('dark');
+  }
+}
+applyTheme();
+
 let state = 'inactive';
 let cmdLog = []; // Fix #22: loaded from localStorage in loadCmdLog()
 let pendingCmdId = null; // P3-17: track last pending cmd for cancel

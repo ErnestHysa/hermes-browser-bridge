@@ -398,6 +398,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.event === 'setProxyPort' && typeof message.port === 'number') {
     _proxyPort = message.port;
     hbsLog('info', 'Proxy port overridden from popup', { port: message.port });
+    // Note: popup already persists via chrome.storage.local.set — no need to write again here
     return true;
   }
 
@@ -425,8 +426,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (currentTabId !== null) {
       navigating = true; // F19: set BEFORE issuing tabs.update
       chrome.tabs.update(currentTabId, { url: message.url }, () => {
+        // R54: Clear navigating flag on BOTH success and error — the flag must not
+        // survive beyond the tabs.update call. Previously only cleared on error,
+        // which left it set if the tab navigated successfully (tabs.onUpdated may
+        // fire with tab.active=false if the user switched tabs during navigation).
+        navigating = false;
         if (chrome.runtime.lastError) {
-          navigating = false; // F19: clear immediately on error
           // F1: Forward navigate failure to proxy so Hermes's cmd_queue resolves immediately.
           // Without this, the content script waits 10s for a load event that will never fire
           // while Hermes waits 30s for a cmd_ack that never arrives.
