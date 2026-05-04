@@ -216,6 +216,17 @@ function stopHealthPoll() {
 
 // Fix #15: Track pending command types so cmd_ack can report the real type to popup
 const pendingCmdTypes = new Map();  // cmdId → original command type
+const MAX_PENDING_CMD_TYPES = 200;  // Fix #H1: cap to prevent unbounded growth
+
+// Fix #H1: Evict oldest entries when the cap is reached
+function _setPendingCmdType(cmdId, cmdType) {
+  if (pendingCmdTypes.size >= MAX_PENDING_CMD_TYPES) {
+    // Delete the oldest entry (first key in insertion order)
+    const firstKey = pendingCmdTypes.keys().next().value;
+    pendingCmdTypes.delete(firstKey);
+  }
+  pendingCmdTypes.set(cmdId, cmdType);
+}
 
 function forwardCommandToTab(tabId, cmd) {
   if (!tabId) {
@@ -225,7 +236,7 @@ function forwardCommandToTab(tabId, cmd) {
   }
 
   // Fix #15: Remember the original command type for the ack/error handler
-  pendingCmdTypes.set(cmd.cmdId, cmd.type);
+  _setPendingCmdType(cmd.cmdId, cmd.type);  // Fix #H1: capped Map with LRU eviction
   notifyPopup({ event: 'cmd_sent', cmdType: cmd.type, selector: cmd.selector, url: cmd.url, cmdId: cmd.cmdId });
 
   // Fix #14: Attach a short reqId to every command forwarded to content script
@@ -409,6 +420,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
       });
     }
+    return true;
+  }
+
+  // Fix #L12: Route cancel through background WS so it respects runtime _proxyPort
+  if (message.event === 'cancelCmd' && message.cmdId) {
+    sendToProxy({ type: 'cmd_cancel', cmdId: message.cmdId });
     return true;
   }
 

@@ -212,6 +212,17 @@ function stopHealthPoll() {
 
 // Fix #15: Track pending command types so cmd_ack can report the real type to popup
 const pendingCmdTypes = new Map();  // cmdId → original command type
+const MAX_PENDING_CMD_TYPES = 200;  // Fix #H1: cap to prevent unbounded growth
+
+// Fix #H1: Evict oldest entries when the cap is reached
+function _setPendingCmdType(cmdId, cmdType) {
+  if (pendingCmdTypes.size >= MAX_PENDING_CMD_TYPES) {
+    // Delete the oldest entry (first key in insertion order)
+    const firstKey = pendingCmdTypes.keys().next().value;
+    pendingCmdTypes.delete(firstKey);
+  }
+  pendingCmdTypes.set(cmdId, cmdType);
+}
 
 function forwardCommandToTab(tabId, cmd) {
   if (!tabId) {
@@ -221,7 +232,7 @@ function forwardCommandToTab(tabId, cmd) {
   }
 
   // Fix #15: Remember the original command type for the ack/error handler
-  pendingCmdTypes.set(cmd.cmdId, cmd.type);
+  _setPendingCmdType(cmd.cmdId, cmd.type);  // Fix #H1: capped Map with LRU eviction
   notifyPopup({ event: 'cmd_sent', cmdType: cmd.type, selector: cmd.selector, url: cmd.url, cmdId: cmd.cmdId });
 
   const MAX_RETRIES = 3;
@@ -237,6 +248,8 @@ function forwardCommandToTab(tabId, cmd) {
       if (attemptNum < MAX_RETRIES) {
         setTimeout(() => attempt(attemptNum + 1), RETRY_DELAY_MS * (attemptNum + 1));
       } else {
+        // Fix #C1: Delete pendingCmdTypes entry so it doesn't leak after exhausted retries
+        pendingCmdTypes.delete(cmd.cmdId);
         hbsLog('error', `Command ${cmd.type} (${cmd.cmdId}) could not be delivered`, { err: err?.message });
         const errorMsg = `Tab not ready: ${err.message || 'delivery failed'}`;
         // Also notify the extension's background via browser.runtime so Hermes sees it
@@ -349,16 +362,20 @@ function updateBadge(color) {
 // ─── Popup notifications ─────────────────────────────────────────────────────
 
 function notifyPopup(data) {
-  // Fix #13: Log unexpected errors from notifyPopup instead of silently swallowing all.
-  // Fix #24: Use optional chaining to safely check error messages — string matching
-  // on browser.runtime.lastError is fragile (message text varies across Safari versions).
+  // Fix #C3: Use a robust error-category check instead of fragile string matching.
+  // Safari's error messages for "no receiver" vary across versions and locales
+  // (e.g. "Could not establish connection", "No target page to receive it", etc.).
+  // Instead of matching exact text, check the error object structurally:
+  // - err is null/undefined → log (unexpected)
+  // - err.message is empty/null → suppress (expected: empty rejection)
+  // - Any other message → log
   browser.runtime.sendMessage({ ...data, from: 'background' }).catch((err) => {
-    // "Could not establish connection" is the expected error when popup is closed.
-    // Only suppress this specific error; all others should be visible in the console.
-    const msg = err?.message || '';
-    if (!msg.includes('Could not establish connection')) {
-      console.warn('[Hermes Bridge] notifyPopup failed:', msg || err);
-    }
+    const msg = err?.message ?? '';
+    // Expected case: popup is closed / no receiver. Empty or null message means
+    // the rejection was fire-and-forget (no listener at all) — suppress it.
+    if (msg.length === 0) return;
+    // Unexpected case: real error with a message — log it for debugging.
+    console.warn('[Hermes Bridge] notifyPopup failed:', msg);
   });
 }
 
@@ -397,11 +414,13 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (currentTabId !== null) {
       browser.tabs.update(currentTabId, { url: message.url }).catch((err) => {
         hbsLog('error', 'browser.tabs.update failed', { err: err?.message });
+        // Fix #L3: Notify popup so user sees the navigation error (Chrome also notifies)
+        notifyPopup({ event: 'cmd_error', cmdType: 'navigate', error: `Navigation failed: ${err?.message}` });
         browser.tabs.sendMessage(currentTabId, {
           type: 'cmd_error',
           cmdId: message.cmdId,
           success: false,
-          error: `Navigation failed: ${err.message}`
+          error: `Navigation failed: ${err?.message || 'unknown error'}`
         }).catch(() => {});
       });
     }
@@ -436,6 +455,12 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
         notifyPopup({ event: 'cmd_error', cmdType: 'refresh', error: 'Tab not ready' });
       });
     }
+    return true;
+  }
+
+  // Fix #L13: Route cancel through background WS so it respects runtime _proxyPort
+  if (message.event === 'cancelCmd' && message.cmdId) {
+    sendToProxy({ type: 'cmd_cancel', cmdId: message.cmdId });
     return true;
   }
 

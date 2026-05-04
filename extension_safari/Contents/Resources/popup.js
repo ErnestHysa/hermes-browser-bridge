@@ -118,19 +118,16 @@ function onRefreshClick() {
   addCmdLog('pending', 'Refresh snapshot…');
 }
 
-// Fix #13: Cancel the currently pending command by calling DELETE /command/:cmdId
+// Fix #13: Cancel the currently pending command via background WS so runtime port is respected
 function onCancelClick() {
   if (!pendingCmdId) return;
   const cmdIdToCancel = pendingCmdId;
   pendingCmdId = null;
   cancelBtn.classList.add('hidden');
-  fetch(`http://localhost:${DEFAULT_PROXY_PORT}/command/${encodeURIComponent(cmdIdToCancel)}`, {
-    method: 'DELETE'
-  }).then(() => {
-    addCmdLog('error', `Cancelled: ${cmdIdToCancel}`);
-  }).catch(() => {
-    addCmdLog('error', 'Cancel failed');
-  });
+  // Fix #L13: Route through background to use its runtime _proxyPort
+  browser.runtime.sendMessage({ event: 'cancelCmd', cmdId: cmdIdToCancel })
+    .then(() => { addCmdLog('error', `Cancelled: ${cmdIdToCancel}`); })
+    .catch(() => { addCmdLog('error', 'Cancel failed'); });
 }
 
 // P1-6: Named handler so we can remove it on popup close

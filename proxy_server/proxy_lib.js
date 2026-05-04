@@ -1305,6 +1305,7 @@ const wss = new WebSocketServer(wssOptionsWithPing);
           pageMirror.disconnectSession(sid);
           sessionMeta.delete(sid);       // Fix #13: clean up sessionMeta on disconnect
           sessionMetaInfo.delete(sid);   // Fix #13: clean up sessionMetaInfo on disconnect
+          hermesPush._removeSession(sid);  // Fix #M2: notify Hermes clients of session eviction
           metricGauge('connectedSessions', sessionSockets.size);
           log('info', 'Extension WS session disconnected', { reqId, sessionId: sid });
           break;
