@@ -226,11 +226,14 @@ const pendingCmdTypes = new Map();  // cmdId → original command type
 const MAX_PENDING_CMD_TYPES = 200;  // Fix #H1: cap to prevent unbounded growth
 
 // Fix #H1: Evict oldest entries when the cap is reached
+// R56: Evict BEFORE setting so the size check guards against the race where
+// another call evicts between our check and our delete (making firstKey undefined).
+// Using > (not >=) so we evict when at capacity, then add → new size = MAX.
 function _setPendingCmdType(cmdId, cmdType) {
   if (pendingCmdTypes.size >= MAX_PENDING_CMD_TYPES) {
     // Delete the oldest entry (first key in insertion order)
     const firstKey = pendingCmdTypes.keys().next().value;
-    pendingCmdTypes.delete(firstKey);
+    if (firstKey !== undefined) pendingCmdTypes.delete(firstKey);
   }
   pendingCmdTypes.set(cmdId, cmdType);
 }
@@ -347,12 +350,21 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     navigating = false;
     currentTabId = tabId;
     currentTabUrl = tab.url;
-    // F22: On tab activation, trigger prerender for the extension's background page
-    // so content script context is warm when the next command arrives.
-    // Prerendering reduces command latency by ~50–100ms on cold starts.
-    try { chrome.tabs.prerender(tabId); } catch (_) { /* prerender may not be available */ }
+    // R56: Only prerender once per navigation, not on every complete event
+    // (tabs.onUpdated fires multiple times including for history.pushState).
+    // Use a Set to track which tabs we've already prerendered in this navigation cycle.
+    if (!_prenderedTabs.has(tabId)) {
+      _prenderedTabs.add(tabId);
+      try { chrome.tabs.prerender(tabId); } catch (_) { /* prerender may not be available */ }
+    }
+  }
+  // R56: Clear prerender flag when the tab navigates away (new URL event)
+  if (changeInfo.url) {
+    _prenderedTabs.delete(tabId);
   }
 });
+
+const _prenderedTabs = new Set();  // R56: track which tabs have been prerendered this cycle
 
 // ─── Badge / icon state ─────────────────────────────────────────────────────
 

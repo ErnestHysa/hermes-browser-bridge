@@ -55,8 +55,8 @@ function initHermesContent() {
   let lastSnapshotHash = '';
 
   // ─── Navigate Handler State (Safari-specific) ────────────────────────────────
-
-  let lastNavigateCmdId = null;
+  // R55: Store on HermesShared so shared clearNavigateHandlers() can clear it
+  window.HermesShared._lastNavigateCmdId = null;
 
   // ─── Snapshot Sending ──────────────────────────────────────────────────────────
 
@@ -205,13 +205,13 @@ function initHermesContent() {
     navigate(cmd) {
       // Clean up any previous navigate handlers before setting up new ones
       window.HermesShared.clearNavigateHandlers();
-      lastNavigateCmdId = cmd.cmdId;
+      window.HermesShared._lastNavigateCmdId = cmd.cmdId;
 
       // Fail-safe: if page doesn't fire load/pageshow within 10s, treat as blocked
       // Fix #3: Use HermesShared._navigateFailTimer so clearNavigateHandlers can cancel it
       window.HermesShared._navigateFailHandler = () => {
-        if (lastNavigateCmdId === cmd.cmdId) {
-          lastNavigateCmdId = null;
+        if (window.HermesShared._lastNavigateCmdId === cmd.cmdId) {
+          window.HermesShared._lastNavigateCmdId = null;
           window.HermesShared.clearNavigateHandlers();
           window._hermesPendingCommands.delete(cmd.cmdId);
           window._hermesSendToBackground({
@@ -239,7 +239,7 @@ function initHermesContent() {
 
       window.HermesShared._navPageShowHandler = () => {
         // pageshow fires on bfcache restore too — treat as navigation success
-        if (lastNavigateCmdId === cmd.cmdId) {
+        if (window.HermesShared._lastNavigateCmdId === cmd.cmdId) {
           window.HermesShared.clearNavigateHandlers();
           window._hermesPendingCommands.delete(cmd.cmdId);
           window._hermesSendToBackground({
@@ -272,9 +272,19 @@ function initHermesContent() {
     },
 
     refresh(cmd) {
-      // Fix #10: Send snapshot then ack — never before the async send completes.
-      // Only sends cmd_ack after tab_snapshot is confirmed delivered.
       const snap = window.HermesShared.getFullPageSnapshot();
+      // R56: Add snapshotHash check to Safari refresh — Chrome already checks the hash
+      // before sending periodic snapshots. Without this check, refresh always sends even if
+      // the page hasn't changed, wasting bandwidth and potentially triggering Hermes updates.
+      const hash = window.HermesShared.snapshotHash();
+      if (hash === window.HermesShared._lastRefreshHash) {
+        // R56: No change since last refresh — resolve immediately without sending.
+        // We still need to notify the popup via the background's cmd_ack handler,
+        // so set a pending entry that the background's cmd_ack will match.
+        window._hermesSendToBackground({ type: '_refreshUnchanged', cmdId: cmd.cmdId, seq: snap.seq });
+        return;
+      }
+      window.HermesShared._lastRefreshHash = hash;
       window._hermesSendToBackground({ type: 'tab_snapshot', ...snap, incremental: false })
         .then(() => {
           window._hermesPendingCommands.delete(cmd.cmdId);

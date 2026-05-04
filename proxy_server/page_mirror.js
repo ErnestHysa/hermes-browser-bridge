@@ -17,18 +17,26 @@ const MUTATION_BUFFER_MAX = 500;
 const DEFAULT_MAX_HTML_BYTES = 10 * 1024 * 1024; // 10MB
 
 // ─── Per-Session State Cache ─────────────────────────────────────────────────
-
 /**
- * #19: PageStateCache — handles per-session page state (html, title, url, lastUpdate, mutations).
+ * page_mirror.js — Per-session page state cache
  *
- * Each session stored independently so one session's state cannot evict another's.
- * Mutation buffers are also per-session ring buffers.
+ * ─── Architecture Notes ──────────────────────────────────────────────────────────
  *
- * @private
+ * ⚠️ Single-tab assumption (INFO-18): Each session is assumed to represent exactly one
+ *   browser tab. The proxy's pageMirror tracks state per sessionId only — there is no
+ *   tabId discriminator. If a user has two tabs of the same origin both running the
+ *   content script, both report snapshots with the same sessionId and the proxy has
+ *   no way to distinguish them. A future version should key state on {sessionId, tabId}.
+ *
+ * ⚠️ In-memory only (INFO-20): pageMirror and all session state are in-process memory.
+ *   If the proxy process crashes, all page state is lost. Additionally, when the extension's
+ *   pending message queue (MAX_PENDING_MESSAGES=50) fills during a proxy outage, older
+ *   messages are dropped with no durable retry. A future version could use a persistent
+ *   queue (e.g. browser.storage.local on the extension side, Redis on the proxy side).
  */
 class PageStateCache {
   /**
-   * @param {number} sessionTtlMs - How long to keep a disconnected session before evicting it
+   * @private
    */
   constructor(sessionTtlMs = 5 * 60 * 1000) {
     /** @type {number} */

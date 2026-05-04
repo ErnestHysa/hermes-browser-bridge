@@ -80,7 +80,7 @@ Injected into every page at `document_start`. Responsibilities:
 - Supported commands: `navigate`, `click`, `scroll`, `type`, `submit`, `evaluate`, `refresh`
 - Each command gets a unique `cmdId` (UUID); result is sent back via `cmd_ack` or `cmd_error`
 - `navigate` uses `_navigate` (background page calls `chrome.tabs.update` to navigate the tab itself)
-- `evaluate` uses `new Function(cmd.script)` — sandboxed to current page context
+- `evaluate` uses `new Function(cmd.script)` — **NOT sandboxed**. It has full access to all page globals (window, document, cookies, localStorage). The caller (Hermes Agent) must ensure `evaluate()` is only used on trusted pages. See Section 4 (Security Model).
 
 **Communication**
 - To background: `window.postMessage({ type, ...payload }, '*')`

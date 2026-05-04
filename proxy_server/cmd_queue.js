@@ -48,7 +48,10 @@ class CommandQueue extends EventEmitter {
       const timer = setTimeout(() => {
         this.pending.delete(cmdId);
         const error = `Command ${cmdId} timed out after ${this.timeoutMs}ms`;
+        // R56: Also track timed-out commands in _completedOrder so MAX_COMPLETED is respected
         this.completed.set(cmdId, { status: 'error', error, timestamp: Date.now() });
+        this._completedOrder.push(cmdId);
+        this._capCompleted(); // H1: enforce MAX_COMPLETED cap
         this.emit('timeout', cmdId, cmd);
         resolve({ success: false, error });
       }, this.timeoutMs);

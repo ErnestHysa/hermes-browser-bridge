@@ -71,7 +71,7 @@ async function restoreSessionId() {
       hbsLog('info', 'Restored proxy port from storage', { port: _proxyPort });
     }
   } catch (e) {
-    console.warn('[Hermes Bridge] Could not restore session ID from storage:', e.message);
+    hbsLog('warn', 'Could not restore session ID from storage', { err: e?.message });  // R55: use hbsLog
   }
 }
 
@@ -79,7 +79,7 @@ async function persistSessionId() {
   try {
     await browser.storage.local.set({ [SESSION_STORAGE_KEY]: SESSION_ID });
   } catch (e) {
-    console.warn('[Hermes Bridge] Could not persist session ID:', e.message);
+    hbsLog('warn', 'Could not persist session ID', { err: e?.message });  // R55: use hbsLog
   }
 }
 
@@ -104,7 +104,17 @@ function connect() {
     return;
   }
 
-  socket = new WebSocket(getProxyWsUrl());
+  // R56: Wrap WebSocket construction in try/catch — if the URL is malformed or the
+  // constructor throws (possible in some Safari versions), we must handle it gracefully.
+  let socketOrError = null;
+  try {
+    socketOrError = new WebSocket(getProxyWsUrl());
+  } catch (e) {
+    hbsLog('error', 'WebSocket constructor threw', { err: e?.message });
+    scheduleReconnect();
+    return;
+  }
+  socket = socketOrError;
 
   socket.addEventListener('open', () => {
     connected = true;
@@ -175,7 +185,7 @@ function sendToProxy(msg) {
   } else {
     if (pendingMessages.length >= MAX_PENDING_MESSAGES) {
       pendingMessages.shift();
-      console.warn('[Hermes Bridge] Pending message queue full, dropping oldest message');
+      hbsLog('warn', 'Pending message queue full, dropping oldest message');  // R55: use hbsLog
     }
     pendingMessages.push({ ...msg, sessionId: SESSION_ID });
     connect();
@@ -202,7 +212,7 @@ function startHealthPoll() {
       const res = await fetch(`http://localhost:${_proxyPort}/health`);
       const health = await res.json();
       if (!health.connected && connected) {
-        console.warn('[Hermes Bridge] Proxy reports no WS client; forcing reconnect');
+        hbsLog('warn', 'Proxy reports no WS client; forcing reconnect');  // R55: use hbsLog
         socket.close();
       }
     } catch { /* proxy down */ }
@@ -223,18 +233,21 @@ const pendingCmdTypes = new Map();  // cmdId → original command type
 const MAX_PENDING_CMD_TYPES = 200;  // Fix #H1: cap to prevent unbounded growth
 
 // Fix #H1: Evict oldest entries when the cap is reached
+// R56: Evict BEFORE setting so the size check guards against the race where
+// another call evicts between our check and our delete (making firstKey undefined).
+// Using > (not >=) so we evict when at capacity, then add → new size = MAX.
 function _setPendingCmdType(cmdId, cmdType) {
   if (pendingCmdTypes.size >= MAX_PENDING_CMD_TYPES) {
     // Delete the oldest entry (first key in insertion order)
     const firstKey = pendingCmdTypes.keys().next().value;
-    pendingCmdTypes.delete(firstKey);
+    if (firstKey !== undefined) pendingCmdTypes.delete(firstKey);
   }
   pendingCmdTypes.set(cmdId, cmdType);
 }
 
 function forwardCommandToTab(tabId, cmd) {
   if (!tabId) {
-    console.warn('[Hermes Bridge] No active tab to forward command to');
+    hbsLog('warn', 'No active tab to forward command to', { cmdType: cmd.type });  // R55: use hbsLog
     notifyPopup({ event: 'cmd_error', cmdType: cmd.type, error: 'No active tab' });
     return;
   }
@@ -251,7 +264,7 @@ function forwardCommandToTab(tabId, cmd) {
       // Success — cmd_ack or cmd_error arrives asynchronously via handleProxyMessage
     }).catch((err) => {
       if (err && err.message) {
-        console.warn(`[Hermes Bridge] Tab delivery attempt ${attemptNum}/${MAX_RETRIES} failed: ${err.message}`);
+        hbsLog('warn', `Tab delivery attempt ${attemptNum}/${MAX_RETRIES} failed`, { err: err?.message });  // R55: use hbsLog
       }
       if (attemptNum < MAX_RETRIES) {
         setTimeout(() => attempt(attemptNum + 1), RETRY_DELAY_MS * (attemptNum + 1));
@@ -291,7 +304,7 @@ function handleProxyMessage(cmd) {
         browser.tabs.sendMessage(currentTabId, { type: 'backpressure', paused: cmd.paused }).catch(() => {});
       }
       notifyPopup({ event: 'backpressure', paused: cmd.paused });
-      console.warn(`[Hermes Bridge] Backpressure ${cmd.paused ? 'ACTIVE' : 'cleared'}`);
+      hbsLog('warn', `Backpressure ${cmd.paused ? 'ACTIVE' : 'cleared'}`);  // R55: use hbsLog
       break;
 
     // P3-17: Cancel — forward to content script so it ignores this cmdId
@@ -327,7 +340,7 @@ function handleProxyMessage(cmd) {
       break;
 
     default:
-      console.warn('[Hermes Bridge] Unknown command type from proxy:', cmd.type);
+      hbsLog('warn', 'Unknown command type from proxy', { cmdType: cmd.type });  // R55: use hbsLog
   }
 }
 
@@ -423,8 +436,28 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === '_navigate') {
+    // F19: Reject navigate commands while a navigation is already in flight.
+    // Without this, a rapid sequence of navigate commands can cause phantom execution
+    // where Hermes sends cmd_ack believing the tab navigated when it didn't.
+    if (navigating) {
+      const err = 'Navigation already in progress — command ignored';
+      notifyPopup({ event: 'cmd_error', cmdType: 'navigate', error: err });
+      sendToProxy({ type: 'cmd_error', cmdId: message.cmdId, error: err, tabId: currentTabId, sessionId: SESSION_ID });
+      return true;
+    }
     if (currentTabId !== null) {
-      browser.tabs.update(currentTabId, { url: message.url }).catch((err) => {
+      navigating = true; // F19: set BEFORE issuing tabs.update
+      // R56: Split into .then() for success and .catch() for error.
+      // The previous code only caught errors — on success, navigating=true permanently
+      // blocked subsequent navigates until the 15s timer fired. Now we clear it immediately.
+      browser.tabs.update(currentTabId, { url: message.url })
+        .then(() => {
+          navigating = false;
+          // R56: Notify popup of successful navigation — previously only error path called notifyPopup
+          notifyPopup({ event: 'cmd_done', cmdType: 'navigate', cmdId: message.cmdId });
+        })
+        .catch((err) => {
+          navigating = false;
         // F1: Forward navigate failure to proxy so Hermes's cmd_queue resolves immediately.
         // Without this, the content script waits 10s for a load event that will never fire
         // while Hermes waits 30s for a cmd_ack that never arrives.
@@ -440,6 +473,9 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
         // F1: Also send cmd_error to proxy so Hermes knows immediately
         sendToProxy({ type: 'cmd_error', cmdId: message.cmdId, error: errorMsg, tabId: currentTabId, sessionId: SESSION_ID });
       });
+      // R56: Removed the 15s setTimeout fallback — both .then() and .catch() above
+      // now clear navigating=false, so the timer is no longer needed to prevent
+      // the flag from permanently blocking future navigates.
     }
     return true;
   }
@@ -500,6 +536,15 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.type === 'cmd_ack' || message.type === 'cmd_error') {
     sendToProxy({ ...message, tabId: currentTabId, sessionId: SESSION_ID });
+    return true;
+  }
+
+  // R56: Handle refresh with no-change — content script sends this when the snapshot
+  // hash hasn't changed since the last refresh. We resolve it as cmd_done so the popup's
+  // pending command state is cleaned up without sending a duplicate snapshot to Hermes.
+  if (message.type === '_refreshUnchanged') {
+    pendingCmdTypes.delete(message.cmdId);
+    notifyPopup({ event: 'cmd_done', cmdType: 'refresh', cmdId: message.cmdId });
     return true;
   }
 

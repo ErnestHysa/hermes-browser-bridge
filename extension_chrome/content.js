@@ -51,8 +51,8 @@ function initHermesContent() {
   let lastSnapshotHash = '';
 
   // ─── Navigate Handler State (Chrome-specific) ────────────────────────────────
-
-  let lastNavigateCmdId = null;
+  // R55: Store on HermesShared so shared clearNavigateHandlers() can clear it
+  window.HermesShared._lastNavigateCmdId = null;
 
   // ─── Snapshot Sending ────────────────────────────────────────────────────────
 
@@ -179,11 +179,11 @@ function initHermesContent() {
   const _chromeCMDHandlers = {
     navigate(cmd) {
       window.HermesShared.clearNavigateHandlers();
-      lastNavigateCmdId = cmd.cmdId;
+      window.HermesShared._lastNavigateCmdId = cmd.cmdId;
       // Fix #3: Use HermesShared._navigateFailTimer so clearNavigateHandlers can cancel it
       window.HermesShared._navigateFailHandler = () => {
-        if (lastNavigateCmdId === cmd.cmdId) {
-          lastNavigateCmdId = null;
+        if (window.HermesShared._lastNavigateCmdId === cmd.cmdId) {
+          window.HermesShared._lastNavigateCmdId = null;
           // Fix #3: Clean up nav listeners when timer fires (navigation failed/neither event fired)
           window.HermesShared.clearNavigateHandlers();
           window._hermesPendingCommands.delete(cmd.cmdId);

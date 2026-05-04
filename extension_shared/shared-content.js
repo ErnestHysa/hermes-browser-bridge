@@ -2,8 +2,23 @@
  * shared-content.js — Shared code for both Chrome and Safari content scripts.
  * This file is injected into pages via chrome.scripting.executeScript or loaded via script tag.
  * Sets window.HermesShared for content scripts to import from.
- * 
+ *
  * Fix #17: Shared extension lib — extract common code used by both content.js files.
+ *
+ * ─── Architecture Notes ──────────────────────────────────────────────────────────
+ *
+ * ⚠️ HermesShared is shared across iframes on the same origin (INFO-19):
+ *   Both Chrome and Safari content scripts inject shared-content.js by adding a <script>
+ *   tag to the page. This means window.HermesShared is a SHARED SINGLETON across all
+ *   frames on the same origin. If a page has multiple iframes, they all share the same
+ *   HermesShared instance — including backpressurePaused, _mutationSendBuffer, and all
+ *   navigate/command handlers. This can cause race conditions on multi-frame pages.
+ *
+ * ⚠️ evaluate() has no runtime sandboxing (INFO-27):
+ *   window.HermesShared.evaluate() uses new Function() which has full access to all page
+ *   globals. Password input values are stripped from HTML snapshots (sanitizePasswordInputs)
+ *   but evaluate() has no equivalent protection. The caller (Hermes Agent) must never send
+ *   evaluate() commands to pages with sensitive data.
  */
 
 'use strict';
@@ -70,10 +85,19 @@ function _pushMutationToBuffer(mutationEntry) {
 
 // ─── Snapshot Hash ─────────────────────────────────────────────────────────────
 
+// R56: Improved sampling strategy — the previous 200-char sample from the beginning
+// misses any changes outside that window (e.g. footer text changes on large SPAs).
+// Now sample from beginning, middle, and end of body text, plus structural signals.
 function snapshotHash() {
   const body = document.body;
-  const sample = (body && body.textContent) ? body.textContent.slice(0, 200) : '';
-  return `${document.title}:${document.contentType}:${sample.length}:${(body && body.childElementCount) || 0}:${sample}`;
+  const text = (body && body.textContent) ? body.textContent : '';
+  const len = text.length;
+  // Sample from start, middle, and end to catch changes anywhere in the page
+  const begin = text.slice(0, 100);
+  const middle = len > 200 ? text.slice(Math.floor(len / 2) - 50, Math.floor(len / 2) + 50) : '';
+  const end = len > 100 ? text.slice(-100) : '';
+  const sample = begin + middle + end;
+  return `${document.title}:${document.contentType}:${len}:${body?.childElementCount || 0}:${sample}`;
 }
 
 // ─── DOM Reading ───────────────────────────────────────────────────────────────
@@ -312,11 +336,23 @@ const CMD_HANDLERS = {
   },
 
   evaluate(cmd) {
-    // R54: Pre-hoc script length check — prevent memory exhaustion before evaluation.
-    // A script large enough to cause heap problems when materialized is unreasonable
-    // regardless of what it returns. 50KB is a generous limit for any legitimate use.
+    // R56: Validate script is a string before attempting to compile it.
+    // If Hermes sends a non-string (null, object, number), new Function() throws
+    // a misleading TypeError. Catch this early with a structured errorCode.
+    if (typeof cmd.script !== 'string') {
+      window._hermesPendingCommands.delete(cmd.cmdId);
+      window._hermesSendToBackground({
+        type: 'cmd_error',
+        cmdId: cmd.cmdId,
+        errorCode: 'EVAL_ERROR',
+        error: `evaluate expects script to be a string, got ${typeof cmd.script}`
+      });
+      return;
+    }
+
+    // R56: script is guaranteed to be a string at this point (validated above)
     const MAX_SCRIPT_CHARS = 50 * 1024;
-    if (cmd.script && cmd.script.length > MAX_SCRIPT_CHARS) {
+    if (cmd.script.length > MAX_SCRIPT_CHARS) {
       window._hermesPendingCommands.delete(cmd.cmdId);
       window._hermesSendToBackground({
         type: 'cmd_error',
@@ -339,10 +375,11 @@ const CMD_HANDLERS = {
     }, EVAL_TIMEOUT_MS);
 
     try {
-      // WARNING: new Function() is NOT sandboxed — it has full access to page globals
-      // (window, document, cookies, localStorage, etc.) just like eval().
-      // The comment below is misleading and kept only to avoid breaking existing docs.
-      // Do NOT assume evaluate() is safe to run on untrusted pages.
+      // R56: SECURITY WARNING — new Function() is NOT sandboxed.
+      // It has full access to all page globals (window, document, cookies, localStorage).
+      // If Hermes ever sends evaluate() commands to pages with sensitive data (banking,
+      // credentials, personal info), the result can be exfiltrated. There is no runtime
+      // protection — the caller (Hermes) must ensure evaluate() is only used on trusted pages.
       // eslint-disable-next-line no-new-func
       const result = (new Function(cmd.script))();
       clearTimeout(timeoutId);
@@ -352,17 +389,31 @@ const CMD_HANDLERS = {
       // materialize a full 100MB JSON string in memory. Abort early if limit exceeded.
       const RESULT_SIZE_LIMIT = 1024 * 1024;
       let resultSizeBytes = 0;
-      const serialized = JSON.stringify(result, (k, v) => {
-        if (typeof v === 'string') {
-          resultSizeBytes += Buffer.byteLength(v, 'utf8');
-        } else if (typeof v === 'number' || typeof v === 'boolean' || v === null) {
-          resultSizeBytes += 30; // rough estimate
-        }
-        if (resultSizeBytes > RESULT_SIZE_LIMIT) {
-          throw new Error('RESULT_TOO_LARGE');
-        }
-        return v;
-      });
+      let serialized;
+      try {
+        serialized = JSON.stringify(result, (k, v) => {
+          if (typeof v === 'string') {
+            resultSizeBytes += Buffer.byteLength(v, 'utf8');
+          } else if (typeof v === 'number' || typeof v === 'boolean' || v === null) {
+            resultSizeBytes += 30; // rough estimate
+          }
+          if (resultSizeBytes > RESULT_SIZE_LIMIT) {
+            throw new Error('RESULT_TOO_LARGE');
+          }
+          return v;
+        });
+      } catch (e) {
+        if (timedOut) return;
+        window._hermesSendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'RESULT_TOO_LARGE', error: e.message });
+        return;
+      }
+      // R55: Send RESULT_TOO_LARGE error if serialized result exceeds limit.
+      // Previously the size check threw but the result was still sent (line 366 used
+      // the un-checked `result` variable). Now we abort before sending anything.
+      if (resultSizeBytes > RESULT_SIZE_LIMIT) {
+        window._hermesSendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'RESULT_TOO_LARGE', error: `Result size (${resultSizeBytes}) exceeds ${RESULT_SIZE_LIMIT} byte limit` });
+        return;
+      }
       window._hermesSendToBackground({ type: 'cmd_ack', cmdId: cmd.cmdId, success: true, result });
     } catch (e) {
       clearTimeout(timeoutId);
@@ -377,6 +428,7 @@ const CMD_HANDLERS = {
 // ─── Navigate Handler Cleanup ───────────────────────────────────────────────────
 
 // Fix #3/#4: navigateFailTimer leaks across navigations — clear it in clearNavigateHandlers
+// R55: Also clear lastNavigateCmdId so a stale timer cannot delete a future navigation's cmdId.
 function clearNavigateHandlers() {
   if (window.HermesShared._navLoadHandler) {
     window.removeEventListener('load', window.HermesShared._navLoadHandler);
@@ -390,6 +442,10 @@ function clearNavigateHandlers() {
   if (window.HermesShared._navigateFailTimer != null) {
     clearTimeout(window.HermesShared._navigateFailTimer);
     window.HermesShared._navigateFailTimer = null;
+  }
+  // R55: Clear lastNavigateCmdId — prevents a stale timer from deleting a new navigation's cmdId
+  if (window.HermesShared._lastNavigateCmdId !== undefined) {
+    window.HermesShared._lastNavigateCmdId = null;
   }
 }
 

@@ -928,7 +928,12 @@ function createProxy({ httpServer, tlsOptions, version }) {
   function broadcastToAllExtensions(msg) {
     const data = JSON.stringify(msg);
     for (const ws of sessionSockets.values()) {
-      if (ws.readyState === 1) ws.send(data);
+      if (ws.readyState !== 1) continue;
+      try { ws.send(data); }
+      catch (e) {
+        // R56: Individual send failure should not prevent other extensions from receiving
+        log('warn', 'broadcastToAllExtensions: send to one socket failed', { reqId: null, err: e.message });
+      }
     }
   }
 
@@ -999,7 +1004,11 @@ const wss = new WebSocketServer(wssOptionsWithPing);
           return;
         }
         authenticated = true;
-        ws.send(JSON.stringify({ type: 'hello_ack', message: 'Hermes Browser Bridge proxy ready', reqId }));
+        try {
+          ws.send(JSON.stringify({ type: 'hello_ack', message: 'Hermes Browser Bridge proxy ready', reqId }));
+        } catch (e) {
+          log('warn', 'Hermes WS failed to send hello_ack', { reqId, err: e.message });
+        }
         return;
       }
 
@@ -1011,14 +1020,18 @@ const wss = new WebSocketServer(wssOptionsWithPing);
       // P0-1: Session subscription
       if (msg.type === 'subscribe') {
         if (!msg.sessionId) {
-          ws.send(JSON.stringify({ type: 'error', message: 'sessionId required' }));
+          try { ws.send(JSON.stringify({ type: 'error', message: 'sessionId required' })); } catch (_) {}
           return;
         }
         hermesPush.subscribe(ws, msg.sessionId, reqId);
         // Send current state of that session immediately
         const state = pageMirror.getState(msg.sessionId, 0);
-        ws.send(JSON.stringify({ type: 'page_state', sessionId: msg.sessionId, ...state }));
-        ws.send(JSON.stringify({ type: 'subscribed', sessionId: msg.sessionId }));
+        try {
+          ws.send(JSON.stringify({ type: 'page_state', sessionId: msg.sessionId, ...state }));
+          ws.send(JSON.stringify({ type: 'subscribed', sessionId: msg.sessionId }));
+        } catch (e) {
+          log('warn', 'Hermes WS failed to send subscribe response', { reqId, sessionId: msg.sessionId, err: e.message });
+        }
         return;
       }
 
@@ -1029,14 +1042,14 @@ const wss = new WebSocketServer(wssOptionsWithPing);
         if (newId && oldId) {
           hermesPush.broadcastSessionBridge(newId, oldId);
         }
-        ws.send(JSON.stringify({ type: 'session_bridge_ack', sessionId: newId, previousSessionId: oldId }));
+        try { ws.send(JSON.stringify({ type: 'session_bridge_ack', sessionId: newId, previousSessionId: oldId })); } catch (_) {}
         return;
       }
 
       // P0-1: Unsubscribe
       if (msg.type === 'unsubscribe') {
         hermesPush.unsubscribe(ws);
-        ws.send(JSON.stringify({ type: 'unsubscribed' }));
+        try { ws.send(JSON.stringify({ type: 'unsubscribed' })); } catch (_) {}
         return;
       }
 
@@ -1058,13 +1071,17 @@ const wss = new WebSocketServer(wssOptionsWithPing);
         hermesPush._cmdIdToWs.set(cmdId, ws);
         hermesPush.forwardCommand(sessionId, cmd);
         log('info', `Hermes CMD → extension`, { reqId, sessionId, type: cmd.type, cmdId });
-        ws.send(JSON.stringify({ type: 'command_queued', cmdId, sessionId }));
+        try {
+          ws.send(JSON.stringify({ type: 'command_queued', cmdId, sessionId }));
+        } catch (e) {
+          log('warn', `Hermes WS failed to send command_queued`, { reqId, cmdId, err: e.message });
+        }
         return;
       }
 
       // P0-1: Ping/pong keepalive
       if (msg.type === 'ping') {
-        ws.send(JSON.stringify({ type: 'pong', ts: Date.now() }));
+        try { ws.send(JSON.stringify({ type: 'pong', ts: Date.now() })); } catch (_) {}
       }
     });
 
@@ -1128,19 +1145,11 @@ const wss = new WebSocketServer(wssOptionsWithPing);
     log('info', 'Extension WS connected', { reqId, origin: origin || 'null', remoteIp });
     metricIncr('wsConnections');
 
-    // H2: Send timeout — detect unresponsive extension sockets
-    let _sendTimeoutTimer = null;
-    function _clearSendTimeout() {
-      if (_sendTimeoutTimer !== null) { clearTimeout(_sendTimeoutTimer); _sendTimeoutTimer = null; }
-    }
-    function _resetSendTimeout() {
-      _clearSendTimeout();
-      _sendTimeoutTimer = setTimeout(() => {
-        log('warn', `WS send timeout for extension — closing socket`, { reqId, sessionId });
-        metrics.counters.wsSendTimeouts++;
-        ws.terminate();
-      }, WS_SEND_TIMEOUT_MS);
-    }
+    // R56: Removed _resetSendTimeout / _clearSendTimeout — these were dead code.
+    // The extension WS handler never calls send-timeout tracking (the Hermes side handles
+    // this via _resetHermesSendTimeout / _clearHermesSendTimeout in sendToExtension).
+    // The sessionId closure variable they referenced was also stale (declared at line ~1211,
+    // after the function definition), making the timeout callback useless even if called.
 
     // isAlive tracking now handled by ws library's ping/pong protocol
 
@@ -1171,8 +1180,7 @@ const wss = new WebSocketServer(wssOptionsWithPing);
       // C2: Require 'hello' message with valid token before accepting any other messages
       if (!extAuthenticated) {
         if (msg.type === 'hello') {
-          clearTimeout(authTimeout);
-          // No token required if HBS_AUTH_TOKEN is not set (dev mode)
+          clearTimeout(authTimeout);  // R55: prevent authTimeout leak on successful auth
           if (expectedToken && msg.token !== expectedToken) {
             log('warn', 'Extension WS auth failed — invalid token', { reqId, remoteIp });
             ws.close(1008, 'Invalid token');
@@ -1180,7 +1188,11 @@ const wss = new WebSocketServer(wssOptionsWithPing);
           }
           extAuthenticated = true;
           log('info', 'Extension WS authenticated', { reqId, remoteIp });
-          ws.send(JSON.stringify({ type: 'connected', message: 'Proxy ready' }));
+          try {
+            ws.send(JSON.stringify({ type: 'connected', message: 'Proxy ready' }));
+          } catch (e) {
+            log('error', 'Extension WS failed to send connected ack', { reqId, err: e.message });
+          }
           return;
         }
         log('warn', 'Extension WS sent message before hello — rejecting', { reqId, type: msg.type });
@@ -1308,7 +1320,6 @@ const wss = new WebSocketServer(wssOptionsWithPing);
       }
     });
 
-    _clearSendTimeout();  // H2: clear send timeout on close
     ws.on('close', () => {
       clearTimeout(authTimeout);
       for (const [sid, sws] of sessionSockets) {
@@ -1875,6 +1886,7 @@ const wss = new WebSocketServer(wssOptionsWithPing);
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Hermes Browser Bridge — Dashboard</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🌉</text></svg>">
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f1117; color: #c9d1d9; min-height: 100vh; padding: 24px; }

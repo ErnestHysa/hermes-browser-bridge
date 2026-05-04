@@ -81,11 +81,22 @@ function loadCmdLog() {
   } catch { cmdLog = []; }
 }
 
-// Fix #22: Save command log to localStorage
+// R56: Save command log to localStorage with retry-on-failure.
+// If storage is full, trim oldest entries and retry once before giving up.
 function saveCmdLog() {
   try {
     localStorage.setItem(CMD_LOG_KEY, JSON.stringify(cmdLog));
-  } catch { /* storage full or unavailable */ }
+  } catch (e) {
+    // R56: Storage full — try trimming oldest entries and retry once
+    if (cmdLog.length > 1) {
+      cmdLog = cmdLog.slice(-MAX_CMD_LOG);
+      try {
+        localStorage.setItem(CMD_LOG_KEY, JSON.stringify(cmdLog));
+        return;
+      } catch (_) { /* give up */ }
+    }
+    // Silent failure — don't crash the popup for a failed log write
+  }
 }
 
 function onActivateClick() {

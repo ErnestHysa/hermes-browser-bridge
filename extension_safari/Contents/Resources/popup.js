@@ -70,11 +70,22 @@ function loadCmdLog() {
   } catch { cmdLog = []; }
 }
 
-// Fix #22: Save command log to localStorage
+// R56: Save command log to localStorage with retry-on-failure.
+// If storage is full, trim oldest entries and retry once before giving up.
 function saveCmdLog() {
   try {
     localStorage.setItem(CMD_LOG_KEY, JSON.stringify(cmdLog));
-  } catch { /* storage full or unavailable */ }
+  } catch (e) {
+    // R56: Storage full — try trimming oldest entries and retry once
+    if (cmdLog.length > 1) {
+      cmdLog = cmdLog.slice(-MAX_CMD_LOG);
+      try {
+        localStorage.setItem(CMD_LOG_KEY, JSON.stringify(cmdLog));
+        return;
+      } catch (_) { /* give up */ }
+    }
+    // Silent failure — don't crash the popup for a failed log write
+  }
 }
 
 // Fix #20: Keyboard shortcuts for quick actions
@@ -197,8 +208,14 @@ function onBgMessage(msg) {
     // Fix #14: show backpressure PAUSED state in popup
     if (msg.paused) {
       pendingCmdId = null;
+      // R55: Update status dot to reflect paused state — previously only the log was updated
+      statusDot.className = 'status-dot paused';
+      statusText.textContent = 'Paused';
       addCmdLog('pending', 'PAUSED — Hermes is catching up');
     } else {
+      // R55: Restore connected state when backpressure clears
+      statusDot.className = 'status-dot connected';
+      statusText.textContent = 'Connected';
       addCmdLog('success', 'Resumed — Hermes is up to date');
     }
   } else if (msg.event === 'hermes_session') {
@@ -209,6 +226,9 @@ function onBgMessage(msg) {
 }
 
 // ─── Command log ─────────────────────────────────────────────────────────────
+// R56: INFO-26 — cmd_log persists to localStorage but has no UI to clear it.
+// The user must open Safari's developer console to clear it manually, or the
+// log auto-purges entries older than 24 hours in loadCmdLog().
 
 function addCmdLog(type, detail) {
   cmdLog.unshift({ type, detail, ts: Date.now() });

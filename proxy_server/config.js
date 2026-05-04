@@ -1,11 +1,14 @@
 /**
  * config.js — Hermes Browser Bridge runtime configuration
  *
- * Fix #P3-14: Rate limit is now fully configurable from this file instead of
- * being hardcoded in proxy_lib.js. Also enables per-setting overrides via env vars.
+ * ⚠️ INFO-22: HBS_AUTH_TOKEN is read once at startup — there is no hot-reload mechanism.
+ *   If the token needs to be rotated, the proxy process must be restarted. A future version
+ *   could add POST /admin/reload-config or support SIGHUP to reload without restart.
  *
- * Fix #P2-9: Metrics flush interval configurable (for high-throughput deployments).
- * Fix #P2-8: Backpressure threshold configurable.
+ * ⚠️ INFO-23: Prometheus metrics (metrics.js) include counters and gauges but lack histogram
+ *   buckets for computing percentile latencies (p50/p95/p99). metricHistogramObserve is called
+ *   in some places but no histograms are registered with prom-client. Add histogram metrics
+ *   for: command latency, snapshot sizes, mutation batch sizes.
  */
 
 'use strict';
@@ -37,7 +40,13 @@ const CMD_TIMEOUT_MS = parseInt(process.env.HBS_CMD_TIMEOUT_MS || '30000', 10);
 const IDEMPOTENCY_WINDOW_MS = parseInt(process.env.HBS_IDEMPOTENCY_WINDOW_MS || '30000', 10);
 
 // ─── Session (Fix #5) ────────────────────────────────────────────────────────────
-
+// R56: SESSION_TTL_MS and SESSION_TIMEOUT_MS serve different purposes:
+// - SESSION_TTL_MS (5min default): How long a disconnected session's page state is
+//   retained in the proxy's pageMirror before being evicted. If an extension reconnects
+//   within TTL, its session state (page HTML, mutations) is still available.
+// - SESSION_TIMEOUT_MS (10min default): How long to wait for a session to reconnect
+//   before cleaning up its WebSocket and evicting it. This is a hard cleanup boundary
+//   that runs regardless of whether the session is connected.
 const SESSION_TTL_MS = parseInt(process.env.HBS_SESSION_TTL_MS || '300000', 10);
 const SESSION_TIMEOUT_MS = parseInt(process.env.HBS_SESSION_TIMEOUT_MS || '600000', 10);
 const PER_SESSION_RATE_LIMIT = parseInt(process.env.HBS_PER_SESSION_RATE_LIMIT || '100', 10);
