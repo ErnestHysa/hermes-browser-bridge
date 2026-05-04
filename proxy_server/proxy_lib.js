@@ -53,7 +53,14 @@ function _getHistory(sessionId) {
 function _pushHistory(sessionId, entry) {
   const hist = _commandHistory.get(sessionId) || [];
   hist.unshift(entry);
-  if (hist.length > CMD_HISTORY_MAX) hist.splice(CMD_HISTORY_MAX);
+  if (hist.length > CMD_HISTORY_MAX) {
+    // F7: Log when we drop history entries so operators can detect when CMD_HISTORY_MAX
+    // is too small for the workload. Previously silent — operators had no indication
+    // that command audit records were being discarded.
+    const dropped = hist.length - CMD_HISTORY_MAX;
+    log('warn', 'Command history overflow — dropping oldest entries', { sessionId, dropped, max: CMD_HISTORY_MAX });
+    hist.splice(CMD_HISTORY_MAX);
+  }
   _commandHistory.set(sessionId, hist);
   // Note: disconnected-session eviction moved to periodic prune interval (see Fix #9)
   // to avoid O(n) iteration on every single command.
@@ -926,6 +933,10 @@ function createProxy({ httpServer, tlsOptions, version }) {
 
   // ── WebSocket Server (Extension WebSocket) ─────────────────────────────────
 
+  // F14: permessage-deflate is enabled — mutation HTML bodies and JSON frames are
+  // transparently compressed, typically cutting bandwidth by 60–80% on typical page HTML.
+  // To disable: set env HBS_NO_DEFLATE=1 or remove the permessageDeflate block below.
+  // See: https://www.rfc-editor.org/rfc/rfc7692
   const wssOptions = { server: httpServer };
   wssOptions.permessageDeflate = {
     serverNoContextTakeover: true,
@@ -1549,6 +1560,9 @@ const wss = new WebSocketServer(wssOptionsWithPing);
       }
       const state = pageMirror.getState(sid);
       const meta = sessionMetaInfo.get(sid) || {};
+      // F17: Include Hermes subscriber count and command queue depth for structured inspection
+      const hermesClientCount = [...hermesPush._clients.values()].filter(sids => sids.has(sid)).length;
+      const cmdQueueDepth = cmdQueue.size;
       jsonResponse(res, 200, {
         sessionId: sid,
         connected: ws.readyState === 1,
@@ -1556,7 +1570,8 @@ const wss = new WebSocketServer(wssOptionsWithPing);
         title: state.title || '',
         lastUpdate: state.lastUpdate || 0,
         mutationsPending: state.mutations ? state.mutations.length : 0,
-        // Fix #5: Expose stored session metadata
+        hermesSubscribers: hermesClientCount,   // F17: how many Hermes clients watching this session
+        commandQueueDepth: cmdQueueDepth,        // F17: total server-side pending commands
         extensionVersion: meta.version || null,
         tabId: meta.tabId || null,
         userAgent: meta.userAgent || null,
@@ -1580,6 +1595,18 @@ const wss = new WebSocketServer(wssOptionsWithPing);
         url: pageMirror.getState(targetSessionId).url
       });
       jsonResponse(res, 200, { success: true, sessionId: targetSessionId, message: 'Session activated' });
+      return;
+    }
+
+    // ── DELETE /sessions/:id (F18) ───────────────────────────────────────────
+    // Clear page state and command history for a session without closing the WebSocket.
+    // Useful for resetting a stuck session without disrupting the extension connection.
+    const sessionDeleteMatch = path.match(/^\/sessions\/([^\/]+)$/);
+    if (req.method === 'DELETE' && sessionDeleteMatch) {
+      const sid = sessionDeleteMatch[1];
+      pageMirror.disconnectSession(sid);
+      _commandHistory.delete(sid);
+      jsonResponse(res, 200, { success: true, sessionId: sid, message: 'Session state cleared' });
       return;
     }
 

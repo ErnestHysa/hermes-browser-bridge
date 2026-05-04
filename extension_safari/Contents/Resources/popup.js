@@ -177,6 +177,12 @@ function onBgMessage(msg) {
     pendingCmdId = null;
     cancelBtn.classList.add('hidden');  // Fix #13
     addCmdLog('error', `${msg.cmdType}: ${msg.error}`);
+  } else if (msg.event === 'cmd_cancelled') {
+    // F3: Hermes cancelled this command — notify the user with a distinct log entry.
+    if (msg.cmdId !== pendingCmdId) return;
+    pendingCmdId = null;
+    cancelBtn.classList.add('hidden');
+    addCmdLog('error', `Cancelled by Hermes: ${msg.cmdId}`);
   } else if (msg.event === 'backpressure') {
     // Fix #14: show backpressure PAUSED state in popup
     if (msg.paused) {

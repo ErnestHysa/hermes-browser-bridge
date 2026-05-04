@@ -71,6 +71,12 @@ body {
 .status-dot.disconnected { background: var(--text-muted); }
 .status-dot.error { background: var(--error); } /* Fix #23: error state dot */
 
+/* F11: Backpressure PAUSED indicator — shown when Hermes is overwhelmed */
+.status-dot.paused {
+  background: var(--warning);
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
 @keyframes pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.4; }
@@ -223,3 +229,43 @@ body {
 
 /* Utility */
 .hidden { display: none !important; }
+
+/* F12: Port override panel */
+.port-override {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 0;
+}
+
+.port-input {
+  width: 60px;
+  padding: 4px 6px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-primary);
+  font-size: 12px;
+  font-family: var(--font);
+}
+
+.port-input:focus {
+  outline: none;
+  border-color: var(--accent-blue);
+}
+
+.btn-sm {
+  padding: 4px 8px;
+  font-size: 11px;
+  flex: none;
+}
+
+.port-display {
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.port-display:hover {
+  color: var(--accent-blue);
+}

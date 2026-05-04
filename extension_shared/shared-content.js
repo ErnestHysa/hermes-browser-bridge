@@ -163,44 +163,88 @@ function handleCancel(cmdId) {
   window._hermesPendingCommands.delete(cmdId);
 }
 
+// F4: Per-command execution timeout — if a handler doesn't send cmd_ack within this
+// window, treat it as hung and clean up the pending entry so Hermes's 30s server-side
+// timeout doesn't linger unnecessarily.
+const CMD_EXECUTION_TIMEOUT_MS = 5000;
+
 // ─── CMD Handlers (shared portion) ────────────────────────────────────────────
+
+/**
+ * Wrap a command handler so it times out if it doesn't complete within the window.
+ * Prevents hung handlers (e.g. a click triggering an infinite animation loop) from
+ * leaving pending entries that wait for the full 30s server-side timeout.
+ */
+function withCmdTimeout(cmdId, fn) {
+  const timeoutMs = CMD_EXECUTION_TIMEOUT_MS;
+  const timerId = setTimeout(() => {
+    window._hermesPendingCommands.delete(cmdId);
+    window._hermesSendToBackground({
+      type: 'cmd_error',
+      cmdId,
+      errorCode: 'HANDLER_TIMEOUT',
+      error: `Command handler timed out after ${timeoutMs}ms`
+    });
+  }, timeoutMs);
+  // Return a function that clears the timeout on success
+  const clear = () => clearTimeout(timerId);
+  return { clear };
+}
 
 const CMD_HANDLERS = {
   click(cmd) {
     // Support coordinate-based click: { x, y } with optional selector
     if (cmd.x !== undefined && cmd.y !== undefined) {
-      const clickEvent = new MouseEvent('click', {
-        clientX: cmd.x,
-        clientY: cmd.y,
-        bubbles: true,
-        cancelable: true
-      });
-      if (cmd.selector) {
-        const el = document.querySelector(cmd.selector);
-        if (el) {
-          el.dispatchEvent(clickEvent);
+      const { clear: clearTimeout } = withCmdTimeout(cmd.cmdId, null);
+      try {
+        const clickEvent = new MouseEvent('click', {
+          clientX: cmd.x,
+          clientY: cmd.y,
+          bubbles: true,
+          cancelable: true
+        });
+        if (cmd.selector) {
+          const el = document.querySelector(cmd.selector);
+          if (el) {
+            el.dispatchEvent(clickEvent);
+          } else {
+            clearTimeout();
+            window._hermesPendingCommands.delete(cmd.cmdId);
+            window._hermesSendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'ELEMENT_NOT_FOUND', error: `Element not found: ${cmd.selector}` });
+            return;
+          }
         } else {
-          window._hermesPendingCommands.delete(cmd.cmdId);
-          window._hermesSendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'ELEMENT_NOT_FOUND', error: `Element not found: ${cmd.selector}` });
-          return;
+          document.elementFromPoint(cmd.x, cmd.y)?.dispatchEvent(clickEvent);
         }
-      } else {
-        document.elementFromPoint(cmd.x, cmd.y)?.dispatchEvent(clickEvent);
+        clearTimeout();
+        window._hermesPendingCommands.delete(cmd.cmdId);
+        window._hermesSendToBackground({ type: 'cmd_ack', cmdId: cmd.cmdId, success: true, result: `Clicked at (${cmd.x}, ${cmd.y})` });
+      } catch (e) {
+        clearTimeout();
+        window._hermesPendingCommands.delete(cmd.cmdId);
+        window._hermesSendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'CLICK_ERROR', error: e.message });
       }
-      window._hermesPendingCommands.delete(cmd.cmdId);
-      window._hermesSendToBackground({ type: 'cmd_ack', cmdId: cmd.cmdId, success: true, result: `Clicked at (${cmd.x}, ${cmd.y})` });
       return;
     }
 
-    const el = document.querySelector(cmd.selector);
-    if (!el) {
+    const { clear: clearTimeout } = withCmdTimeout(cmd.cmdId, null);
+    try {
+      const el = document.querySelector(cmd.selector);
+      if (!el) {
+        clearTimeout();
+        window._hermesPendingCommands.delete(cmd.cmdId);
+        window._hermesSendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'ELEMENT_NOT_FOUND', error: `Element not found: ${cmd.selector}` });
+        return;
+      }
+      el.click();
+      clearTimeout();
       window._hermesPendingCommands.delete(cmd.cmdId);
-      window._hermesSendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'ELEMENT_NOT_FOUND', error: `Element not found: ${cmd.selector}` });
-      return;
+      window._hermesSendToBackground({ type: 'cmd_ack', cmdId: cmd.cmdId, success: true, result: `Clicked: ${cmd.selector}` });
+    } catch (e) {
+      clearTimeout();
+      window._hermesPendingCommands.delete(cmd.cmdId);
+      window._hermesSendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'CLICK_ERROR', error: e.message });
     }
-    el.click();
-    window._hermesPendingCommands.delete(cmd.cmdId);
-    window._hermesSendToBackground({ type: 'cmd_ack', cmdId: cmd.cmdId, success: true, result: `Clicked: ${cmd.selector}` });
   },
 
   scroll(cmd) {
@@ -210,38 +254,67 @@ const CMD_HANDLERS = {
   },
 
   type(cmd) {
-    const el = document.querySelector(cmd.selector);
-    if (!el) {
+    const { clear: clearTimeout } = withCmdTimeout(cmd.cmdId, null);
+    try {
+      const el = document.querySelector(cmd.selector);
+      if (!el) {
+        clearTimeout();
+        window._hermesPendingCommands.delete(cmd.cmdId);
+        window._hermesSendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'ELEMENT_NOT_FOUND', error: `Element not found: ${cmd.selector}` });
+        return;
+      }
+      el.focus();
+      const nativeInputSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')
+        || Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value');
+      if (nativeInputSetter) { nativeInputSetter.set.call(el, cmd.text); }
+      else { el.value = cmd.text; }
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      clearTimeout();
       window._hermesPendingCommands.delete(cmd.cmdId);
-      window._hermesSendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'ELEMENT_NOT_FOUND', error: `Element not found: ${cmd.selector}` });
-      return;
+      window._hermesSendToBackground({ type: 'cmd_ack', cmdId: cmd.cmdId, success: true, result: `Typed "${cmd.text}" into: ${cmd.selector}` });
+    } catch (e) {
+      clearTimeout();
+      window._hermesPendingCommands.delete(cmd.cmdId);
+      window._hermesSendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'TYPE_ERROR', error: e.message });
     }
-    el.focus();
-    const nativeInputSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')
-      || Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value');
-    if (nativeInputSetter) { nativeInputSetter.set.call(el, cmd.text); }
-    else { el.value = cmd.text; }
-    el.dispatchEvent(new Event('input', { bubbles: true }));
-    el.dispatchEvent(new Event('change', { bubbles: true }));
-    window._hermesPendingCommands.delete(cmd.cmdId);
-    window._hermesSendToBackground({ type: 'cmd_ack', cmdId: cmd.cmdId, success: true, result: `Typed "${cmd.text}" into: ${cmd.selector}` });
   },
 
   submit(cmd) {
-    const form = cmd.selector ? document.querySelector(cmd.selector) : document.querySelector('form');
-    if (!form) {
+    const { clear: clearTimeout } = withCmdTimeout(cmd.cmdId, null);
+    try {
+      const form = cmd.selector ? document.querySelector(cmd.selector) : document.querySelector('form');
+      if (!form) {
+        clearTimeout();
+        window._hermesPendingCommands.delete(cmd.cmdId);
+        window._hermesSendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'FORM_NOT_FOUND', error: `Form not found: ${cmd.selector || 'any form'}` });
+        return;
+      }
+      const submitBtn = form.querySelector('button[type="submit"], input[type="submit"]');
+      if (submitBtn) { submitBtn.click(); }
+      else { form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })); }
+      clearTimeout();
       window._hermesPendingCommands.delete(cmd.cmdId);
-      window._hermesSendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'FORM_NOT_FOUND', error: `Form not found: ${cmd.selector || 'any form'}` });
-      return;
+      window._hermesSendToBackground({ type: 'cmd_ack', cmdId: cmd.cmdId, success: true, result: `Submitted form: ${cmd.selector || 'form'}` });
+    } catch (e) {
+      clearTimeout();
+      window._hermesPendingCommands.delete(cmd.cmdId);
+      window._hermesSendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'SUBMIT_ERROR', error: e.message });
     }
-    const submitBtn = form.querySelector('button[type="submit"], input[type="submit"]');
-    if (submitBtn) { submitBtn.click(); }
-    else { form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })); }
-    window._hermesPendingCommands.delete(cmd.cmdId);
-    window._hermesSendToBackground({ type: 'cmd_ack', cmdId: cmd.cmdId, success: true, result: `Submitted form: ${cmd.selector || 'form'}` });
   },
 
   evaluate(cmd) {
+    // F2: Wrap execution in a timeout to prevent infinite loops or heavy computation
+    // from hanging the page's main thread. If the evaluated script runs longer than
+    // 10 seconds, treat it as a failure so Hermes's cmd_queue can resolve promptly.
+    const EVAL_TIMEOUT_MS = 10000;
+    let timedOut = false;
+    const timeoutId = setTimeout(() => {
+      timedOut = true;
+      window._hermesPendingCommands.delete(cmd.cmdId);
+      window._hermesSendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'EVAL_TIMEOUT', error: `Script execution timed out after ${EVAL_TIMEOUT_MS}ms` });
+    }, EVAL_TIMEOUT_MS);
+
     try {
       // WARNING: new Function() is NOT sandboxed — it has full access to page globals
       // (window, document, cookies, localStorage, etc.) just like eval().
@@ -249,8 +322,10 @@ const CMD_HANDLERS = {
       // Do NOT assume evaluate() is safe to run on untrusted pages.
       // eslint-disable-next-line no-new-func
       const result = (new Function(cmd.script))();
+      clearTimeout(timeoutId);
+      if (timedOut) return;  // timeout fired between Function() and clearTimeout
       window._hermesPendingCommands.delete(cmd.cmdId);
-      // Fix #6: Enforce 1MB result size limit to prevent memory exhaustion.
+      // F2: Enforce 1MB result size limit to prevent memory exhaustion.
       // If the evaluated expression returns something very large (e.g. Array(1e8)),
       // serialize and check the byte length before sending.
       const serialized = JSON.stringify(result);
@@ -260,6 +335,8 @@ const CMD_HANDLERS = {
       }
       window._hermesSendToBackground({ type: 'cmd_ack', cmdId: cmd.cmdId, success: true, result });
     } catch (e) {
+      clearTimeout(timeoutId);
+      if (timedOut) return;
       window._hermesPendingCommands.delete(cmd.cmdId);
       window._hermesSendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'EVAL_ERROR', error: e.message });
     }

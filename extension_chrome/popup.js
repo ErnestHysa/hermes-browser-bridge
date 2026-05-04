@@ -35,7 +35,31 @@ try {
 
 let state = 'inactive';
 let cmdLog = []; // Fix #22: loaded from localStorage in loadCmdLog()
+// F9: pendingCmdId kept — needed for stale-response filtering (cmd_done/cmd_error guard).
 let pendingCmdId = null;
+
+// F12: proxyPort starts at default; overridden by chrome.storage.local if user set one.
+// This is read by all sendToProxy calls to build the correct URL.
+let proxyPort = DEFAULT_PROXY_PORT;
+
+// F12: Load persisted proxy port override from storage
+function loadProxyPort() {
+  try {
+    chrome.storage.local.get(['proxyPortOverride'], (result) => {
+      if (result && result.proxyPortOverride) {
+        proxyPort = result.proxyPortOverride;
+        updatePortDisplay();
+      }
+    });
+  } catch (_) {}
+}
+
+function updatePortDisplay() {
+  const el = document.getElementById('port-num');
+  if (el) el.textContent = proxyPort;
+  const link = document.getElementById('dashboard-link');
+  if (link) link.href = `http://localhost:${proxyPort}/dashboard`;
+}
 
 // Fix #22: Load command log from localStorage
 function loadCmdLog() {
@@ -160,14 +184,26 @@ function onBgMessage(msg) {
     // Fix #18: Same guard — ignore stale errors from a previous tab's command.
     if (msg.cmdId !== pendingCmdId) return;
     pendingCmdId = null;
-    cancelBtn.classList.add('hidden');
+    cancelBtn.classList.add('hidden');  // Fix #13
     addCmdLog('error', `${msg.cmdType}: ${msg.error}`);
+  } else if (msg.event === 'cmd_cancelled') {
+    // F3: Hermes cancelled this command — notify the user with a distinct log entry.
+    if (msg.cmdId !== pendingCmdId) return;
+    pendingCmdId = null;
+    cancelBtn.classList.add('hidden');
+    addCmdLog('error', `Cancelled by Hermes: ${msg.cmdId}`);
   } else if (msg.event === 'backpressure') {
-    // Fix #14: show backpressure PAUSED state in popup; clear pending command
+    // F11: Show backpressure PAUSED state in popup — not just a log entry but a
+    // visible status change so the user immediately understands why commands are queued.
+    const dot = document.getElementById('status-dot');
     if (msg.paused) {
       pendingCmdId = null;
+      // F11: Swap dot to 'paused' state — pulsing yellow warning
+      if (dot) { dot.className = 'status-dot paused'; }
       addCmdLog('pending', 'PAUSED — Hermes is catching up');
     } else {
+      // F11: Restore connected state when backpressure clears
+      if (dot && state === 'active') { dot.className = 'status-dot connected'; }
       addCmdLog('success', 'Resumed — Hermes is up to date');
     }
   } else if (msg.event === 'hermes_session') {
@@ -264,7 +300,8 @@ function onDashboardLinkClick(e) {
 async function init() {
   setState('inactive');
   loadCmdLog(); // Fix #22: restore persisted command log
-  renderCmdLog(); // Render loaded log on startup
+  loadProxyPort(); // F12: restore persisted proxy port override
+  renderCmdLog();
   chrome.runtime.onMessage.addListener(onBgMessage);
   activateBtn.addEventListener('click', onActivateClick);
   disconnectBtn.addEventListener('click', onDisconnectClick);
@@ -303,6 +340,52 @@ async function init() {
       sessionStorage.setItem('hermes_last_url', resp.url);
     }
   } catch {}
+
+  // F12: Port override UI — wire click on the port display to show the input panel
+  const portDisplay = document.getElementById('proxy-port-display');
+  const portOverridePanel = document.getElementById('port-override-panel');
+  const portOverrideInput = document.getElementById('port-override-input');
+  const portOverrideOk = document.getElementById('port-override-ok');
+  const portOverrideCancel = document.getElementById('port-override-cancel');
+
+  if (portDisplay && portOverridePanel) {
+    portDisplay.addEventListener('click', () => {
+      portOverridePanel.classList.remove('hidden');
+      if (portOverrideInput) {
+        portOverrideInput.value = proxyPort;
+        portOverrideInput.focus();
+        portOverrideInput.select();
+      }
+    });
+  }
+
+  if (portOverrideOk) {
+    portOverrideOk.addEventListener('click', () => {
+      const val = parseInt(portOverrideInput.value, 10);
+      if (val > 0 && val < 65536) {
+        proxyPort = val;
+        chrome.storage.local.set({ proxyPortOverride: val }, () => {
+          updatePortDisplay();
+          portOverridePanel.classList.add('hidden');
+          // F12: Notify background so it uses the new port for future proxy connections
+          chrome.runtime.sendMessage({ event: 'setProxyPort', port: val }).catch(() => {});
+        });
+      }
+    });
+  }
+
+  if (portOverrideCancel) {
+    portOverrideCancel.addEventListener('click', () => {
+      portOverridePanel.classList.add('hidden');
+    });
+  }
+
+  if (portOverrideInput) {
+    portOverrideInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') portOverrideOk.click();
+      if (e.key === 'Escape') portOverridePanel.classList.add('hidden');
+    });
+  }
 }
 
 init();

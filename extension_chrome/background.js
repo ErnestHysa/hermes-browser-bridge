@@ -12,11 +12,11 @@
 
 const DEFAULT_PROXY_PORT = 9321;
 
-// Fix #15: Minimal structured logger — one JSON object per line, same format as proxy server.
-// Only 'info' and 'warn'/'error' are used in extensions (no log-level filtering).
+// F10: Consistent structured logger — same format as server.js log() and Safari hbsLog().
+// Fields: { ts, ext, lvl, msg, ...extras }
 function hbsLog(level, msg, extras = {}) {
   const entry = {
-    t: new Date().toISOString(),
+    ts: new Date().toISOString(),
     ext: 'chrome',
     lvl: level,
     msg,
@@ -51,12 +51,18 @@ let SESSION_ID = `session_${Date.now()}_${crypto.randomUUID().replace(/-/g, '').
 // Use chrome.storage.local as the persistence layer (available in MV3 Chrome extensions).
 function restoreSessionId() {
   // chrome.storage.local.get is async but doesn't reject for missing keys — only for actual API failures
-  chrome.storage.local.get(['hermesSessionId']).then((stored) => {
+  chrome.storage.local.get(['hermesSessionId', 'hbsProxyPort']).then((stored) => {
     if (stored && stored.hermesSessionId) {
       const oldId = SESSION_ID;
       SESSION_ID = stored.hermesSessionId;
       console.log('[Hermes Bridge] Restored session ID from local storage:', SESSION_ID.slice(0, 12));
       // If we already connected with a fresh ID, that's fine — proxy handles re-association
+    }
+    // F12: Also restore persisted proxy port so the extension reconnects to the right port
+    // after a service worker restart, even if the popup never sent setProxyPort.
+    if (stored && stored.hbsProxyPort) {
+      _proxyPort = stored.hbsProxyPort;
+      hbsLog('info', 'Restored proxy port from storage', { port: _proxyPort });
     }
   }).catch(() => {
     // Storage API unavailable — use volatile ID
@@ -74,6 +80,7 @@ let pendingMessages = [];
 let reconnectTimer = null;
 let healthPollTimer = null;
 let backpressurePaused = false;
+let navigating = false; // F19: guard against phantom navigate command execution
 
 // ─── WebSocket ─────────────────────────────────────────────────────────────
 
@@ -290,6 +297,9 @@ function handleProxyMessage(cmd) {
 
     case 'cancel':
       pendingCmdTypes.delete(cmd.cmdId);
+      // F3: Notify popup so the user sees feedback when Hermes cancels a command.
+      // Without this, the cancel button disappears silently with no indication of what happened.
+      notifyPopup({ event: 'cmd_cancelled', cmdId: cmd.cmdId });
       if (currentTabId) {
         chrome.tabs.sendMessage(currentTabId, { type: 'cancel', cmdId: cmd.cmdId }).catch(() => {});
       }
@@ -334,6 +344,9 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (tab.active && changeInfo.status === 'complete') {
+    // F19: Navigation completed — clear the navigating flag so future commands are accepted.
+    // Also update tab URL so our local state stays current.
+    navigating = false;
     currentTabId = tabId;
     currentTabUrl = tab.url;
   }
@@ -377,6 +390,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  // F12: setProxyPort — update _proxyPort from the popup's port override UI.
+  // This persists via chrome.storage.local in the popup; the background keeps the
+  // in-memory value in sync so future proxy connections use the new port.
+  if (message.event === 'setProxyPort' && typeof message.port === 'number') {
+    _proxyPort = message.port;
+    hbsLog('info', 'Proxy port overridden from popup', { port: message.port });
+    return true;
+  }
+
   if (message.event === 'activate') {
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
       if (tabs[0]) {
@@ -389,15 +411,32 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === '_navigate') {
+    // F19: Reject navigate commands while a navigation is already in flight.
+    // Without this, a rapid sequence of navigate commands can cause phantom execution
+    // where Hermes sends cmd_ack believing the tab navigated when it didn't.
+    if (navigating) {
+      const err = 'Navigation already in progress — command ignored';
+      notifyPopup({ event: 'cmd_error', cmdType: 'navigate', error: err });
+      sendToProxy({ type: 'cmd_error', cmdId: message.cmdId, error: err, tabId: currentTabId, sessionId: SESSION_ID });
+      return true;
+    }
     if (currentTabId !== null) {
+      navigating = true; // F19: set BEFORE issuing tabs.update
       chrome.tabs.update(currentTabId, { url: message.url }, () => {
         if (chrome.runtime.lastError) {
+          navigating = false; // F19: clear immediately on error
+          // F1: Forward navigate failure to proxy so Hermes's cmd_queue resolves immediately.
+          // Without this, the content script waits 10s for a load event that will never fire
+          // while Hermes waits 30s for a cmd_ack that never arrives.
+          const errorMsg = `Navigation failed: ${chrome.runtime.lastError.message}`;
           chrome.tabs.sendMessage(currentTabId, {
             type: 'cmd_error',
             cmdId: message.cmdId,
             success: false,
-            error: `Navigation failed: ${chrome.runtime.lastError.message}`
+            error: errorMsg
           }).catch(() => {});
+          sendToProxy({ type: 'cmd_error', cmdId: message.cmdId, error: errorMsg, tabId: currentTabId, sessionId: SESSION_ID });
+          notifyPopup({ event: 'cmd_error', cmdType: 'navigate', error: errorMsg });
         }
       });
     }

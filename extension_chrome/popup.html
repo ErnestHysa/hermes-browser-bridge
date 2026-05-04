@@ -48,10 +48,18 @@
 
     <div id="hermes-session-hint" class="hermes-session-hint hidden"></div>
 
+    <!-- F12: Proxy port override — click to change. Stored in chrome.storage.local. -->
     <div class="footer">
       <a id="dashboard-link" href="http://localhost:9321/dashboard" class="dashboard-link" title="Open Dashboard">Dashboard</a>
       <span class="footer-sep">•</span>
-      <span>localhost:9321</span>
+      <!-- F12: Clicking the port number opens an inline input to override proxy host:port -->
+      <span id="proxy-port-display" class="port-display" title="Click to change proxy port">localhost:<span id="port-num">9321</span></span>
+    </div>
+    <!-- F12: Hidden port override input — revealed when user clicks the port display -->
+    <div id="port-override-panel" class="port-override hidden">
+      <input id="port-override-input" type="text" class="port-input" placeholder="9321" maxlength="5" />
+      <button id="port-override-ok" class="btn btn-sm">OK</button>
+      <button id="port-override-cancel" class="btn btn-sm btn-ghost">Cancel</button>
     </div>
   </div>
 

@@ -20,9 +20,10 @@ const { createProxy } = require('./proxy_lib');
 
 const HOST = '127.0.0.1';  // Fix #C4: localhost only — prevents LAN exposure
 
-// M7: Structured logging — JSON lines consistent with proxy_lib.js
+// M7: Structured logging — JSON lines consistent with hbsLog in extensions.
+// Format: { ts, ext, lvl, msg, ...extras }
 function log(level, msg, extras = {}) {
-  const entry = { ts: new Date().toISOString(), level, msg, ...extras };
+  const entry = { ts: new Date().toISOString(), ext: 'server', lvl: level, msg, ...extras };
   const str = JSON.stringify(entry);
   if (level === 'error' || level === 'warn') console.error(str);
   else console.log(str);

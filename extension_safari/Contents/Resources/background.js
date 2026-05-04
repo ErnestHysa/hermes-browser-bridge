@@ -14,11 +14,11 @@
 
 const DEFAULT_PROXY_PORT = 9321;
 
-// Fix #15: Minimal structured logger — one JSON object per line, matching proxy server format.
-// Critical WS lifecycle and error paths use this; info-level calls remain as console.log for now.
+// F10: Consistent structured logger — same format as server.js log() and Chrome hbsLog().
+// Fields: { ts, ext, lvl, msg, ...extras }
 function hbsLog(level, msg, extras = {}) {
   const entry = {
-    t: new Date().toISOString(),
+    ts: new Date().toISOString(),
     ext: 'safari',
     lvl: level,
     msg,
@@ -51,17 +51,24 @@ const HEALTH_POLL_INTERVAL_MS = 10000;
 // browser.storage.session is available in Manifest V3 Safari extensions.
 // Fix #11: Use crypto.randomUUID for unpredictable session IDs
 const SESSION_STORAGE_KEY = 'hermesSessionId';
+const PROXY_PORT_STORAGE_KEY = 'hermesProxyPort'; // F12: persisted proxy port key
 let SESSION_ID = `session_${Date.now()}_${crypto.randomUUID().replace(/-/g, '').slice(0, 10)}`;
 
 async function restoreSessionId() {
   try {
-    const stored = await browser.storage.session.get([SESSION_STORAGE_KEY]);
+    // F12: Restore both session ID and proxy port from persistent storage
+    const stored = await browser.storage.local.get([SESSION_STORAGE_KEY, PROXY_PORT_STORAGE_KEY]);
     if (stored[SESSION_STORAGE_KEY]) {
       SESSION_ID = stored[SESSION_STORAGE_KEY];
       console.log('[Hermes Bridge] Restored session ID:', SESSION_ID.slice(0, 12));
     } else {
       // First run — persist the generated ID so it survives restart
       await persistSessionId();
+    }
+    // F12: Restore persisted proxy port so extension reconnects to the right port
+    if (stored[PROXY_PORT_STORAGE_KEY]) {
+      _proxyPort = stored[PROXY_PORT_STORAGE_KEY];
+      hbsLog('info', 'Restored proxy port from storage', { port: _proxyPort });
     }
   } catch (e) {
     console.warn('[Hermes Bridge] Could not restore session ID from storage:', e.message);
@@ -70,7 +77,7 @@ async function restoreSessionId() {
 
 async function persistSessionId() {
   try {
-    await browser.storage.session.set({ [SESSION_STORAGE_KEY]: SESSION_ID });
+    await browser.storage.local.set({ [SESSION_STORAGE_KEY]: SESSION_ID });
   } catch (e) {
     console.warn('[Hermes Bridge] Could not persist session ID:', e.message);
   }
@@ -88,6 +95,7 @@ let pendingMessages = [];
 let reconnectTimer = null;
 let healthPollTimer = null;
 let backpressurePaused = false; // P2-8
+let navigating = false; // F19: guard against phantom navigate command execution
 
 // ─── WebSocket ──────────────────────────────────────────────────────────────
 
@@ -289,6 +297,8 @@ function handleProxyMessage(cmd) {
     // P3-17: Cancel — forward to content script so it ignores this cmdId
     case 'cancel':
       pendingCmdTypes.delete(cmd.cmdId);
+      // F3: Notify popup so the user sees feedback when Hermes cancels a command.
+      notifyPopup({ event: 'cmd_cancelled', cmdId: cmd.cmdId });
       if (currentTabId) {
         browser.tabs.sendMessage(currentTabId, { type: 'cancel', cmdId: cmd.cmdId }).catch(() => {});
       }
@@ -385,6 +395,8 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'setProxyPort' && typeof message.port === 'number') {
     // M4: Allow popup/options to update proxy port at runtime
     _proxyPort = message.port;
+    // F12: Persist to storage so the port survives extension restarts
+    browser.storage.local.set({ [PROXY_PORT_STORAGE_KEY]: message.port }).catch(() => {});
     sendResponse({ ok: true, port: _proxyPort });
     return true;
   }
@@ -413,27 +425,32 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === '_navigate') {
     if (currentTabId !== null) {
       browser.tabs.update(currentTabId, { url: message.url }).catch((err) => {
+        // F1: Forward navigate failure to proxy so Hermes's cmd_queue resolves immediately.
+        // Without this, the content script waits 10s for a load event that will never fire
+        // while Hermes waits 30s for a cmd_ack that never arrives.
+        const errorMsg = `Navigation failed: ${err?.message || 'unknown error'}`;
         hbsLog('error', 'browser.tabs.update failed', { err: err?.message });
-        // Fix #L3: Notify popup so user sees the navigation error (Chrome also notifies)
-        notifyPopup({ event: 'cmd_error', cmdType: 'navigate', error: `Navigation failed: ${err?.message}` });
+        notifyPopup({ event: 'cmd_error', cmdType: 'navigate', error: errorMsg });
         browser.tabs.sendMessage(currentTabId, {
           type: 'cmd_error',
           cmdId: message.cmdId,
           success: false,
-          error: `Navigation failed: ${err?.message || 'unknown error'}`
+          error: errorMsg
         }).catch(() => {});
+        // F1: Also send cmd_error to proxy so Hermes knows immediately
+        sendToProxy({ type: 'cmd_error', cmdId: message.cmdId, error: errorMsg, tabId: currentTabId, sessionId: SESSION_ID });
       });
     }
     return true;
   }
 
   if (message.event === 'refreshSnapshot') {
-    // Fix #5: Set up a pending command entry so the popup gets cmd_ack on completion.
-    // Without this, the pendingCmdId in popup.js never gets cleared for refresh commands.
+    // F5: Set up a pending command entry so the popup gets cmd_ack on completion.
+    // Without this, the popup never gets confirmation that the refresh completed.
     if (currentTabId) {
       const fakeCmdId = `refresh_${Date.now()}`;
       pendingCmdTypes.set(fakeCmdId, 'refresh');
-      pendingCmdId = fakeCmdId;
+      // F8: pendingCmdId is not declared at module scope in Safari background — removed dangling assignments.
       browser.tabs.sendMessage(currentTabId, { type: 'ping', cmdId: fakeCmdId }).then((resp) => {
         if (resp && resp.html) {
           sendToProxy({
@@ -445,12 +462,10 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
             tabId: currentTabId,
             sessionId: SESSION_ID
           });
-          pendingCmdId = null;
           pendingCmdTypes.delete(fakeCmdId);
           notifyPopup({ event: 'cmd_done', cmdType: 'refresh' });
         }
       }).catch(() => {
-        pendingCmdId = null;
         pendingCmdTypes.delete(fakeCmdId);
         notifyPopup({ event: 'cmd_error', cmdType: 'refresh', error: 'Tab not ready' });
       });
