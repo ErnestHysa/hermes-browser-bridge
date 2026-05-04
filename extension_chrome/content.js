@@ -218,10 +218,18 @@ function initHermesContent() {
 
     refresh(cmd) {
       const snap = window.HermesShared.getFullPageSnapshot();
-      window._hermesPendingCommands.delete(cmd.cmdId);
+      // Fix #13: Don't delete cmdId until AFTER the send confirmation resolves.
+      // If deleted before, a Hermes cancel command arriving mid-flight won't find
+      // the cmdId in _hermesPendingCommands and could race with the pending send.
       window._hermesSendToBackground({ type: 'tab_snapshot', ...snap, incremental: false })
-        .then(() => window._hermesSendToBackground({ type: 'cmd_ack', cmdId: cmd.cmdId, success: true, result: `Refreshed (seq ${snap.seq})` }))
-        .catch(e => window._hermesSendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'REFRESH_FAILED', error: e.message }));
+        .then(() => {
+          window._hermesPendingCommands.delete(cmd.cmdId);
+          return window._hermesSendToBackground({ type: 'cmd_ack', cmdId: cmd.cmdId, success: true, result: `Refreshed (seq ${snap.seq})` });
+        })
+        .catch(e => {
+          window._hermesPendingCommands.delete(cmd.cmdId);
+          return window._hermesSendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'REFRESH_FAILED', error: e.message });
+        });
     }
   };
 

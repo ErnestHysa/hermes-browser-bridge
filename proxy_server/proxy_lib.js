@@ -55,12 +55,8 @@ function _pushHistory(sessionId, entry) {
   hist.unshift(entry);
   if (hist.length > CMD_HISTORY_MAX) hist.splice(CMD_HISTORY_MAX);
   _commandHistory.set(sessionId, hist);
-  // Fix #16: Prune history for disconnected sessions to prevent unbounded Map growth
-  for (const [sid] of _commandHistory) {
-    if (!sessionSockets.has(sid) && !_wssHermes?._clients?.has(sid)) {
-      _commandHistory.delete(sid);
-    }
-  }
+  // Note: disconnected-session eviction moved to periodic prune interval (see Fix #9)
+  // to avoid O(n) iteration on every single command.
 }
 
 const { CommandQueue } = require('./cmd_queue');
@@ -231,7 +227,7 @@ function metricHistogramPush(histName, value, labels = {}) {
   const now = Date.now();
   if (!_metricLastCleanup || (now - _metricLastCleanup) > METRIC_TTL_MS) {
     _metricLastCleanup = now;
-    for (const [histName2, entries] of Object.entries(metrics.histograms)) {
+    for (const [hName, entries] of Object.entries(metrics.histograms)) {
       for (const [type, arr] of Object.entries(entries)) {
         const cutoff = now - METRIC_TTL_MS;
         // Remove expired entries
@@ -240,7 +236,7 @@ function metricHistogramPush(histName, value, labels = {}) {
         if (valid.length > METRIC_MAX_PER_TYPE) {
           valid.splice(0, valid.length - METRIC_MAX_PER_TYPE);
         }
-        metrics.histograms[histName2][type] = valid;
+        metrics.histograms[hName][type] = valid;
       }
     }
   }
@@ -676,6 +672,32 @@ class HermesPushManager {
   }
 
   /**
+   * Fix #22: Remove all Hermes subscriptions and cmdIdToWs entries for a session.
+   * Called when a session is evicted (timeout or manual disconnect) so Hermes clients
+   * know they can stop waiting for updates on that session.
+   * @param {string} sid
+   */
+  _removeSession(sid) {
+    // Notify each subscribed Hermes client that this session is gone
+    const subs = this._sessionSubscriptions.get(sid);
+    if (subs) {
+      for (const ws of subs) {
+        try {
+          ws.send(JSON.stringify({ type: 'session_evicted', sessionId: sid, reason: 'timeout' }));
+        } catch (_) {}
+      }
+      this._sessionSubscriptions.delete(sid);
+    }
+    // Clean up any pending cmd routing entries for this session
+    for (const [cmdId, storedWs] of this._cmdIdToWs.entries()) {
+      const clientSid = this._clients.get(storedWs)?.sessionId;
+      if (clientSid === sid) {
+        this._cmdIdToWs.delete(cmdId);
+      }
+    }
+  }
+
+  /**
    * Fix #11: Remove all _cmdIdToWs entries associated with a disconnected Hermes WS.
    * This prevents unbounded memory growth when long-running Hermes sessions disconnect
    * without receiving cmd_error for all their pending commands.
@@ -806,6 +828,9 @@ function createProxy({ httpServer, tlsOptions, version }) {
       const headers = {
         'Content-Type': 'application/json',
         'Content-Encoding': 'gzip',
+        'Access-Control-Allow-Origin': 'http://localhost:*',  // Fix #14: was missing in gzip path
+        'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type',
         'X-Content-Type-Options': 'nosniff',  // M10
         'X-Frame-Options': 'DENY',            // M10
         'X-XSS-Protection': '1; mode=block',  // M10
@@ -879,14 +904,14 @@ function createProxy({ httpServer, tlsOptions, version }) {
     backpressure.incrementPending(sessionId);
 
     try {
-      _resetSendTimeout();  // H2: start send timeout
+      _resetHermesSendTimeout(ws, reqId);  // Fix #1: Hermes-specific send timeout
       ws.send(data, () => {
-        _clearSendTimeout();  // H2: send completed
+        _clearHermesSendTimeout();  // Fix #1: send completed
         backpressure.decrementPending(sessionId);  // Fix #22
         backpressure.markDone(sessionId, ws);
       });
     } catch (e) {
-      _clearSendTimeout();  // H2: send failed
+      _clearHermesSendTimeout();  // Fix #1: send failed
       backpressure.markDone(sessionId, ws);
     }
     return true;
@@ -914,6 +939,21 @@ const wss = new WebSocketServer(wssOptionsWithPing);
 
   // ── WebSocket Server (Hermes push client — Fix #P0-1) ───────────────────────
   const wssHermes = new WebSocketServer({ noServer: true, pingInterval: 30000, pingTimeout: 10000 });
+
+  // Fix #1: Hermes WS send timeout — separate from Extension's _sendTimeoutTimer.
+  // Hermes uses this to detect when a Hermes WS client is unresponsive.
+  let _hermesSendTimeoutTimer = null;
+  function _clearHermesSendTimeout() {
+    if (_hermesSendTimeoutTimer !== null) { clearTimeout(_hermesSendTimeoutTimer); _hermesSendTimeoutTimer = null; }
+  }
+  function _resetHermesSendTimeout(ws, reqId) {
+    _clearHermesSendTimeout();
+    _hermesSendTimeoutTimer = setTimeout(() => {
+      log('warn', `Hermes WS send timeout — closing socket`, { reqId });
+      metrics.counters.wsSendTimeouts++;
+      ws.terminate();  // Fix #1: actually close the unresponsive Hermes WS
+    }, WS_SEND_TIMEOUT_MS);
+  }
 
   httpServer.on('upgrade', (req, socket, head) => {
     const url = new URL(req.url, `http://localhost:${httpServer.address().port}`);
@@ -1016,10 +1056,11 @@ const wss = new WebSocketServer(wssOptionsWithPing);
       }
     });
 
-    _clearSendTimeout();  // H2: clear send timeout on close
+    _clearHermesSendTimeout();  // Fix #1: clear Hermes-specific send timeout on close
     ws.on('close', () => {
       hermesPush._cleanupWsEntries(ws);  // Fix #11: prevent _cmdIdToWs leaks on disconnect
       hermesPush.unsubscribe(ws);
+      _clearHermesSendTimeout();  // Fix #1: clear timer on close
       log('info', 'Hermes WS client disconnected', { reqId });
     });
 
@@ -1201,13 +1242,25 @@ const wss = new WebSocketServer(wssOptionsWithPing);
         }
 
         case 'cmd_error': {
-          // S8: Structured error codes — determine error code from error string
+          // S8: Structured error codes — prefer the errorCode field if available,
+          // fall back to string matching for compatibility with older extensions.
+          // Fix #25: This avoids misclassification when error messages are localized,
+          // capitalized differently, or reworded in custom element frameworks.
           const rawError = msg.error || 'Unknown error';
-          const errCode = rawError.includes('timeout') ? 'COMMAND_TIMEOUT'
-            : rawError.includes('not found') || rawError.includes('No node') ? 'ELEMENT_NOT_FOUND'
-            : rawError.includes('denied') || rawError.includes('permission') ? 'PERMISSION_DENIED'
-            : rawError.includes('invalid') || rawError.includes('selector') ? 'INVALID_COMMAND'
-            : 'INTERNAL_ERROR';
+          let errCode;
+          if (msg.errorCode && typeof msg.errorCode === 'string' && msg.errorCode !== 'INTERNAL_ERROR') {
+            errCode = msg.errorCode;  // Use the structured code directly
+          } else if (rawError.toLowerCase().includes('timeout')) {
+            errCode = 'COMMAND_TIMEOUT';
+          } else if (rawError.toLowerCase().includes('not found') || rawError.toLowerCase().includes('no node')) {
+            errCode = 'ELEMENT_NOT_FOUND';
+          } else if (rawError.toLowerCase().includes('denied') || rawError.toLowerCase().includes('permission')) {
+            errCode = 'PERMISSION_DENIED';
+          } else if (rawError.toLowerCase().includes('invalid') || rawError.toLowerCase().includes('selector')) {
+            errCode = 'INVALID_COMMAND';
+          } else {
+            errCode = 'INTERNAL_ERROR';
+          }
 
           const before = cmdQueue.size;
           cmdQueue.error(msg.cmdId, rawError);
@@ -1290,9 +1343,19 @@ const wss = new WebSocketServer(wssOptionsWithPing);
           sessionSockets.delete(sid);
           pageMirror.disconnectSession(sid);
         }
+        hermesPush._removeSession(sid);  // Fix #22: notify Hermes clients of session eviction
         sessionMeta.delete(sid);
         sessionMetaInfo.delete(sid);  // Fix #13: clean up sessionMetaInfo on eviction
         metricGauge('connectedSessions', sessionSockets.size);
+      }
+    }
+    // Fix #9: Evict command history for sessions that are fully gone
+    // (not in sessionSockets AND no Hermes client is subscribed to them)
+    for (const [sid] of _commandHistory) {
+      const hasExt = sessionSockets.has(sid);
+      const hasHermes = [...hermesPush._clients.values()].some(sids => sids.has(sid));
+      if (!hasExt && !hasHermes) {
+        _commandHistory.delete(sid);
       }
     }
     // Evict sessions that have been disconnected past SESSION_TTL_MS
@@ -1420,8 +1483,9 @@ const wss = new WebSocketServer(wssOptionsWithPing);
         wsUrl: `${proto}://localhost:${serverPort}`,
         hermesWsUrl: `${proto}://localhost:${serverPort}/hermes`,
         // Fix #21: Expose connected extension metadata so Hermes can detect version mismatches
-        extensions: [...sessionMeta.values()].map(m => ({
-          sessionId: m.sessionId,
+        // Fix #2: sessionMetaInfo keys are sessionIds — use .entries() to get both key and value
+        extensions: [...sessionMetaInfo.entries()].map(([sessionId, m]) => ({
+          sessionId,
           extension: m.extension,
           version: m.version,
           tabId: m.tabId,
@@ -1633,7 +1697,9 @@ const wss = new WebSocketServer(wssOptionsWithPing);
         const existing = idempotencyCache.check(sessionId, idempotencyKey, body);
         if (existing.duplicate) {
           metrics.counters.idempotencyRejections++;
-          metricIncr('idempotencyRejections');
+          // Fix #11: Removed dead metricIncr('idempotencyRejections') call —
+          // metricIncr() with no tags creates metrics.counters.idempotencyRejections['']
+          // instead of incrementing the counter itself. Direct ++ above is correct.
           log('info', 'Duplicate command rejected (idempotency)', { reqId, sessionId, idempotencyKey, existingCmdId: existing.existingCmdId });
           jsonResponse(res, 200, {
             cmdId: existing.existingCmdId,
@@ -1712,10 +1778,35 @@ const wss = new WebSocketServer(wssOptionsWithPing);
 
     // ── GET /dashboard ─────────────────────────────────────────────────────────
     if (req.method === 'GET' && path === '/dashboard') {
+      // Fix #5: Require HTTP auth — dashboard exposes all session URLs and command history
+      const auth = validateHttpAuth(req);
+      if (!auth.authorized) {
+        jsonResponse(res, 401, { error: 'Unauthorized', reason: auth.reason });
+        return;
+      }
+
+      // Fix #4: HTML-escape all user-controlled fields to prevent XSS
+      const _e = (s) => String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+
       const sessions = Array.from(sessionSockets.entries()).map(([sid, ws]) => {
         const state = pageMirror.getState(sid);
         const cmdHistory = _getHistory(sid).slice(0, 5);
-        return { sessionId: sid, connected: ws.readyState === 1, url: state.url || '', title: state.title || '', lastUpdate: state.lastUpdate || 0, recentCommands: cmdHistory };
+        return {
+          sessionId: _e(sid),
+          connected: ws.readyState === 1,
+          url: _e(state.url || ''),
+          title: _e(state.title || ''),
+          lastUpdate: state.lastUpdate || 0,
+          recentCommands: cmdHistory.map(c => ({
+            ...c,
+            result: _e(c.result || ''),
+            error: _e(c.error || '')
+          }))
+        };
       });
       const activeSessionIds = Array.from(sessionSockets.keys());
       const dashHtml = `<!DOCTYPE html>

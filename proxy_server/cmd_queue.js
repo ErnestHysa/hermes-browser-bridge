@@ -145,6 +145,8 @@ class CommandQueue extends EventEmitter {
     // Fix #9: Rebuild _completedOrder to match what remains in completed
     const validIds = new Set(this.completed.keys());
     this._completedOrder = this._completedOrder.filter(cmdId => validIds.has(cmdId));
+    // Fix #15: Also enforce MAX_COMPLETED cap after pruning by age
+    this._capCompleted();
   }
 
   /** Pending command count. */

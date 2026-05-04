@@ -350,11 +350,14 @@ function updateBadge(color) {
 
 function notifyPopup(data) {
   // Fix #13: Log unexpected errors from notifyPopup instead of silently swallowing all.
+  // Fix #24: Use optional chaining to safely check error messages — string matching
+  // on browser.runtime.lastError is fragile (message text varies across Safari versions).
   browser.runtime.sendMessage({ ...data, from: 'background' }).catch((err) => {
-    // "Could not establish connection" is expected when popup is closed — don't log it
-    const msg = err?.message || browser.runtime.lastError?.message || '';
+    // "Could not establish connection" is the expected error when popup is closed.
+    // Only suppress this specific error; all others should be visible in the console.
+    const msg = err?.message || '';
     if (!msg.includes('Could not establish connection')) {
-      console.warn('[Hermes Bridge] notifyPopup failed:', msg);
+      console.warn('[Hermes Bridge] notifyPopup failed:', msg || err);
     }
   });
 }

@@ -41,10 +41,6 @@ const PER_SESSION_RATE_LIMIT = parseInt(process.env.HBS_PER_SESSION_RATE_LIMIT |
 const MAX_BODY_BYTES = parseInt(process.env.HBS_MAX_BODY_BYTES || (1 * 1024 * 1024).toString(), 10);
 const MAX_HTML_BYTES = parseInt(process.env.HBS_MAX_HTML_BYTES || (10 * 1024 * 1024).toString(), 10);
 
-// ─── Logging ───────────────────────────────────────────────────────────────────
-
-const LOG_LEVEL = process.env.HBS_LOG_LEVEL || 'info';  // 'debug' | 'info' | 'warn' | 'error'
-
 module.exports = {
   RATE_LIMIT_RPS,
   RATE_LIMIT_BURST,
@@ -57,6 +53,5 @@ module.exports = {
   SESSION_TIMEOUT_MS,
   PER_SESSION_RATE_LIMIT,
   MAX_BODY_BYTES,
-  MAX_HTML_BYTES,
-  LOG_LEVEL,
+  MAX_HTML_BYTES
 };

@@ -45,18 +45,7 @@ function startHttp() {
     log('info', 'Hermes Browser Bridge proxy running (HTTP)', { port: PORT, host: HOST, mode: 'http' });
     log('info', 'HTTP REST server started', { addr: `http://${HOST}:${PORT}` });
     log('info', 'WebSocket server started', { addr: `ws://${HOST}:${PORT}` });
-    log('info', 'Registered HTTP endpoints:', { endpoints: ['GET /health', 'GET /metrics', 'GET /sessions', 'POST /sessions/:id/activate', 'GET /page_state', 'POST /command', 'GET /command/:cmdId', 'DELETE /command/:cmdId', 'GET /last_seq', 'GET /commands/history', 'GET /config', 'WS / (extension)', 'WS /hermes (Hermes)'] });
-
-
-
-
-
-
-
-
-
-    log('info', 'Extension WebSocket endpoint', { addr: `ws://${HOST}:${PORT}` });
-    log('info', 'Hermes Agent WebSocket endpoint', { addr: `ws://${HOST}:${PORT}/hermes` });
+    // Fix #24: WS endpoints already listed above — removed duplicate single-property WS logs
   });
 
   httpServer.on('error', (err) => {
@@ -99,17 +88,6 @@ function startHttps() {
   // Fix #20: Check certificate expiry on startup to prevent cryptic connection failures
   try {
     const certObj = tlsOptions.cert;
-    const certLines = certObj.split('\n');
-    let certBase64 = '';
-    let inCert = false;
-    for (const line of certLines) {
-      if (line === '-----BEGIN CERTIFICATE-----') inCert = true;
-      if (inCert && !line.startsWith('-----')) certBase64 += line.trim();
-      if (line === '-----END CERTIFICATE-----') break;
-    }
-    const certBuffer = Buffer.from(certBase64, 'base64');
-    const asn1 = certBuffer;
-    // Certificate expiry is at index offset in ASN.1 structure — use Node's crypto instead
     const { X509Certificate } = require('node:crypto');
     const x509 = new X509Certificate(certObj);
     const notBefore = x509.validFrom;
@@ -138,16 +116,7 @@ function startHttps() {
     log('info', 'WSS server started', { addr: `wss://${HOST}:${PORT}` });
     log('warn', 'Using self-signed TLS certificate — browser will show a security warning');
     log('info', 'Install ../certificates/ca.crt into Keychain to suppress the warning');
-    log('info', 'Registered HTTP endpoints:', { endpoints: ['GET /health', 'GET /metrics', 'GET /sessions', 'POST /sessions/:id/activate', 'GET /page_state', 'POST /command', 'GET /command/:cmdId', 'DELETE /command/:cmdId', 'GET /last_seq', 'GET /commands/history', 'GET /config', 'WS / (extension)', 'WS /hermes (Hermes)'] });
-
-
-
-
-
-
-
-
-
+    // Fix #24: WS endpoints already listed above — removed duplicate single-property WS logs
   });
 
   httpServer.on('error', (err) => {

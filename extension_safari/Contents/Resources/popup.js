@@ -141,8 +141,12 @@ function onBgMessage(msg) {
     const lastUrl = sessionStorage.getItem('hermes_last_url');
     setState('active', { url: lastUrl || undefined });
   } else if (msg.event === 'disconnected') {
+    pendingCmdId = null;  // Fix #7: clear stale cmdId so cancel button doesn't persist
+    cancelBtn?.classList.add('hidden');
     setState('inactive');
   } else if (msg.event === 'tab_activated') {
+    pendingCmdId = null;  // Fix #12: clear stale cmdId when switching tabs
+    cancelBtn?.classList.add('hidden');
     sessionStorage.setItem('hermes_last_url', msg.url);
     setState('active', { url: msg.url });
   } else if (msg.event === 'error') {

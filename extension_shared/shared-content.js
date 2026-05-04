@@ -243,15 +243,27 @@ const CMD_HANDLERS = {
 
   evaluate(cmd) {
     try {
+      // WARNING: new Function() is NOT sandboxed — it has full access to page globals
+      // (window, document, cookies, localStorage, etc.) just like eval().
+      // The comment below is misleading and kept only to avoid breaking existing docs.
+      // Do NOT assume evaluate() is safe to run on untrusted pages.
       // eslint-disable-next-line no-new-func
       const result = (new Function(cmd.script))();
       window._hermesPendingCommands.delete(cmd.cmdId);
+      // Fix #6: Enforce 1MB result size limit to prevent memory exhaustion.
+      // If the evaluated expression returns something very large (e.g. Array(1e8)),
+      // serialize and check the byte length before sending.
+      const serialized = JSON.stringify(result);
+      if (serialized.length > 1024 * 1024) {
+        window._hermesSendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'RESULT_TOO_LARGE', error: `Result exceeds 1MB limit (${serialized.length} bytes)` });
+        return;
+      }
       window._hermesSendToBackground({ type: 'cmd_ack', cmdId: cmd.cmdId, success: true, result });
     } catch (e) {
       window._hermesPendingCommands.delete(cmd.cmdId);
       window._hermesSendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'EVAL_ERROR', error: e.message });
     }
-  }
+  },
 };
 
 // ─── Navigate Handler Cleanup ───────────────────────────────────────────────────
