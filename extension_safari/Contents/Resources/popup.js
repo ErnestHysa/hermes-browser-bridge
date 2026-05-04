@@ -13,6 +13,11 @@ const DEFAULT_PROXY_PORT = 9321;
 const MAX_CMD_LOG = 5;
 const CMD_LOG_KEY = 'hermes_cmd_log'; // Fix #22: localStorage key for persistence
 
+// ─── Popup state ───────────────────────────────────────────────────────────
+// Fix #3: Track initialization and hidden state to prevent listener accumulation
+let _popupInitialized = false;
+let _popupHidden = false;
+
 // ─── DOM refs ────────────────────────────────────────────────────────────────
 
 const statusDot    = document.getElementById('status-dot');
@@ -281,6 +286,10 @@ function onDashboardLinkClick(e) {
 }
 
 async function init() {
+  // Fix #3: Guard against double-init if popup is reopened after being hidden
+  if (_popupInitialized) return;
+  _popupInitialized = true;
+
   setState('inactive');
   loadCmdLog(); // Fix #22: restore persisted command log
   renderCmdLog(); // Render loaded log on startup
@@ -303,12 +312,10 @@ async function init() {
   activateBtn.addEventListener('click', onActivateClick);
   disconnectBtn.addEventListener('click', onDisconnectClick);
   refreshBtn.addEventListener('click', onRefreshClick);
-  cancelBtn.addEventListener('click', onCancelClick);  // Fix #13
-
-  // Fix #20: Register keyboard shortcuts
+  cancelBtn.addEventListener('click', onCancelClick); // Fix #13
   document.addEventListener('keydown', onKeyDown);
 
-  // Fix #21: Dashboard link - open in new tab (named function for cleanup)
+  // Fix #3: Dashboard link - open in new tab (named function for cleanup)
   if (dashboardLink) {
     dashboardLink.addEventListener('click', onDashboardLinkClick);
   }
@@ -316,6 +323,7 @@ async function init() {
   // P1-6: Cleanup on popup visibility change (covers close, tab switch, etc.)
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') {
+      _popupHidden = true;
       // Remove listeners to prevent accumulation
       browser.runtime.onMessage.removeListener(onBgMessage);
       activateBtn.removeEventListener('click', onActivateClick);
@@ -327,11 +335,25 @@ async function init() {
       if (dashboardLink) {
         dashboardLink.removeEventListener('click', onDashboardLinkClick);
       }
+    } else if (document.visibilityState === 'visible' && _popupHidden) {
+      // Fix #3: Popup was hidden and is now visible again — restore all listeners
+      _popupHidden = false;
+      browser.runtime.onMessage.addListener(onBgMessage);
+      activateBtn.addEventListener('click', onActivateClick);
+      disconnectBtn.addEventListener('click', onDisconnectClick);
+      refreshBtn.addEventListener('click', onRefreshClick);
+      cancelBtn.addEventListener('click', onCancelClick);
+      document.addEventListener('keydown', onKeyDown);
+      if (dashboardLink) {
+        dashboardLink.addEventListener('click', onDashboardLinkClick);
+      }
     }
   });
 
   // P1-6: Also clean up on pagehide (Safari's equivalent of beforeunload)
   window.addEventListener('pagehide', () => {
+    _popupInitialized = false;
+    _popupHidden = false;
     browser.runtime.onMessage.removeListener(onBgMessage);
     activateBtn.removeEventListener('click', onActivateClick);
     disconnectBtn.removeEventListener('click', onDisconnectClick);

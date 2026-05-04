@@ -14,6 +14,21 @@
 
 const DEFAULT_PROXY_PORT = 9321;
 
+// Fix #15: Minimal structured logger — one JSON object per line, matching proxy server format.
+// Critical WS lifecycle and error paths use this; info-level calls remain as console.log for now.
+function hbsLog(level, msg, extras = {}) {
+  const entry = {
+    t: new Date().toISOString(),
+    ext: 'safari',
+    lvl: level,
+    msg,
+    ...extras
+  };
+  if (level === 'error') console.error('[Hermes]', JSON.stringify(entry));
+  else if (level === 'warn') console.warn('[Hermes]', JSON.stringify(entry));
+  else console.log('[Hermes]', JSON.stringify(entry));
+}
+
 // M4: Configurable proxy port — defaults to 9321, can be updated at runtime
 let _proxyPort = DEFAULT_PROXY_PORT;
 
@@ -23,7 +38,10 @@ function getProxyWsUrl() {
 
 // Fix #18/#32: Removed stale `const PROXY_WS_URL = getProxyWsUrl()` — the const was
 // never used (site of first WS call already uses getProxyWsUrl() directly).
-const RECONNECT_DELAY_MS = 2000;
+const MAX_RECONNECT_DELAY_MS = 30000;
+// Fix #6: Exponential backoff state — attempt count and current delay
+let _reconnectAttempt = 0;
+let _reconnectDelay = 2000;
 const MAX_PENDING_MESSAGES = 50;
 const HEALTH_POLL_INTERVAL_MS = 10000;
 
@@ -83,6 +101,9 @@ function connect() {
   socket.addEventListener('open', () => {
     connected = true;
     backpressurePaused = false; // P2-8
+    // Fix #6: Reset exponential backoff on successful connection
+    _reconnectAttempt = 0;
+    _reconnectDelay = 2000;
     updateBadge('green');
     startHealthPoll();
     // C2: Send hello with auth token so proxy knows this is a legitimate extension
@@ -119,7 +140,7 @@ function connect() {
       const cmd = JSON.parse(event.data);
       handleProxyMessage(cmd);
     } catch (e) {
-      console.error('[Hermes Bridge] Failed to parse proxy message:', e);
+      hbsLog('error', 'Failed to parse proxy message', { err: e?.message });
     }
   });
 
@@ -130,7 +151,7 @@ function connect() {
     stopHealthPoll();
     notifyPopup({ event: 'disconnected' });
     if (reconnectTimer) clearTimeout(reconnectTimer);
-    reconnectTimer = setTimeout(connect, RECONNECT_DELAY_MS);
+    reconnectTimer = setTimeout(scheduleReconnect, 100);
   });
 
   socket.addEventListener('error', () => {
@@ -151,6 +172,17 @@ function sendToProxy(msg) {
     pendingMessages.push({ ...msg, sessionId: SESSION_ID });
     connect();
   }
+}
+
+// ─── WebSocket reconnect with exponential backoff ───────────────────────────
+
+// Fix #6: Exponential backoff with jitter — call this instead of connect() directly
+function scheduleReconnect() {
+  const delay = Math.min(_reconnectDelay + Math.random() * 1000, MAX_RECONNECT_DELAY_MS);
+  _reconnectDelay = Math.min(_reconnectDelay * 2, MAX_RECONNECT_DELAY_MS);
+  _reconnectAttempt++;
+  console.log(`[Hermes Bridge] Reconnecting in ${Math.round(delay)}ms (attempt ${_reconnectAttempt})`);
+  reconnectTimer = setTimeout(connect, delay);
 }
 
 // ─── Health polling ─────────────────────────────────────────────────────────
@@ -205,7 +237,7 @@ function forwardCommandToTab(tabId, cmd) {
       if (attemptNum < MAX_RETRIES) {
         setTimeout(() => attempt(attemptNum + 1), RETRY_DELAY_MS * (attemptNum + 1));
       } else {
-        console.error(`[Hermes Bridge] Command ${cmd.type} (${cmd.cmdId}) could not be delivered`);
+        hbsLog('error', `Command ${cmd.type} (${cmd.cmdId}) could not be delivered`, { err: err?.message });
         const errorMsg = `Tab not ready: ${err.message || 'delivery failed'}`;
         // Also notify the extension's background via browser.runtime so Hermes sees it
         browser.runtime.sendMessage({
@@ -361,7 +393,7 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === '_navigate') {
     if (currentTabId !== null) {
       browser.tabs.update(currentTabId, { url: message.url }).catch((err) => {
-        console.error('[Hermes Bridge] browser.tabs.update failed:', err.message);
+        hbsLog('error', 'browser.tabs.update failed', { err: err?.message });
         browser.tabs.sendMessage(currentTabId, {
           type: 'cmd_error',
           cmdId: message.cmdId,
@@ -430,7 +462,7 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   // P1-6: content_error forwarded to popup
   if (message.type === 'content_error') {
-    console.error(`[Hermes Bridge] Content script error: ${message.message}`);
+    hbsLog('error', `Content script error: ${message.message}`);
     notifyPopup({ event: 'error', message: `Content error: ${message.message}` });
     return true;
   }

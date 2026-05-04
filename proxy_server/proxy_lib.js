@@ -51,9 +51,16 @@ function _getHistory(sessionId) {
  * @param {{cmdId: string, type: string, status: string, result?: string, error?: string, ts: number}} entry
  */
 function _pushHistory(sessionId, entry) {
-  const hist = _getHistory(sessionId);
+  const hist = _commandHistory.get(sessionId) || [];
   hist.unshift(entry);
   if (hist.length > CMD_HISTORY_MAX) hist.splice(CMD_HISTORY_MAX);
+  _commandHistory.set(sessionId, hist);
+  // Fix #16: Prune history for disconnected sessions to prevent unbounded Map growth
+  for (const [sid] of _commandHistory) {
+    if (!sessionSockets.has(sid) && !_wssHermes?._clients?.has(sid)) {
+      _commandHistory.delete(sid);
+    }
+  }
 }
 
 const { CommandQueue } = require('./cmd_queue');
@@ -765,6 +772,8 @@ function createProxy({ httpServer, tlsOptions, version }) {
   /** @type {Map<string, RateLimiter>} */
   const rateLimiters = new Map();
   const sessionMeta = new Map(); // sessionId → { limiter, lastSeen }
+  // Fix #5: Store extension session metadata (version, tabId, userAgent) per session
+  const sessionMetaInfo = new Map(); // sessionId → { version?, tabId?, userAgent?, connectedAt: number }
 
   function getSessionMeta(sessionId) {
     if (!sessionMeta.has(sessionId)) {
@@ -1127,7 +1136,8 @@ const wss = new WebSocketServer(wssOptionsWithPing);
       }
 
       // Fix #12: Warn when falling back to 'default' sessionId — masks config errors
-      const sessionId = msg.sessionId || _warnDefault('sessionId', msg.sessionId);
+      // Fix #4: Only warn once — don't call _warnDefault (which also logs) and then log again
+      const sessionId = msg.sessionId || 'default';
       if (!msg.sessionId) {
         log('warn', 'Extension WS sent no sessionId — falling back to default', { reqId });
       }
@@ -1160,8 +1170,14 @@ const wss = new WebSocketServer(wssOptionsWithPing);
 
         case 'session_info':
           // S3: Extension sends session metadata on connect
+          // Fix #5: Store metadata so it's accessible via GET /sessions/:id
           log('info', `session_info from extension`, { reqId, sessionId, version: msg.version, tabId: msg.tabId });
-          // No response needed — session is already tracked via the hello handshake
+          sessionMetaInfo.set(sessionId, {
+            version: msg.version || null,
+            tabId: msg.tabId || null,
+            userAgent: msg.userAgent || null,
+            connectedAt: Date.now()
+          });
           break;
 
         case 'cmd_ack': {
@@ -1204,7 +1220,6 @@ const wss = new WebSocketServer(wssOptionsWithPing);
               // S3: Record in command history
               _pushHistory(sessionId, { cmdId: msg.cmdId, type: cmdEntry.cmd.type, status: 'error', error: String(msg.error || 'Unknown error').slice(0, 200), ts: Date.now() });
             }
-            metricIncr('commands', { status: 'error' });
           }
 
           // H1: Route cmd_error to the specific Hermes WS client that issued this command
@@ -1235,7 +1250,8 @@ const wss = new WebSocketServer(wssOptionsWithPing);
         if (sws === ws) {
           sessionSockets.delete(sid);
           pageMirror.disconnectSession(sid);
-          sessionMeta.delete(sid);
+          sessionMeta.delete(sid);       // Fix #13: clean up sessionMeta on disconnect
+          sessionMetaInfo.delete(sid);   // Fix #13: clean up sessionMetaInfo on disconnect
           metricGauge('connectedSessions', sessionSockets.size);
           log('info', 'Extension WS session disconnected', { reqId, sessionId: sid });
           break;
@@ -1275,6 +1291,7 @@ const wss = new WebSocketServer(wssOptionsWithPing);
           pageMirror.disconnectSession(sid);
         }
         sessionMeta.delete(sid);
+        sessionMetaInfo.delete(sid);  // Fix #13: clean up sessionMetaInfo on eviction
         metricGauge('connectedSessions', sessionSockets.size);
       }
     }
@@ -1378,7 +1395,11 @@ const wss = new WebSocketServer(wssOptionsWithPing);
         } catch (e) { clearInterval(metricsInterval); }
       }, 1000);
 
-      req.on('close', () => clearInterval(metricsInterval));
+      // Fix #9: Decrement SSE stream counter when client disconnects
+      req.on('close', () => {
+        clearInterval(metricsInterval);
+        metrics.counters.sseStreams = Math.max(0, (metrics.counters.sseStreams || 0) - 1);
+      });
       metrics.counters.sseStreams++;
       return;
     }
@@ -1398,6 +1419,14 @@ const wss = new WebSocketServer(wssOptionsWithPing);
         backpressureActive: metrics.gauges.backpressureActive === 1,
         wsUrl: `${proto}://localhost:${serverPort}`,
         hermesWsUrl: `${proto}://localhost:${serverPort}/hermes`,
+        // Fix #21: Expose connected extension metadata so Hermes can detect version mismatches
+        extensions: [...sessionMeta.values()].map(m => ({
+          sessionId: m.sessionId,
+          extension: m.extension,
+          version: m.version,
+          tabId: m.tabId,
+          connectedAt: m.connectedAt
+        }))
       });
       return;
     }
@@ -1454,6 +1483,7 @@ const wss = new WebSocketServer(wssOptionsWithPing);
         return;
       }
       const state = pageMirror.getState(sid);
+      const meta = sessionMetaInfo.get(sid) || {};
       jsonResponse(res, 200, {
         sessionId: sid,
         connected: ws.readyState === 1,
@@ -1461,6 +1491,11 @@ const wss = new WebSocketServer(wssOptionsWithPing);
         title: state.title || '',
         lastUpdate: state.lastUpdate || 0,
         mutationsPending: state.mutations ? state.mutations.length : 0,
+        // Fix #5: Expose stored session metadata
+        extensionVersion: meta.version || null,
+        tabId: meta.tabId || null,
+        userAgent: meta.userAgent || null,
+        connectedAt: meta.connectedAt || null,
       });
       return;
     }
@@ -1563,6 +1598,29 @@ const wss = new WebSocketServer(wssOptionsWithPing);
       if (!validTypes.includes(type)) {
         jsonResponse(res, 400, { error: `Invalid type. Must be one of: ${validTypes.join(', ')}` });
         return;
+      }
+
+      // Fix #12: Validate selector to prevent querySelector crashes in the content script.
+      // Only types that pass a selector to document.querySelector need validation.
+      const selectorTypes = ['click', 'type', 'submit'];
+      if (selectorTypes.includes(type)) {
+        if (!selector || typeof selector !== 'string' || selector.trim() === '') {
+          jsonResponse(res, 400, { error: `Missing or invalid 'selector' field for '${type}' command` });
+          return;
+        }
+        // Reject selectors that would be dangerous in querySelector (e.g. closing tags)
+        if (/<\//.test(selector)) {
+          jsonResponse(res, 400, { error: `Invalid selector: cannot contain HTML tag syntax` });
+          return;
+        }
+      }
+
+      // Fix #14: Validate script field for evaluate commands
+      if (type === 'evaluate') {
+        if (!script || typeof script !== 'string') {
+          jsonResponse(res, 400, { error: `Missing or invalid 'script' field for 'evaluate' command` });
+          return;
+        }
       }
 
       if (!pageMirror.connected) {
@@ -1710,7 +1768,7 @@ ${sessions.map(s => `
   <div class="card">
     <div class="card-header">
       <span class="status-dot ${s.connected ? 'connected' : 'disconnected'}"></span>
-      <span class="card-title">${s.sessionId.slice(0, 16)}…</span>
+      <span class="card-title" title="${s.sessionId}">${s.sessionId}</span>
     </div>
     <div class="card-url">${s.url || '—'}</div>
     ${s.recentCommands.length > 0 ? `
@@ -1740,7 +1798,12 @@ setInterval(refresh, 5000);
 </script>
 </body>
 </html>`;
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'X-Content-Type-Options': 'nosniff' });
+      // Fix #10: Add Content-Security-Policy header to prevent XSS in dashboard
+      res.writeHead(200, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'X-Content-Type-Options': 'nosniff',
+        'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'"
+      });
       res.end(dashHtml);
       return;
     }

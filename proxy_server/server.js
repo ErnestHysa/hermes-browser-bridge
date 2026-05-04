@@ -96,6 +96,39 @@ function startHttps() {
     process.exit(1);
   }
 
+  // Fix #20: Check certificate expiry on startup to prevent cryptic connection failures
+  try {
+    const certObj = tlsOptions.cert;
+    const certLines = certObj.split('\n');
+    let certBase64 = '';
+    let inCert = false;
+    for (const line of certLines) {
+      if (line === '-----BEGIN CERTIFICATE-----') inCert = true;
+      if (inCert && !line.startsWith('-----')) certBase64 += line.trim();
+      if (line === '-----END CERTIFICATE-----') break;
+    }
+    const certBuffer = Buffer.from(certBase64, 'base64');
+    const asn1 = certBuffer;
+    // Certificate expiry is at index offset in ASN.1 structure — use Node's crypto instead
+    const { X509Certificate } = require('node:crypto');
+    const x509 = new X509Certificate(certObj);
+    const notBefore = x509.validFrom;
+    const notAfter = x509.validTo;
+    const now = new Date();
+    const expiresAt = new Date(notAfter);
+    const daysUntilExpiry = Math.floor((expiresAt - now) / (1000 * 60 * 60 * 24));
+    if (daysUntilExpiry < 0) {
+      log('error', 'TLS certificate has EXPIRED', { expiredAt: notAfter, expiredDaysAgo: Math.abs(daysUntilExpiry) });
+      process.exit(1);
+    } else if (daysUntilExpiry < 30) {
+      log('warn', 'TLS certificate expires soon', { expiresAt: notAfter, daysRemaining: daysUntilExpiry });
+    } else {
+      log('info', 'TLS certificate loaded', { expiresAt: notAfter, daysRemaining: daysUntilExpiry });
+    }
+  } catch (e) {
+    log('warn', 'Could not verify TLS certificate expiry', { err: e.message });
+  }
+
   const httpServer = https.createServer(tlsOptions);
   const proxy = createProxy({ httpServer, tlsOptions, version: PKG_VERSION });
 

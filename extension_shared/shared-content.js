@@ -86,8 +86,10 @@ function sanitizePasswordInputs(html) {
 
 function getFullPageSnapshot() {
   try {
-    let html = document.documentElement.outerHTML;
-    html = sanitizePasswordInputs(html);
+    // Fix #19: Use XMLSerializer instead of outerHTML — outerHTML can miss
+    // dynamically added attributes or modified values that haven't been
+    // serialized back to the HTML source. XMLSerializer reads the live DOM state.
+    const html = sanitizePasswordInputs(new XMLSerializer().serializeToString(document));
     return {
       url: window.location.href,
       title: document.title,
@@ -270,6 +272,14 @@ function clearNavigateHandlers() {
     window.HermesShared._navigateFailTimer = null;
   }
 }
+
+// Fix #7: Also clean up navigate handlers and pending commands when the user
+// navigates away manually (e.g. typing a new URL, clicking a link, or submitting a form).
+// This prevents stale cmdIds from accumulating in _hermesPendingCommands.
+window.addEventListener('beforeunload', () => {
+  window.HermesShared.clearNavigateHandlers();
+  window._hermesPendingCommands.clear();
+});
 
 // ─── Expose on window.HermesShared ────────────────────────────────────────────
 

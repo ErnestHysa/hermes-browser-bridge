@@ -1,26 +1,45 @@
 /**
  * background.js — Chrome Extension Service Worker (Manifest V3)
  * Bridges the Safari extension's content+background architecture to Chrome.
- * 
+ *
  * Key differences from Safari:
  * - Uses chrome.tabs instead of browser.tabs
  * - Service worker instead of persistent background page
  * - chrome.runtime.sendNativeMessage for potential native messaging
- * 
+ *
  * Fix #P2-7: Full Chrome extension implementation for parity with Safari.
  */
 
 const DEFAULT_PROXY_PORT = 9321;
 
+// Fix #15: Minimal structured logger — one JSON object per line, same format as proxy server.
+// Only 'info' and 'warn'/'error' are used in extensions (no log-level filtering).
+function hbsLog(level, msg, extras = {}) {
+  const entry = {
+    t: new Date().toISOString(),
+    ext: 'chrome',
+    lvl: level,
+    msg,
+    ...extras
+  };
+  if (level === 'error') console.error('[Hermes]', JSON.stringify(entry));
+  else if (level === 'warn') console.warn('[Hermes]', JSON.stringify(entry));
+  else console.log('[Hermes]', JSON.stringify(entry));
+}
+
 // Fix #5: Configurable proxy port — declared at module scope so setProxyPort works
 let _proxyPort = DEFAULT_PROXY_PORT;
 
+// Fix #6: Use _proxyPort dynamically so runtime port changes take effect
 function getProxyWsUrl() {
-  return `ws://localhost:${DEFAULT_PROXY_PORT}`;
+  return `ws://localhost:${_proxyPort}`;
 }
 
 const PROXY_WS_URL = getProxyWsUrl();
-const RECONNECT_DELAY_MS = 2000;
+const MAX_RECONNECT_DELAY_MS = 30000;
+// Fix #6: Exponential backoff state: attempt count and current delay
+let _reconnectAttempt = 0;
+let _reconnectDelay = 2000;
 const MAX_PENDING_MESSAGES = 50;
 const HEALTH_POLL_INTERVAL_MS = 10000;
 
@@ -65,9 +84,10 @@ function connect() {
   }
 
   try {
-    socket = new WebSocket(PROXY_WS_URL);
+    // Fix #6: Call getProxyWsUrl() each time so runtime _proxyPort changes are respected
+    socket = new WebSocket(getProxyWsUrl());
   } catch (e) {
-    console.error('[Hermes Bridge] WebSocket creation failed:', e);
+    hbsLog('error', 'WebSocket creation failed', { err: e?.message });
     scheduleReconnect();
     return;
   }
@@ -75,6 +95,9 @@ function connect() {
   socket.addEventListener('open', () => {
     connected = true;
     backpressurePaused = false;
+    // Fix #6: Reset exponential backoff on successful connection
+    _reconnectAttempt = 0;
+    _reconnectDelay = 2000;
     updateBadge('green');
     startHealthPoll();
     // C2: Send hello with auth token so proxy knows this is a legitimate extension
@@ -124,7 +147,7 @@ function connect() {
       const cmd = JSON.parse(event.data);
       handleProxyMessage(cmd);
     } catch (e) {
-      console.error('[Hermes Bridge] Failed to parse proxy message:', e);
+      hbsLog('error', 'Failed to parse proxy message', { err: e?.message });
     }
   });
 
@@ -146,7 +169,12 @@ function connect() {
 
 function scheduleReconnect() {
   if (reconnectTimer) clearTimeout(reconnectTimer);
-  reconnectTimer = setTimeout(connect, RECONNECT_DELAY_MS);
+  // Fix #6: Exponential backoff with jitter — cap at MAX_RECONNECT_DELAY_MS
+  const delay = Math.min(_reconnectDelay + Math.random() * 1000, MAX_RECONNECT_DELAY_MS);
+  _reconnectDelay = Math.min(_reconnectDelay * 2, MAX_RECONNECT_DELAY_MS);
+  _reconnectAttempt++;
+  console.log(`[Hermes Bridge] Reconnecting in ${Math.round(delay)}ms (attempt ${_reconnectAttempt})`);
+  reconnectTimer = setTimeout(connect, delay);
 }
 
 function sendToProxy(msg) {
