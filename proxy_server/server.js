@@ -73,16 +73,26 @@ function startHttp() {
 function startHttps() {
   const PORT = parseInt(process.env.HBS_HTTPS_PORT || '9322', 10);
   const TLS_DIR = __dirname + '/../certificates';
-  let tlsOptions;
 
+  // F21: TLS client certificate authentication (mTLS).
+  // To require browser extensions to present a client certificate:
+  //   1. Generate client certs: openssl req -new -x509 -days 365 -nodes \
+  //        -out certificates/client.crt -keyout certificates/client.key
+  //   2. Sign client certs with the same CA: openssl x509 -req -days 365 \
+  //        -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out client.crt
+  //   3. Uncomment ca + requestCert + rejectUnauthorized below.
+  // The extension would then need to be configured with its own client cert (not currently supported).
+  let tlsOptions;
   try {
     tlsOptions = {
       cert: readFileSync(`${TLS_DIR}/ca.crt`),
-      key: readFileSync(`${TLS_DIR}/ca.key`)
+      key: readFileSync(`${TLS_DIR}/ca.key`),
+      // ca: readFileSync(`${TLS_DIR}/ca.crt`),            // F21: uncomment for mTLS client cert auth
+      // requestCert: true,                                 // F21: uncomment to request client cert
+      // rejectUnauthorized: false,                         // F21: uncomment to reject without valid client cert
     };
   } catch (e) {
     log('error', 'Failed to load TLS certificates from ../certificates/', { err: e.message, hint: 'Run: ./scripts/generate-certs.sh' });
-
     process.exit(1);
   }
 

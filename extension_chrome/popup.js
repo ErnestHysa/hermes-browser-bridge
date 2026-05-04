@@ -34,7 +34,14 @@ try {
 } catch {}
 
 let state = 'inactive';
-let cmdLog = []; // Fix #22: loaded from localStorage in loadCmdLog()
+let cmdLog = []; // F23: Detect system dark/light mode preference and apply --dark-* CSS variables
+// from popup.css. Class 'dark' on <body> activates dark theme variables.
+function applyTheme() {
+  const isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+  document.body.classList.toggle('dark', isDark);
+}
+applyTheme();
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyTheme);
 // F9: pendingCmdId kept — needed for stale-response filtering (cmd_done/cmd_error guard).
 let pendingCmdId = null;
 

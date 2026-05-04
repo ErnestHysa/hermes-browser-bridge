@@ -1114,15 +1114,10 @@ const wss = new WebSocketServer(wssOptionsWithPing);
       }
     }, 5000);
 
-    // P3-15: Improved origin validation — 'null' is Safari's file:// context
+    // F20: Origin validation — uses configurable ALLOWED_ORIGINS list from config.js.
+    // Safari file:// pages send origin 'null' — always allowed.
     const origin = req.headers['origin'];
-    const validOrigins = [
-      'null',                          // Safari file:// context
-      'http://localhost',
-      'http://localhost:9321',
-      'http://127.0.0.1',
-      'http://127.0.0.1:9321',
-    ];
+    const validOrigins = config.ALLOWED_ORIGINS;
     if (origin && !validOrigins.includes(origin)) {
       log('warn', 'WS connection rejected — unauthorized origin', { reqId, origin, remoteIp });
       ws.close(1008, 'Unauthorized origin');
@@ -1344,6 +1339,22 @@ const wss = new WebSocketServer(wssOptionsWithPing);
     cmdQueue.prune(60000);
     idempotencyCache.prune();
     metricGauge('pendingCommands', cmdQueue.size);
+
+    // F26: Session eviction has TWO separate paths that work together:
+    //
+    // Path 1 — WebSocket close (ws.on('close') at ~line 1311):
+    //   Triggered when the extension's browser tab closes or the WS is severed.
+    //   Cleans up: sessionSockets, pageMirror, sessionMeta, sessionMetaInfo, hermesPush.
+    //   This is the normal/tear-down path.
+    //
+    // Path 2 — Prune interval (below, runs every 30s):
+    //   Triggered by inactivity timeout SESSION_TIMEOUT_MS or when the command history
+    //   has orphaned entries (no extension WS AND no Hermes subscriber).
+    //   Handles: unclean disconnects (Path 1 skipped), stale history, zombie sessions.
+    //
+    // Both paths call hermesPush._removeSession(sid) to notify Hermes clients.
+    // This two-path strategy ensures no resource leaks even on hard browser kills.
+
     // Fix #10: Evict sessions that have been inactive past SESSION_TIMEOUT_MS
     const now = Date.now();
     for (const [sid, meta] of sessionMeta) {
@@ -1966,9 +1977,14 @@ setInterval(refresh, 5000);
   return { httpServer, wss, pageMirror, cmdQueue, shutdown, hermesPush };
 }
 
+// F25: Export hermesPush internals for testing — allows test scripts to inject fake
+// Hermes clients and verify session routing without a real Hermes agent connection.
+// Usage in tests: const { hermesPush } = require('./proxy_lib'); hermesPush._addSession(sid, fakeWs);
 module.exports = {
   /** @type {typeof createProxy} */
   createProxy,
   /** @type {typeof RateLimiter} */
   RateLimiter,
+  /** @type {hermesPush} Internal push client for Hermes agent subscriptions (F25) */
+  hermesPush,
 };
