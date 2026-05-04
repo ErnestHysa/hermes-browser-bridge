@@ -29,7 +29,8 @@ const cmdCount     = document.getElementById('cmd-count');
 
 try {
   const manifest = browser.runtime.getManifest();
-  versionText.textContent = `v${manifest.version}`;
+  // L2: Fallback to 'dev' if manifest version is missing/undefined
+  versionText.textContent = `v${manifest.version || 'dev'}`;
 } catch { /* fallback */ }
 
 let state = 'inactive';

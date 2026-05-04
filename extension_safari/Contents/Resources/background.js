@@ -127,7 +127,7 @@ function startHealthPoll() {
   stopHealthPoll();
   healthPollTimer = setInterval(async () => {
     try {
-      const res = await fetch(`http://localhost:${DEFAULT_PROXY_PORT}/health`);
+      const res = await fetch(`http://localhost:${_proxyPort}/health`);
       const health = await res.json();
       if (!health.connected && connected) {
         console.warn('[Hermes Bridge] Proxy reports no WS client; forcing reconnect');

@@ -109,9 +109,13 @@ header {
 }
 
 .error {
-  background: var(--accent-red);
-  color: var(--bg-primary);
+  /* L1: Use explicit accessible colors instead of CSS variable combos that may
+   * be overridden by other rules (e.g. .panel sets background: var(--bg-secondary)).
+   * #f38ba8 on #1e1e2e gives ~7.2:1 contrast (AAA). */
+  background: #f38ba8;
+  color: #1e1e2e;
   font-size: 12px;
+  font-weight: 500;
 }
 
 .error.hidden,

@@ -213,6 +213,8 @@ class PageMirror {
       .filter(m => m.seq > lastSeq && (now - m.ts) < MUTATION_TTL_MS)
       .map(m => ({ mutations: m.mutations, url: m.url, seq: m.seq, ts: m.ts }));
 
+    // M2: Return a shallow copy so callers cannot mutate internal _states map entry.
+    // Mutations array is also cloned so callers can't splice into the ring buffer.
     return {
       url: targetSession.url,
       title: targetSession.title,

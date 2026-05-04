@@ -23,8 +23,9 @@ const cmdLogList   = document.getElementById('cmd-log-list');
 const cmdCount     = document.getElementById('cmd-count');
 
 try {
-  chrome.runtime.getManifest().version;
-  versionText.textContent = 'v' + chrome.runtime.getManifest().version;
+  const manifest = chrome.runtime.getManifest();
+  // L2: Fallback to 'dev' if manifest version is missing/undefined
+  versionText.textContent = 'v' + (manifest.version || 'dev');
 } catch {}
 
 let state = 'inactive';
@@ -59,6 +60,8 @@ function onBgMessage(msg) {
     pendingCmdId = null;
     setState('inactive');
   } else if (msg.event === 'tab_activated') {
+    // H2: Clear pendingCmdId so stale responses from the previous tab don't leak
+    pendingCmdId = null;
     sessionStorage.setItem('hermes_last_url', msg.url);
     setState('active', { url: msg.url });
   } else if (msg.event === 'error') {

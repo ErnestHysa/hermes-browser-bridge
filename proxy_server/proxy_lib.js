@@ -25,6 +25,24 @@ const { createHash } = require('crypto');
 const { randomUUID } = require('node:crypto');
 const { createGzip } = require('zlib');  // S5: gzip compression
 
+// ─── Command History Store (S3) ───────────────────────────────────────────────
+
+/** S3: In-memory command history — last 50 completed commands per session */
+const CMD_HISTORY_MAX = 50;
+/** @type {Map<string, {cmdId: string, type: string, status: string, result?: string, error?: string, ts: number}[]>} */
+const _commandHistory = new Map();
+
+function _getHistory(sessionId) {
+  if (!_commandHistory.has(sessionId)) _commandHistory.set(sessionId, []);
+  return _commandHistory.get(sessionId);
+}
+
+function _pushHistory(sessionId, entry) {
+  const hist = _getHistory(sessionId);
+  hist.unshift(entry);
+  if (hist.length > CMD_HISTORY_MAX) hist.splice(CMD_HISTORY_MAX);
+}
+
 const { CommandQueue } = require('./cmd_queue');
 const { PageMirror } = require('./page_mirror');
 const cfg = require('./config');                   // P3-14: all tunable settings in one place
@@ -58,6 +76,24 @@ function _warnDefault(field, value) {
   return 'default';
 }
 
+// ─── HTTP Auth Helper (C3) ────────────────────────────────────────────────────
+
+/**
+ * C3: Validate auth token from Authorization header or ?token= query param.
+ * Returns { authorized: true } or { authorized: false, reason: string }.
+ * Token is only required if HBS_AUTH_TOKEN env var is set (dev mode skips auth).
+ */
+function validateHttpAuth(req) {
+  const expectedToken = process.env.HBS_AUTH_TOKEN || null;
+  if (!expectedToken) return { authorized: true }; // dev mode: no auth required
+  const authHeader = req.headers['authorization'] || '';
+  const queryToken = new URL(req.url, 'http://localhost').searchParams.get('token');
+  const provided = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : (queryToken || '');
+  if (!provided) return { authorized: false, reason: 'Missing token. Provide ?token=<auth_token> or Authorization: Bearer <token>' };
+  if (provided !== expectedToken) return { authorized: false, reason: 'Invalid token' };
+  return { authorized: true };
+}
+
 function log(level, msg, extras = {}) {
   if (LOG_LEVELS[level] === undefined || LOG_LEVELS[level] < CURRENT_LOG_LEVEL) return;
   const entry = {
@@ -67,7 +103,11 @@ function log(level, msg, extras = {}) {
     pid: process.pid,
     ...extras
   };
-  console.log(JSON.stringify(entry));
+  // C1: Redact sensitive fields — never log token/password values
+  console.log(JSON.stringify(entry, (k, v) => {
+    if (k === 'token' || k === 'auth' || k === 'pwd' || k === 'password') return '[REDACTED]';
+    return v;
+  }));
 }
 
 // ─── Prometheus Metrics ─────────────────────────────────────────────────────────
@@ -227,7 +267,7 @@ function formatPrometheus() {
     }
     const leLabels = [...durationBuckets.map(b => `${b}`), '+Inf'].map(b => `le="${b}"`).join(',');
     for (let i = 0; i <= durationBuckets.length; i++) {
-      emit(`hbs_command_duration_seconds_bucket{type="${cmdType}",${leLabels.split(',')[i]} ${bucketCounts[i]}`);
+      emit(`hbs_command_duration_seconds_bucket {type="${cmdType}",${leLabels.split(',')[i]} ${bucketCounts[i]}`);
     }
     emit(`hbs_command_duration_seconds_sum{type="${cmdType}"} ${(sum / 1000).toFixed(4)}`);
     emit(`hbs_command_duration_seconds_count{type="${cmdType}"} ${count}`);
@@ -241,7 +281,7 @@ function formatPrometheus() {
     emit('# TYPE hbs_html_bytes gauge');
     // Emit only the most recent entry as the current value
     const latest = metrics.histograms.htmlBytes[metrics.histograms.htmlBytes.length - 1];
-    emit(`hbs_html_bytes ${latest.value} ${latest.ts}`);
+    emit(`hbs_html_bytes ${latest.value}`);
   }
 
   if (metrics.histograms.mutationBufferSize.length > 0) {
@@ -249,7 +289,7 @@ function formatPrometheus() {
     emit('# TYPE hbs_mutation_buffer_size gauge');
     // Emit only the most recent entry as the current value
     const latest = metrics.histograms.mutationBufferSize[metrics.histograms.mutationBufferSize.length - 1];
-    emit(`hbs_mutation_buffer_size ${latest.value} ${latest.ts}`);
+    emit(`hbs_mutation_buffer_size ${latest.value}`);
   }
 
   return lines.join('\n');
@@ -419,6 +459,8 @@ class HermesPushManager {
   constructor() {
     /** @type {Map<import('ws').WebSocket, {sessionId: string, reqId: string}>} */
     this._clients = new Map();
+    /** @type {Map<string, import('ws').WebSocket>} H1: cmdId → specific Hermes WS client that issued it */
+    this._cmdIdToWs = new Map();
     /** @type {Map<string, Set<import('ws').WebSocket>>} sessionId → set of subscribed clients */
     this._sessionSubscriptions = new Map();
     /** H3: Callback to forward session_bridge to extension — set by createProxy */
@@ -532,6 +574,8 @@ function createProxy({ httpServer, tlsOptions, version }) {
   function jsonResponse(res, statusCode, data, extraHeaders = {}) {
     const json = JSON.stringify(data);
     const acceptEncoding = (res.req && res.req.headers && res.req.headers['accept-encoding']) || '';
+    // S7: X-Request-Id on every HTTP response for tracing
+    const reqId = (res.req && res.req._hermesReqId) || 'unknown';
 
     // S5: gzip — if client accepts gzip and response > 1KB, compress
     if (acceptEncoding.includes('gzip') && json.length > 1024) {
@@ -543,6 +587,7 @@ function createProxy({ httpServer, tlsOptions, version }) {
         'X-Frame-Options': 'DENY',            // M10
         'X-XSS-Protection': '1; mode=block',  // M10
         'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',  // M10
+        'X-Request-Id': reqId,                // S7
         ...extraHeaders
       };
       res.writeHead(statusCode, headers);
@@ -561,6 +606,7 @@ function createProxy({ httpServer, tlsOptions, version }) {
       'X-Frame-Options': 'DENY',            // M10
       'X-XSS-Protection': '1; mode=block',  // M10
       'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',  // M10
+      'X-Request-Id': reqId,                // S7
       ...extraHeaders
     });
     res.end(json);
@@ -629,10 +675,11 @@ function createProxy({ httpServer, tlsOptions, version }) {
     clientMaxWindowBits: 15,
     concurrencyLimit: 10
   };
-  const wss = new WebSocketServer(wssOptions);
+  const wssOptionsWithPing = { ...wssOptions, pingInterval: 30000, pingTimeout: 10000 };
+const wss = new WebSocketServer(wssOptionsWithPing);
 
   // ── WebSocket Server (Hermes push client — Fix #P0-1) ───────────────────────
-  const wssHermes = new WebSocketServer({ noServer: true });
+  const wssHermes = new WebSocketServer({ noServer: true, pingInterval: 30000, pingTimeout: 10000 });
 
   httpServer.on('upgrade', (req, socket, head) => {
     const url = new URL(req.url, `http://localhost:${httpServer.address().port}`);
@@ -710,9 +757,10 @@ function createProxy({ httpServer, tlsOptions, version }) {
       // P0-1: Command over WS — forward to extension session
       if (msg.type === 'command') {
         const sessionId = msg.sessionId;
+        const cmdId = msg.cmdId || randomUUID();
         const cmd = {
           type: msg.commandType,   // 'click', 'navigate', etc.
-          cmdId: msg.cmdId || randomUUID(),
+          cmdId,
           selector: msg.selector,
           url: msg.url,
           x: msg.x,
@@ -720,9 +768,11 @@ function createProxy({ httpServer, tlsOptions, version }) {
           text: msg.text,
           script: msg.script,
         };
+        // H1: Track cmdId → this specific Hermes WS client so cmd_error routes back correctly
+        hermesPush._cmdIdToWs.set(cmdId, ws);
         hermesPush.forwardCommand(sessionId, cmd);
-        log('info', `Hermes CMD → extension`, { reqId, sessionId, type: cmd.type });
-        ws.send(JSON.stringify({ type: 'command_queued', cmdId: cmd.cmdId, sessionId }));
+        log('info', `Hermes CMD → extension`, { reqId, sessionId, type: cmd.type, cmdId });
+        ws.send(JSON.stringify({ type: 'command_queued', cmdId, sessionId }));
         return;
       }
 
@@ -813,6 +863,16 @@ function createProxy({ httpServer, tlsOptions, version }) {
 
     ws.on('message', (raw) => {
       metrics.counters.wsMessages.rx++;
+
+      // M4: Per-session WS message rate limiting — reject if session exceeds limit
+      {
+        const meta = getSessionMeta(sessionId);
+        if (!meta.limiter.tryConsume()) {
+          log('warn', 'Extension WS rate limit exceeded — dropping message', { reqId, sessionId, type: msg.type });
+          ws.send(JSON.stringify({ type: 'rate_limited', message: 'Too many messages — slow down', retryAfterMs: 100 }));
+          return;
+        }
+      }
       let msg;
       try { msg = JSON.parse(raw); }
       catch (e) {
@@ -891,6 +951,8 @@ function createProxy({ httpServer, tlsOptions, version }) {
               const duration = Date.now() - (cmdEntry.submittedAt || Date.now());
               metricHistogramPush('commandDuration', duration, { type: cmdEntry.cmd.type });
               metricIncr('commands', { type: cmdEntry.cmd.type, status: 'success' });
+              // S3: Record in command history
+              _pushHistory(sessionId, { cmdId: msg.cmdId, type: cmdEntry.cmd.type, status: 'success', result: String(msg.result || '').slice(0, 200), ts: Date.now() });
             }
             metricIncr('commands', { status: 'success' });
           }
@@ -898,17 +960,41 @@ function createProxy({ httpServer, tlsOptions, version }) {
         }
 
         case 'cmd_error': {
+          // S8: Structured error codes — determine error code from error string
+          const rawError = msg.error || 'Unknown error';
+          const errCode = rawError.includes('timeout') ? 'COMMAND_TIMEOUT'
+            : rawError.includes('not found') || rawError.includes('No node') ? 'ELEMENT_NOT_FOUND'
+            : rawError.includes('denied') || rawError.includes('permission') ? 'PERMISSION_DENIED'
+            : rawError.includes('invalid') || rawError.includes('selector') ? 'INVALID_COMMAND'
+            : 'INTERNAL_ERROR';
+
           const before = cmdQueue.size;
-          cmdQueue.error(msg.cmdId, msg.error || 'Unknown error');
+          cmdQueue.error(msg.cmdId, rawError);
           if (cmdQueue.size === before && cmdQueue.get(msg.cmdId)?.status !== 'error') {
-            log('warn', 'cmd_error for unknown cmdId', { reqId, sessionId, cmdId: msg.cmdId, error: msg.error });
+            log('warn', 'cmd_error for unknown cmdId', { reqId, sessionId, cmdId: msg.cmdId, error: rawError, errCode });
           } else {
             const cmdEntry = cmdQueue.get(msg.cmdId);
             if (cmdEntry?.cmd) {
               metricIncr('commands', { type: cmdEntry.cmd.type, status: 'error' });
+              // S3: Record in command history
+              _pushHistory(sessionId, { cmdId: msg.cmdId, type: cmdEntry.cmd.type, status: 'error', error: String(msg.error || 'Unknown error').slice(0, 200), ts: Date.now() });
             }
             metricIncr('commands', { status: 'error' });
           }
+
+          // H1: Route cmd_error to the specific Hermes WS client that issued this command
+          const targetWs = hermesPush._cmdIdToWs.get(msg.cmdId);
+          if (targetWs && targetWs.readyState === 1) {
+            targetWs.send(JSON.stringify({
+              type: 'cmd_error',
+              cmdId: msg.cmdId,
+              error: rawError,
+              code: errCode,        // S8: structured error code
+              sessionId: sessionId,
+              ts: Date.now()
+            }));
+          }
+          hermesPush._cmdIdToWs.delete(msg.cmdId);
           break;
         }
 
@@ -938,10 +1024,8 @@ function createProxy({ httpServer, tlsOptions, version }) {
     });
   });
 
-  // Heartbeat — use ws library's built-in ping/pong (Fix #28)
-  // ws handles protocol-level pings automatically when pingInterval is set
-  wss.options = { ...wss.options, pingInterval: 30000, pingTimeout: 10000 };
-  wssHermes.options = { ...wssHermes.options, pingInterval: 30000, pingTimeout: 10000 };
+  // Heartbeat — ws library handles ping/pong automatically via pingInterval
+  // Both servers configured with pingInterval: 30000, pingTimeout: 10000 in constructor
 
   const heartbeat = setInterval(() => {
     metricGauge('uptimeSeconds', Math.floor(process.uptime()));
@@ -977,6 +1061,7 @@ function createProxy({ httpServer, tlsOptions, version }) {
       }
     });
     const reqId = randomUUID().slice(0, 8);
+    req._hermesReqId = reqId;  // S7: attach to request for jsonResponse to read
     const serverPort = httpServer.address().port;
     const url = new URL(req.url, `http://localhost:${serverPort}`);
     const path = url.pathname;
@@ -986,6 +1071,18 @@ function createProxy({ httpServer, tlsOptions, version }) {
     if (req.method === 'OPTIONS') {
       jsonResponse(res, 204, {});
       return;
+    }
+
+    // C3: Auth check for protected endpoints (non-GET, non-OPTIONS)
+    const protectedPaths = ['/command', '/sessions'];
+    const needsAuth = req.method !== 'GET' && protectedPaths.some(p => path.startsWith(p));
+    if (needsAuth) {
+      const auth = validateHttpAuth(req);
+      if (!auth.authorized) {
+        log('warn', 'HTTP auth failed', { reqId, path, reason: auth.reason });
+        jsonResponse(res, 401, { error: 'Unauthorized', reason: auth.reason });
+        return;
+      }
     }
 
     // ── GET /metrics/stream (S1) ───────────────────────────────────────────────
@@ -1027,6 +1124,7 @@ function createProxy({ httpServer, tlsOptions, version }) {
 
     // ── GET /health ─────────────────────────────────────────────────────────
     if (req.method === 'GET' && path === '/health') {
+      const proto = tlsOptions ? 'wss' : 'ws';
       jsonResponse(res, 200, {
         status: 'ok',
         version: PROXY_VERSION,
@@ -1037,6 +1135,8 @@ function createProxy({ httpServer, tlsOptions, version }) {
         hermesClients: hermesPush.size,
         activeSessions: sessionSockets.size,
         backpressureActive: metrics.gauges.backpressureActive === 1,
+        wsUrl: `${proto}://localhost:${serverPort}`,
+        hermesWsUrl: `${proto}://localhost:${serverPort}/hermes`,
       });
       return;
     }
@@ -1047,6 +1147,22 @@ function createProxy({ httpServer, tlsOptions, version }) {
       metricGauge('pendingCommands', cmdQueue.size);
       res.writeHead(200, { 'Content-Type': 'text/plain' });
       res.end(formatPrometheus());
+      return;
+    }
+
+    // ── GET /config (S1) ───────────────────────────────────────────────────────
+    if (req.method === 'GET' && path === '/config') {
+      jsonResponse(res, 200, {
+        version: PROXY_VERSION,
+        authEnabled: !!process.env.HBS_AUTH_TOKEN,
+        port: serverPort,
+        sessionTtlMs: cfg.SESSION_TTL_MS,
+        commandTimeoutMs: cfg.CMD_TIMEOUT_MS,
+        rateLimitRps: cfg.RATE_LIMIT_RPS,
+        rateLimitBurst: cfg.RATE_LIMIT_BURST,
+        backpressureThresholdMs: BACKPRESSURE_THRESHOLD_MS,
+        pruneIntervalMs: PRUNE_INTERVAL_MS,
+      });
       return;
     }
 
@@ -1103,6 +1219,24 @@ function createProxy({ httpServer, tlsOptions, version }) {
         url: pageMirror.getState(targetSessionId).url
       });
       jsonResponse(res, 200, { success: true, sessionId: targetSessionId, message: 'Session activated' });
+      return;
+    }
+
+    // ── GET /commands/history (S3) ─────────────────────────────────────────────
+    const historyMatch = path.match(/^\/commands\/history(?:\/([^/]+))?$/);
+    if (req.method === 'GET' && historyMatch) {
+      const sessionId = historyMatch[1];  // optional — if omitted return all sessions
+      let result;
+      if (sessionId) {
+        result = { sessionId, history: _getHistory(sessionId) };
+      } else {
+        // Return history for all sessions that have commands
+        result = {};
+        for (const [sid, hist] of _commandHistory.entries()) {
+          result[sid] = hist;
+        }
+      }
+      jsonResponse(res, 200, result);
       return;
     }
 

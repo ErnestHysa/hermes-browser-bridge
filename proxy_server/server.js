@@ -20,6 +20,14 @@ const { createProxy } = require('./proxy_lib');
 
 const HOST = '127.0.0.1';  // Fix #C4: localhost only — prevents LAN exposure
 
+// M7: Structured logging — JSON lines consistent with proxy_lib.js
+function log(level, msg, extras = {}) {
+  const entry = { ts: new Date().toISOString(), level, msg, ...extras };
+  const str = JSON.stringify(entry);
+  if (level === 'error' || level === 'warn') console.error(str);
+  else console.log(str);
+}
+
 // Fix #19: Read version from package.json to avoid hardcoded drift
 let PKG_VERSION = '1.0.0';
 try {
@@ -34,41 +42,39 @@ function startHttp() {
   const proxy = createProxy({ httpServer, version: PKG_VERSION });
 
   httpServer.listen(PORT, HOST, () => {
-    console.log('Hermes Browser Bridge proxy running (HTTP)');
-    console.log(`  HTTP REST: http://${HOST}:${PORT}`);
-    console.log(`  WebSocket: ws://${HOST}:${PORT}`);
-    console.log('');
-    console.log('Endpoints:');
-    console.log('  GET    /health           → proxy health + rate limit status');
-    console.log('  GET    /metrics          → Prometheus-compatible metrics');
-    console.log('  GET    /sessions          → list active sessions');
-    console.log('  POST   /sessions/:id/activate');
-    console.log('  GET    /page_state       → current tab snapshot');
-    console.log('  POST   /command           → send command to extension');
-    console.log('  GET    /command/:cmdId    → poll command result');
-    console.log('  DELETE /command/:cmdId    → cancel pending command');
-    console.log('  GET    /last_seq');
-    console.log('');
-    console.log('  WebSocket: ws://localhost:9321 (extension)');
-    console.log('             ws://localhost:9321/hermes (Hermes Agent)');
+    log('info', 'Hermes Browser Bridge proxy running (HTTP)', { port: PORT, host: HOST, mode: 'http' });
+    log('info', 'HTTP REST server started', { addr: `http://${HOST}:${PORT}` });
+    log('info', 'WebSocket server started', { addr: `ws://${HOST}:${PORT}` });
+    log('info', 'Registered HTTP endpoints:', { endpoints: ['GET /health', 'GET /metrics', 'GET /sessions', 'POST /sessions/:id/activate', 'GET /page_state', 'POST /command', 'GET /command/:cmdId', 'DELETE /command/:cmdId', 'GET /last_seq', 'GET /commands/history', 'GET /config', 'WS / (extension)', 'WS /hermes (Hermes)'] });
+
+
+
+
+
+
+
+
+
+    log('info', 'Extension WebSocket endpoint', { addr: `ws://${HOST}:${PORT}` });
+    log('info', 'Hermes Agent WebSocket endpoint', { addr: `ws://${HOST}:${PORT}/hermes` });
   });
 
   httpServer.on('error', (err) => {
     if (err.code === 'EADDRINUSE') {
-      console.error(`ERROR: Port ${PORT} is already in use.`);
+      log('error', `Port ${PORT} is already in use`, { port: PORT, code: 'EADDRINUSE' });
       process.exit(1);
     }
     throw err;
   });
 
   process.on('SIGINT', () => {
-    console.log('\nShutting down…');
+    log('info', 'Shutting down…');
     proxy.shutdown();
     process.exit(0);
   });
 
   process.on('SIGTERM', () => {
-    console.log('\nShutting down…');
+    log('info', 'Shutting down…');
     proxy.shutdown();
     process.exit(0);
   });
@@ -85,8 +91,8 @@ function startHttps() {
       key: readFileSync(`${TLS_DIR}/ca.key`)
     };
   } catch (e) {
-    console.error('[HTTPS] Failed to load TLS certificates from ../certificates/:', e.message);
-    console.error('[HTTPS] Run: ./scripts/generate-certs.sh');
+    log('error', 'Failed to load TLS certificates from ../certificates/', { err: e.message, hint: 'Run: ./scripts/generate-certs.sh' });
+
     process.exit(1);
   }
 
@@ -94,41 +100,39 @@ function startHttps() {
   const proxy = createProxy({ httpServer, tlsOptions, version: PKG_VERSION });
 
   httpServer.listen(PORT, HOST, () => {
-    console.log('Hermes Browser Bridge proxy running (HTTPS)');
-    console.log(`  HTTPS REST: https://${HOST}:${PORT}`);
-    console.log(`  WSS:       wss://${HOST}:${PORT}`);
-    console.log('');
-    console.log('NOTE: Using self-signed certificate — browser will show a warning.');
-    console.log('      Install ../certificates/ca.crt into Keychain to suppress it.');
-    console.log('');
-    console.log('Endpoints:');
-    console.log('  GET    /health           → proxy health + rate limit status');
-    console.log('  GET    /metrics          → Prometheus-compatible metrics');
-    console.log('  GET    /sessions         → list active sessions');
-    console.log('  POST   /sessions/:id/activate');
-    console.log('  GET    /page_state       → current tab snapshot');
-    console.log('  POST   /command          → send command to extension');
-    console.log('  GET    /command/:cmdId   → poll command result');
-    console.log('  DELETE /command/:cmdId   → cancel pending command');
-    console.log('  GET    /last_seq');
+    log('info', 'Hermes Browser Bridge proxy running (HTTPS)', { port: PORT, host: HOST, mode: 'https' });
+    log('info', 'HTTPS REST server started', { addr: `https://${HOST}:${PORT}` });
+    log('info', 'WSS server started', { addr: `wss://${HOST}:${PORT}` });
+    log('warn', 'Using self-signed TLS certificate — browser will show a security warning');
+    log('info', 'Install ../certificates/ca.crt into Keychain to suppress the warning');
+    log('info', 'Registered HTTP endpoints:', { endpoints: ['GET /health', 'GET /metrics', 'GET /sessions', 'POST /sessions/:id/activate', 'GET /page_state', 'POST /command', 'GET /command/:cmdId', 'DELETE /command/:cmdId', 'GET /last_seq', 'GET /commands/history', 'GET /config', 'WS / (extension)', 'WS /hermes (Hermes)'] });
+
+
+
+
+
+
+
+
+
   });
 
   httpServer.on('error', (err) => {
     if (err.code === 'EADDRINUSE') {
-      console.error(`ERROR: Port ${PORT} is already in use.`);
+      log('error', `Port ${PORT} is already in use`, { port: PORT, code: 'EADDRINUSE' });
       process.exit(1);
     }
     throw err;
   });
 
   process.on('SIGINT', () => {
-    console.log('\nShutting down…');
+    log('info', 'Shutting down…');
     proxy.shutdown();
     process.exit(0);
   });
 
   process.on('SIGTERM', () => {
-    console.log('\nShutting down…');
+    log('info', 'Shutting down…');
     proxy.shutdown();
     process.exit(0);
   });
