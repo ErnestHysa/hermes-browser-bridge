@@ -6,6 +6,7 @@
 
 'use strict';
 
+const DEFAULT_PROXY_PORT = 9321;
 const MAX_CMD_LOG = 5;
 const CMD_LOG_KEY = 'hermes_cmd_log'; // Fix #22: localStorage key for persistence
 
@@ -82,7 +83,7 @@ function onCancelClick() {
   const cmdIdToCancel = pendingCmdId;
   pendingCmdId = null;
   cancelBtn.classList.add('hidden');
-  fetch(`http://localhost:9321/command/${encodeURIComponent(cmdIdToCancel)}`, {
+  fetch(`http://localhost:${DEFAULT_PROXY_PORT}/command/${encodeURIComponent(cmdIdToCancel)}`, {
     method: 'DELETE'
   }).then(() => {
     addCmdLog('error', `Cancelled: ${cmdIdToCancel}`);
@@ -140,6 +141,10 @@ function onBgMessage(msg) {
     cancelBtn.classList.remove('hidden');  // Fix #13: show cancel button when command is pending
     addCmdLog('pending', `${msg.cmdType} → ${msg.selector || msg.url || '(action)'}`);
   } else if (msg.event === 'cmd_done') {
+    // Fix #18: Only clear pendingCmdId if this ack belongs to the current pending command.
+    // If tab switched since the command was sent, pendingCmdId was already nulled
+    // and a stale ack from the old tab must not interfere with the new command.
+    if (msg.cmdId !== pendingCmdId) return;
     pendingCmdId = null;
     cancelBtn.classList.add('hidden');
     // Fix #15: If there's a pending "Refresh snapshot…" entry, update it in-place
@@ -155,6 +160,8 @@ function onBgMessage(msg) {
     if (!updated) addCmdLog('success', `${msg.cmdType}: OK`);
     else { saveCmdLog(); renderCmdLog(); }
   } else if (msg.event === 'cmd_error') {
+    // Fix #18: Same guard — ignore stale errors from a previous tab's command.
+    if (msg.cmdId !== pendingCmdId) return;
     pendingCmdId = null;
     cancelBtn.classList.add('hidden');
     addCmdLog('error', `${msg.cmdType}: ${msg.error}`);
@@ -251,6 +258,12 @@ function setState(newState, extra = {}) {
   }
 }
 
+// Fix #21: Dashboard link — use named function so it can be removed on cleanup
+function onDashboardLinkClick(e) {
+  e.preventDefault();
+  chrome.tabs.create({ url: dashboardLink.href });
+}
+
 async function init() {
   setState('inactive');
   loadCmdLog(); // Fix #22: restore persisted command log
@@ -262,12 +275,9 @@ async function init() {
   cancelBtn.addEventListener('click', onCancelClick);  // Fix #13
   document.addEventListener('keydown', onKeyDown); // Fix #20: keyboard shortcuts
 
-  // Fix #21: Dashboard link - open in new tab
+  // Fix #21: Dashboard link - open in new tab (named function for cleanup)
   if (dashboardLink) {
-    dashboardLink.addEventListener('click', (e) => {
-      e.preventDefault();
-      chrome.tabs.create({ url: dashboardLink.href });
-    });
+    dashboardLink.addEventListener('click', onDashboardLinkClick);
   }
 
   // Cleanup on close
@@ -279,6 +289,10 @@ async function init() {
       refreshBtn.removeEventListener('click', onRefreshClick);
       cancelBtn.removeEventListener('click', onCancelClick);
       document.removeEventListener('keydown', onKeyDown);
+      // Fix #13: Remove dashboardLink listener to prevent accumulation on re-open
+      if (dashboardLink) {
+        dashboardLink.removeEventListener('click', onDashboardLinkClick);
+      }
     }
   });
 

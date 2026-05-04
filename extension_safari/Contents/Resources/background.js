@@ -31,8 +31,9 @@ const HEALTH_POLL_INTERVAL_MS = 10000;
 // Fix #9: On Safari, the background script can be restarted by the OS under memory pressure.
 // Without persistence, a new SESSION_ID orphans the proxy's session state.
 // browser.storage.session is available in Manifest V3 Safari extensions.
+// Fix #11: Use crypto.randomUUID for unpredictable session IDs
 const SESSION_STORAGE_KEY = 'hermesSessionId';
-let SESSION_ID = `session_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+let SESSION_ID = `session_${Date.now()}_${crypto.randomUUID().replace(/-/g, '').slice(0, 10)}`;
 
 async function restoreSessionId() {
   try {
@@ -177,6 +178,9 @@ function stopHealthPoll() {
 
 // ─── Command routing ─────────────────────────────────────────────────────────
 
+// Fix #15: Track pending command types so cmd_ack can report the real type to popup
+const pendingCmdTypes = new Map();  // cmdId → original command type
+
 function forwardCommandToTab(tabId, cmd) {
   if (!tabId) {
     console.warn('[Hermes Bridge] No active tab to forward command to');
@@ -184,6 +188,8 @@ function forwardCommandToTab(tabId, cmd) {
     return;
   }
 
+  // Fix #15: Remember the original command type for the ack/error handler
+  pendingCmdTypes.set(cmd.cmdId, cmd.type);
   notifyPopup({ event: 'cmd_sent', cmdType: cmd.type, selector: cmd.selector, url: cmd.url, cmdId: cmd.cmdId });
 
   const MAX_RETRIES = 3;
@@ -237,6 +243,7 @@ function handleProxyMessage(cmd) {
 
     // P3-17: Cancel — forward to content script so it ignores this cmdId
     case 'cancel':
+      pendingCmdTypes.delete(cmd.cmdId);
       if (currentTabId) {
         browser.tabs.sendMessage(currentTabId, { type: 'cancel', cmdId: cmd.cmdId }).catch(() => {});
       }
@@ -254,11 +261,14 @@ function handleProxyMessage(cmd) {
       break;
 
     case 'cmd_ack':
-      notifyPopup({ event: 'cmd_done', cmdType: cmd.type });
+      // Fix #15: Forward the original command type, not 'cmd_ack'
+      notifyPopup({ event: 'cmd_done', cmdType: pendingCmdTypes.get(cmd.cmdId) || cmd.type, cmdId: cmd.cmdId });
+      pendingCmdTypes.delete(cmd.cmdId);
       break;
 
     case 'cmd_error':
-      notifyPopup({ event: 'cmd_error', cmdType: cmd.type, error: cmd.error });
+      notifyPopup({ event: 'cmd_error', cmdType: pendingCmdTypes.get(cmd.cmdId) || cmd.type, error: cmd.error, cmdId: cmd.cmdId });
+      pendingCmdTypes.delete(cmd.cmdId);
       break;
 
     default:
@@ -368,6 +378,7 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // Without this, the pendingCmdId in popup.js never gets cleared for refresh commands.
     if (currentTabId) {
       const fakeCmdId = `refresh_${Date.now()}`;
+      pendingCmdTypes.set(fakeCmdId, 'refresh');
       pendingCmdId = fakeCmdId;
       browser.tabs.sendMessage(currentTabId, { type: 'ping', cmdId: fakeCmdId }).then((resp) => {
         if (resp && resp.html) {
@@ -381,10 +392,12 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
             sessionId: SESSION_ID
           });
           pendingCmdId = null;
+          pendingCmdTypes.delete(fakeCmdId);
           notifyPopup({ event: 'cmd_done', cmdType: 'refresh' });
         }
       }).catch(() => {
         pendingCmdId = null;
+        pendingCmdTypes.delete(fakeCmdId);
         notifyPopup({ event: 'cmd_error', cmdType: 'refresh', error: 'Tab not ready' });
       });
     }
@@ -396,7 +409,8 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
     currentTabUrl = null;
     backpressurePaused = false;
     updateBadge('gray');
-    notifyPopup({ event: 'disconnected' });
+    // Fix #16: Always pass pendingCmdId on disconnect so popup resets state
+    notifyPopup({ event: 'disconnected', pendingCmdId: null });
     return true;
   }
 

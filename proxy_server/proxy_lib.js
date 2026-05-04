@@ -151,6 +151,8 @@ const metrics = {
     wsConnections: 0,
     wsMessages: { rx: 0, tx: 0 },
     idempotencyRejections: 0,
+    wsSendTimeouts: 0,  // Fix #8: track and expose WS send timeouts in Prometheus
+    sseStreams: 0,
   },
   gauges: {
     connectedSessions: 0,
@@ -294,6 +296,10 @@ function formatPrometheus() {
   emit('# TYPE hbs_idempotency_rejections_total counter');
   emit(`hbs_idempotency_rejections_total ${metrics.counters.idempotencyRejections}`);
 
+  emit('# HELP hbs_ws_send_timeouts_total Extension WebSocket sends that timed out (>30s blocked)');
+  emit('# TYPE hbs_ws_send_timeouts_total counter');
+  emit(`hbs_ws_send_timeouts_total ${metrics.counters.wsSendTimeouts}`);
+
   // ── Histogram: command duration (proper Prometheus bucket structure) ──────
   const durationBuckets = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5];
   emit('# HELP hbs_command_duration_seconds Command execution duration in seconds');
@@ -312,9 +318,10 @@ function formatPrometheus() {
       }
       bucketCounts[durationBuckets.length]++; // +Inf bucket
     }
-    const leLabels = [...durationBuckets.map(b => `${b}`), '+Inf'].map(b => `le="${b}"`).join(',');
+    // Build label strings once — avoid recomputing on every iteration
+    const bucketLabels = [...durationBuckets.map(b => `le="${b}"`), 'le="+Inf"'];
     for (let i = 0; i <= durationBuckets.length; i++) {
-      emit(`hbs_command_duration_seconds_bucket {type="${cmdType}",${leLabels.split(',')[i]} ${bucketCounts[i]}`);
+      emit(`hbs_command_duration_seconds_bucket {type="${cmdType}",${bucketLabels[i]}} ${bucketCounts[i]}`);
     }
     emit(`hbs_command_duration_seconds_sum{type="${cmdType}"} ${(sum / 1000).toFixed(4)}`);
     emit(`hbs_command_duration_seconds_count{type="${cmdType}"} ${count}`);
@@ -782,7 +789,9 @@ function createProxy({ httpServer, tlsOptions, version }) {
     // S7: X-Request-Id on every HTTP response for tracing
     const reqId = (res.req && res.req._hermesReqId) || 'unknown';
 
-    // S5: gzip — if client accepts gzip and response > 1KB, compress
+    // S5: gzip — if client accepts gzip and response > 1KB, compress.
+    // zlib.createGzip() uses level 6 by default (balanced speed/size).
+    // Fix #17: To make configurable: set env HBS_GZIP_LEVEL (0=none, 1=fastest … 9=best, default 6).
     if (acceptEncoding.includes('gzip') && json.length > 1024) {
       const gzip = createGzip();
       const headers = {
@@ -1071,7 +1080,7 @@ const wss = new WebSocketServer(wssOptionsWithPing);
       _clearSendTimeout();
       _sendTimeoutTimer = setTimeout(() => {
         log('warn', `WS send timeout for extension — closing socket`, { reqId, sessionId });
-        metrics.counters.wsSendTimeouts = (metrics.counters.wsSendTimeouts || 0) + 1;
+        metrics.counters.wsSendTimeouts++;
         ws.terminate();
       }, WS_SEND_TIMEOUT_MS);
     }
@@ -1152,8 +1161,7 @@ const wss = new WebSocketServer(wssOptionsWithPing);
         case 'session_info':
           // S3: Extension sends session metadata on connect
           log('info', `session_info from extension`, { reqId, sessionId, version: msg.version, tabId: msg.tabId });
-          // Acknowledge with our version
-          ws.send(JSON.stringify({ type: 'session_info_ack', sessionId, version: PROXY_VERSION }));
+          // No response needed — session is already tracked via the hello handshake
           break;
 
         case 'cmd_ack': {
@@ -1171,7 +1179,7 @@ const wss = new WebSocketServer(wssOptionsWithPing);
               // S3: Record in command history
               _pushHistory(sessionId, { cmdId: msg.cmdId, type: cmdEntry.cmd.type, status: 'success', result: String(msg.result || '').slice(0, 200), ts: Date.now() });
             }
-            metricIncr('commands', { status: 'success' });
+            // Note: no second metricIncr for 'success' here — grandTotal is derived from labeled sums above
           }
           break;
         }
@@ -1200,13 +1208,13 @@ const wss = new WebSocketServer(wssOptionsWithPing);
           }
 
           // H1: Route cmd_error to the specific Hermes WS client that issued this command
-          // Fix #11: Sanitize error — send generic message, never expose internal error codes externally
           const targetWs = hermesPush._cmdIdToWs.get(msg.cmdId);
           if (targetWs && targetWs.readyState === 1) {
             targetWs.send(JSON.stringify({
               type: 'cmd_error',
               cmdId: msg.cmdId,
-              error: 'Command failed. Please retry or contact support if the problem persists.',
+              error: String(rawError).slice(0, 200),
+              errCode,
               sessionId: sessionId,
               ts: Date.now()
             }));
@@ -1371,7 +1379,7 @@ const wss = new WebSocketServer(wssOptionsWithPing);
       }, 1000);
 
       req.on('close', () => clearInterval(metricsInterval));
-      metrics.counters.sseStreams = (metrics.counters.sseStreams || 0) + 1;
+      metrics.counters.sseStreams++;
       return;
     }
 
@@ -1644,9 +1652,102 @@ const wss = new WebSocketServer(wssOptionsWithPing);
       return;
     }
 
+    // ── GET /dashboard ─────────────────────────────────────────────────────────
+    if (req.method === 'GET' && path === '/dashboard') {
+      const sessions = Array.from(sessionSockets.entries()).map(([sid, ws]) => {
+        const state = pageMirror.getState(sid);
+        const cmdHistory = _getHistory(sid).slice(0, 5);
+        return { sessionId: sid, connected: ws.readyState === 1, url: state.url || '', title: state.title || '', lastUpdate: state.lastUpdate || 0, recentCommands: cmdHistory };
+      });
+      const activeSessionIds = Array.from(sessionSockets.keys());
+      const dashHtml = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hermes Browser Bridge — Dashboard</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f1117; color: #c9d1d9; min-height: 100vh; padding: 24px; }
+  h1 { color: #89b4fa; font-size: 20px; margin-bottom: 4px; }
+  .subtitle { color: #6e7681; font-size: 13px; margin-bottom: 24px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 16px; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; }
+  .card-header { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+  .status-dot { width: 8px; height: 8px; border-radius: 50%; }
+  .status-dot.connected { background: #3fb950; }
+  .status-dot.disconnected { background: #6e7681; }
+  .card-title { font-size: 13px; font-weight: 600; color: #e6edf3; }
+  .card-url { font-size: 11px; color: #8b949e; word-break: break-all; margin-bottom: 8px; }
+  .card-title2 { font-size: 12px; color: #8b949e; margin-bottom: 6px; }
+  .cmd-list { list-style: none; }
+  .cmd-list li { font-size: 11px; padding: 3px 0; color: #8b949e; }
+  .cmd-list li.success { color: #3fb950; }
+  .cmd-list li.error { color: #f85149; }
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 24px; }
+  .stat { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; text-align: center; }
+  .stat-val { font-size: 28px; font-weight: 700; color: #89b4fa; }
+  .stat-label { font-size: 11px; color: #6e7681; margin-top: 4px; }
+  .no-sessions { color: #6e7681; font-size: 13px; }
+  .refresh { font-size: 11px; color: #6e7681; margin-top: 16px; }
+</style>
+</head>
+<body>
+<h1>Hermes Browser Bridge</h1>
+<p class="subtitle">Proxy v${PROXY_VERSION} — <span id="uptime">—</span></p>
+
+<div class="stats">
+  <div class="stat"><div class="stat-val" id="stat-sessions">${sessions.length}</div><div class="stat-label">Sessions</div></div>
+  <div class="stat"><div class="stat-val" id="stat-pending">${cmdQueue.size}</div><div class="stat-label">Pending</div></div>
+  <div class="stat"><div class="stat-val" id="stat-hermes">${hermesPush.size}</div><div class="stat-label">Hermes Clients</div></div>
+  <div class="stat"><div class="stat-val" id="stat-bp">${metrics.gauges.backpressureActive === 1 ? '⏸' : '✅'}</div><div class="stat-label">Flow</div></div>
+</div>
+
+<h2 style="font-size:14px;color:#8b949e;margin-bottom:12px;">Active Sessions</h2>
+${sessions.length === 0 ? '<p class="no-sessions">No active sessions. Activate the extension in your browser.</p>' : ''}
+<div class="grid">
+${sessions.map(s => `
+  <div class="card">
+    <div class="card-header">
+      <span class="status-dot ${s.connected ? 'connected' : 'disconnected'}"></span>
+      <span class="card-title">${s.sessionId.slice(0, 16)}…</span>
+    </div>
+    <div class="card-url">${s.url || '—'}</div>
+    ${s.recentCommands.length > 0 ? `
+    <div class="card-title2">Recent Commands</div>
+    <ul class="cmd-list">
+      ${s.recentCommands.map(c => `<li class="${c.status}">[${c.status}] ${c.type} — ${c.result || c.error || ''}</li>`).join('')}
+    </ul>` : ''}
+  </div>`).join('')}
+</div>
+<p class="refresh">Auto-refreshes every 5s</p>
+<script>
+let startTime = Date.now();
+function refresh() {
+  fetch('/health')
+    .then(r => r.json())
+    .then(d => {
+      document.getElementById('stat-sessions').textContent = d.activeSessions;
+      document.getElementById('stat-pending').textContent = d.pendingCommands;
+      document.getElementById('stat-hermes').textContent = d.hermesClients;
+      document.getElementById('stat-bp').textContent = d.backpressureActive ? '⏸' : '✅';
+      const elapsed = Math.floor((Date.now() - startTime) / 1000);
+      document.getElementById('uptime').textContent = \`up \${elapsed}s\`;
+    });
+}
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>`;
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'X-Content-Type-Options': 'nosniff' });
+      res.end(dashHtml);
+      return;
+    }
+
     jsonResponse(res, 404, {
       error: 'Not found',
-      available: ['GET /health', 'GET /metrics', 'GET /sessions', 'POST /sessions/:id/activate', 'GET /page_state', 'POST /command', 'GET /command/:cmdId', 'DELETE /command/:cmdId', 'GET /last_seq']
+      available: ['GET /health', 'GET /metrics', 'GET /sessions', 'POST /sessions/:id/activate', 'GET /page_state', 'POST /command', 'GET /command/:cmdId', 'DELETE /command/:cmdId', 'GET /last_seq', 'GET /dashboard']
     });
   });
 

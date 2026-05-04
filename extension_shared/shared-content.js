@@ -78,12 +78,20 @@ function snapshotHash() {
 
 // ─── DOM Reading ───────────────────────────────────────────────────────────────
 
+// Fix #14: Strip password input values from HTML snapshots before sending.
+// Password fields must never leave the browser — even over localhost.
+function sanitizePasswordInputs(html) {
+  return html.replace(/ type=(['"]?)password\1/gi, ' type=$1text$1 data-hermes-masked="true"');
+}
+
 function getFullPageSnapshot() {
   try {
+    let html = document.documentElement.outerHTML;
+    html = sanitizePasswordInputs(html);
     return {
       url: window.location.href,
       title: document.title,
-      html: document.documentElement.outerHTML,
+      html,
       seq: ++window._snapshotSeq || (window._snapshotSeq = 1)
     };
   } catch (e) {

@@ -190,7 +190,8 @@ function initHermesContent() {
           window._hermesSendToBackground({ type: 'cmd_error', cmdId: cmd.cmdId, errorCode: 'NAVIGATE_BLOCKED', error: `Navigation to ${cmd.url} was blocked or failed` });
         }
       };
-      window.HermesShared._navigateFailTimer = setTimeout(window.HermesShared._navigateFailHandler, 3000);
+      // Fix #3: Unify navigate timeout — Safari uses 10s, Chrome used 3s. Use 10s as the single shared value.
+      window.HermesShared._navigateFailTimer = setTimeout(window.HermesShared._navigateFailHandler, 10000);
 
       window.HermesShared._navLoadHandler = () => {
         window.HermesShared.clearNavigateHandlers();

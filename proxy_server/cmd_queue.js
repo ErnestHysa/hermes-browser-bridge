@@ -131,6 +131,8 @@ class CommandQueue extends EventEmitter {
 
   /**
    * Prune old completed entries older than maxAgeMs.
+   * Fix #9: Also trims _completedOrder to prevent stale cmdIds from accumulating
+   * in the array after entries are removed from the completed Map.
    * @param {number} [maxAgeMs=60000]
    */
   prune(maxAgeMs = 60000) {
@@ -140,6 +142,9 @@ class CommandQueue extends EventEmitter {
         this.completed.delete(cmdId);
       }
     }
+    // Fix #9: Rebuild _completedOrder to match what remains in completed
+    const validIds = new Set(this.completed.keys());
+    this._completedOrder = this._completedOrder.filter(cmdId => validIds.has(cmdId));
   }
 
   /** Pending command count. */

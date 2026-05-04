@@ -12,6 +12,9 @@
 
 const DEFAULT_PROXY_PORT = 9321;
 
+// Fix #5: Configurable proxy port — declared at module scope so setProxyPort works
+let _proxyPort = DEFAULT_PROXY_PORT;
+
 function getProxyWsUrl() {
   return `ws://localhost:${DEFAULT_PROXY_PORT}`;
 }
@@ -22,7 +25,27 @@ const MAX_PENDING_MESSAGES = 50;
 const HEALTH_POLL_INTERVAL_MS = 10000;
 
 // Session ID persists across service worker restarts via chrome.storage.local
-let SESSION_ID = `session_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+// Fix #11: Use crypto.randomUUID for cryptographically unpredictable session IDs
+let SESSION_ID = `session_${Date.now()}_${crypto.randomUUID().replace(/-/g, '').slice(0, 10)}`;
+
+// Fix #19: chrome.storage.session may be unavailable (private browsing, strict MV3 permissions).
+// Always keep SESSION_ID valid as the primary ID. On successful storage read, update it.
+// Use chrome.storage.local as the persistence layer (available in MV3 Chrome extensions).
+function restoreSessionId() {
+  // chrome.storage.local.get is async but doesn't reject for missing keys — only for actual API failures
+  chrome.storage.local.get(['hermesSessionId']).then((stored) => {
+    if (stored && stored.hermesSessionId) {
+      const oldId = SESSION_ID;
+      SESSION_ID = stored.hermesSessionId;
+      console.log('[Hermes Bridge] Restored session ID from local storage:', SESSION_ID.slice(0, 12));
+      // If we already connected with a fresh ID, that's fine — proxy handles re-association
+    }
+  }).catch(() => {
+    // Storage API unavailable — use volatile ID
+  });
+}
+
+restoreSessionId();
 
 // Connection state
 let socket = null;
@@ -67,15 +90,9 @@ function connect() {
       chrome.tabs.sendMessage(currentTabId, { type: 'backpressure', paused: false }).catch(() => {});
     }
     // Fix #7: Persist sessionId across service worker restarts
-    // Fix #22: Persist sessionId via chrome.storage.session (survives service worker restarts)
-    chrome.storage.session.get(['hermesSessionId']).then((result) => {
-      if (result.hermesSessionId) {
-        SESSION_ID = result.hermesSessionId;
-      } else {
-        chrome.storage.session.set({ hermesSessionId: SESSION_ID });
-      }
-    }).catch(() => {
-      // session storage unavailable — use volatile memory only
+    // Fix #19: Use chrome.storage.local (not session) for reliable persistence in MV3 Chrome
+    chrome.storage.local.set({ hermesSessionId: SESSION_ID }).catch(() => {
+      // storage unavailable — session will use fresh ID on next restart
     });
     // S3: Send session_info so the proxy knows our metadata
     socket.send(JSON.stringify({
@@ -170,6 +187,9 @@ function stopHealthPoll() {
 
 // ─── Command routing ─────────────────────────────────────────────────────────
 
+// Fix #15: Track pending command types so cmd_ack can report the real type to popup
+const pendingCmdTypes = new Map();  // cmdId → original command type
+
 function forwardCommandToTab(tabId, cmd) {
   if (!tabId) {
     console.warn('[Hermes Bridge] No active tab to forward command to');
@@ -177,6 +197,8 @@ function forwardCommandToTab(tabId, cmd) {
     return;
   }
 
+  // Fix #15: Remember the original command type for the ack/error handler
+  pendingCmdTypes.set(cmd.cmdId, cmd.type);
   notifyPopup({ event: 'cmd_sent', cmdType: cmd.type, selector: cmd.selector, url: cmd.url, cmdId: cmd.cmdId });
 
   // Fix #14: Attach a short reqId to every command forwarded to content script
@@ -229,6 +251,7 @@ function handleProxyMessage(cmd) {
     }
 
     case 'cancel':
+      pendingCmdTypes.delete(cmd.cmdId);
       if (currentTabId) {
         chrome.tabs.sendMessage(currentTabId, { type: 'cancel', cmdId: cmd.cmdId }).catch(() => {});
       }
@@ -246,11 +269,14 @@ function handleProxyMessage(cmd) {
       break;
 
     case 'cmd_ack':
-      notifyPopup({ event: 'cmd_done', cmdType: cmd.type });
+      // Fix #15: Forward the original command type, not 'cmd_ack'
+      notifyPopup({ event: 'cmd_done', cmdType: pendingCmdTypes.get(cmd.cmdId) || cmd.type, cmdId: cmd.cmdId });
+      pendingCmdTypes.delete(cmd.cmdId);
       break;
 
     case 'cmd_error':
-      notifyPopup({ event: 'cmd_error', cmdType: cmd.type, error: cmd.error });
+      notifyPopup({ event: 'cmd_error', cmdType: pendingCmdTypes.get(cmd.cmdId) || cmd.type, error: cmd.error, cmdId: cmd.cmdId });
+      pendingCmdTypes.delete(cmd.cmdId);
       break;
 
     default:

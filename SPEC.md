@@ -1,4 +1,4 @@
-# Hermes Browser Bridge — Architecture Specification v1.3.0
+# Hermes Browser Bridge — Architecture Specification v1.3.1
 
 > Hermes Browser Bridge gives the Hermes Agent full read and control of a live browser tab
 > running in the user's own browser session. Since the extension runs inside the user's
@@ -19,7 +19,7 @@ User's Browser Tab (any site — Google, banking, intranet, etc.)
     │
     ▼
 background.js (extension service worker / background page)
-    │   • Maintains WebSocket to proxy
+    │   • Maintains WebSocket to proxy (ws://localhost:9321)
     │   • Routes commands to content script
     │   • Routes page state to proxy
     │
@@ -27,7 +27,7 @@ background.js (extension service worker / background page)
     ▼
 proxy_server/ (Node.js)
     │  • HTTP REST API (page_state, commands, sessions)
-    │  • WebSocket endpoint for Hermes Agent
+    │  • WebSocket endpoint for Hermes Agent (ws://localhost:9321/hermes)
     │  • PageMirror: caches page state per session
     │  • CmdQueue: async command execution with ack/error
     │
@@ -61,7 +61,7 @@ Hermes Agent
 
 ### 2.1 Content Script (`content.js`)
 
-Injected into every page at `document_idle`. Responsibilities:
+Injected into every page at `document_start`. Responsibilities:
 
 **Page State Capture**
 - On init: captures full HTML snapshot synchronously (`document.documentElement.outerHTML`) before MutationObserver attaches — avoids missing early DOM mutations
@@ -106,16 +106,18 @@ Injected into every page at `document_idle`. Responsibilities:
 - Popup ↔ background: `chrome.runtime.sendMessage`
 - Background pushes events: `connected`, `disconnected`, `tab_activated`, `cmd_sent`, `cmd_done`, `cmd_error`
 
-**Hermes WebSocket Push (v1.3)**
-- Background also connects to `ws://localhost:9321/hermes` (separate WS connection)
-- Sends `{ type: 'session_announce', sessionId }` to subscribe
-- Receives `{ type: 'command', ...cmd }` from Hermes and forwards to the correct session's tab
-- Receives `{ type: 'cancel', cmdId }` and forwards to content script
+**Hermes Agent WebSocket Push (v1.3)**
+- The Hermes Agent itself connects directly to `ws://localhost:9321/hermes` — **not** the extension background
+- Hermes Agent sends `{ type: 'subscribe', sessionId }` to subscribe to a session's push stream
+- Proxy pushes `{ type: 'command', cmdId, type, selector, ... }` to Hermes for that session
+- Extension executes the command and replies via the extension WS; proxy forwards `cmd_ack`/`cmd_error` to Hermes
+
+**Note on run_at**: Extensions use `run_at: 'document_start'` so the content script injects before the page renders, capturing the initial DOM before any JS runs.
 
 ### 2.3 Proxy Server (`proxy_server/`)
 
 **Files**
-- `server.js` — main entry: HTTP server on port 9321 (default); HTTPS on port 9322 with `--https` flag (uses certificates from `../certificates/`)
+- `server.js` — main entry: HTTP server on port 9321 (default); HTTPS on port 9321 with `--https` flag (uses certificates from `../certificates/`)
 - `proxy_lib.js` — shared logic (all HTTP handlers, WebSocket handling, state)
 - `page_mirror.js` — DOM cache + mutation ring buffer
 - `cmd_queue.js` — command queue with ack/error tracking and cancel support
@@ -207,16 +209,16 @@ RATE_LIMIT_RPS: 20,           // Max commands per second per session
 CMD_TIMEOUT_MS: 30000,        // Command timeout (ms)
 MAX_HTML_BYTES: 10 * 1024 * 1024,  // Max HTML snapshot size (10MB)
 MAX_STRUCTURAL_CHANGES: 500,  // Max mutations per batch
-FULL_SNAPSHOT_INTERVAL_MS: 3000,   // ms between full HTML snapshots
+FULL_SNAPSHOT_INTERVAL_MS: 2000,   // ms between full HTML snapshots (shared-content.js)
 MAJOR_MUTATION_DEBOUNCE_MS: 300,   // ms to wait before full snapshot after major mutation
-HEARTBEAT_INTERVAL_MS: 15000,  // content.js → background.js heartbeat interval
+HEARTBEAT_INTERVAL_MS: 15000,  // content.js → background.js heartbeat interval (shared-content.js)
 BACKPRESSURE_THRESHOLD_MS: 500, // ms of estimated send time above which backpressure triggers
-MAX_PENDING_MESSAGES: 100,    // Extension → proxy pending queue depth
+MAX_PENDING_MESSAGES: 50,    // Extension → proxy pending queue depth (extension background.js)
 MAX_IDEMPOTENCY_CACHE: 1000,   // Max entries in the idempotency cache
 IDEMPOTENCY_TTL_MS: 60000,    // How long idempotency keys live (ms)
 SESSION_MAX_AGE_MS: 3600000,  // Evict sessions inactive for 1 hour
 MAX_SESSIONS: 100,             // Max concurrent sessions before LRU eviction
-MUTATION_BUFFER_MAX: 500,      // Max mutations per session ring buffer
+MUTATION_BUFFER_MAX: 100,      // Max mutations per session ring buffer (page_mirror.js)
 ```
 
 ---
@@ -231,7 +233,7 @@ MUTATION_BUFFER_MAX: 500,      // Max mutations per session ring buffer
 
 **Production hardening** (when ready for multi-user/multi-machine deployment):
 - Add token-based auth: extensions receive a time-limited token; proxy validates it on every request
-- Use HTTPS (server_https.js + CA cert) for non-localhost proxy access
+- Use HTTPS (`--https` flag on server.js + CA cert) for non-localhost proxy access
 - Add per-session ACLs (restrict which sites a given token can access)
 - Add request signing (HMAC) to prevent tampering in transit
 
