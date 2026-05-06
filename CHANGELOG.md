@@ -2,6 +2,45 @@
 
 All notable changes to Hermes Browser Bridge are documented here.
 
+## [1.3.2] — 2026-05-05
+
+### Added
+- **README.md**: Project overview, architecture diagram, quick-start instructions at repo root.
+- **ESLint configuration**: Added `.eslintrc.json` and `lint` npm script for consistent code quality.
+- **build_safari_bundle.sh**: Script to generate Safari `.safariextension` bundle for sideloading.
+
+### Changed
+- **Version unified**: All manifest.json, package.json, and Info.plist now consistently at 1.3.2.
+- **proxy_lib.js refactored**: Monolithic 2026-line file split into `lib/` modules: `server.js` (entry), `routes/`, `handlers/`, and `middleware/`.
+- **CHANGELOG.md updated**: 1.3.1 and 1.3.2 entries documented.
+
+### Fixed
+- **#P0: CA private key removed from repo**: `certificates/ca.key` and `ca.crt` added to `.gitignore`. Key regenerated with AES encryption. Rotated.
+- **#P1: Chrome popup uses wrong API**: Fixed `browser.runtime.sendMessage` → `chrome.runtime.sendMessage` in Chrome popup cancel handler.
+- **#P1: No test coverage for core modules**: Added unit tests for `cmd_queue.js`, `page_mirror.js`, `config.js` and integration tests for extension→proxy flow.
+- **#P2: evaluate() has no sandbox guards**: Added runtime warnings when evaluate accesses sensitive APIs (cookies, storage, network).
+- **#P2: Shared HermesShared singleton across iframes**: Added per-frame instance isolation via frame ID tracking.
+- **#P2: commandHistory memory leak with stale connections**: Added TTL-based eviction for sessions with stale Hermes WebSocket connections.
+- **#P2: Unbounded launchd log files**: Added `newsyslog`-style log rotation configuration.
+- **#P3: getStructuralSnapshot runs O(n) DOM query before idle guard**: Moved `querySelectorAll('*')` inside the idle callback.
+- **#P3: Dashboard silently swallows health check errors**: Added visible error banner when `/health` fetch fails.
+- **#P3: Popup saveCmdLog silently fails**: Added user-visible toast notification on persistent storage errors.
+- **#P3: Fixed mutation buffer overflow notification**: Hermes Agent now receives `buffer_overflow` warning when mutations exceed capacity.
+- **#P3: Adaptive mutation flush**: Buffer now flushes immediately when exceeding 75% capacity instead of waiting for the fixed 500ms interval.
+- **#P3: CHROME_EXTENSION.md stale docs**: Fixed `document_idle` → `document_start` in content script run_at documentation.
+- **#P3: Safari navigate handler missing tab dedup**: Added tab change listener guard to prevent phantom navigations during rapid tab switches.
+- **#P3: Shared content bootstrap extracted**: Common initialization logic moved into `initHermesBridge()` in shared-content.js.
+
+### Security
+- **CA key rotation**: `certificates/ca.key` regenerated with AES encryption, removed from git tracking.
+- **evaluate() sandbox instrumentation**: Runtime monitoring of sensitive API access in evaluated scripts.
+
+## [1.3.1] — 2026-05-04
+
+### Fixed
+- Safari extension manifest.json at correct location in bundle root for sideloading.
+- CFBundlePackageType set to BNDL for Safari extension wrapper.
+
 ## [1.3.0] — 2026-05-03
 
 ### Fixed (22 issues from R25 audit)

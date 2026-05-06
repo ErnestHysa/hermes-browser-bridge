@@ -1,6 +1,6 @@
 {
   "name": "hermes-browser-bridge-proxy",
-  "version": "1.3.1",
+  "version": "1.3.2",
   "description": "Local proxy + WebSocket bridge for Hermes Browser Bridge extension",
   "main": "server.js",
   "scripts": {

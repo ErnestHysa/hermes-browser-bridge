@@ -1,6 +1,6 @@
 # Chrome Extension — Specification
 
-**Status: ✅ Implemented (v1.3.0)**
+**Status: ✅ Implemented (v1.3.2)**
 
 This document describes the Chrome Web Extension variant of Hermes Browser Bridge.
 It mirrors the Safari extension architecture using Chrome's Manifest V3 Web Extensions API.
@@ -131,7 +131,7 @@ Or use `npm run build:icons` from the `proxy_server/` directory.
   "content_scripts": [{
     "matches": ["<all_urls>"],
     "js": ["content.js"],
-    "run_at": "document_idle"
+    "run_at": "document_start"
   }],
   "web_accessible_resources": [{
     "resources": ["noop.html"],

@@ -83,19 +83,19 @@ function loadCmdLog() {
 
 // R56: Save command log to localStorage with retry-on-failure.
 // If storage is full, trim oldest entries and retry once before giving up.
+// If storage is disabled (private browsing, storage API blocked), show error in UI.
 function saveCmdLog() {
   try {
     localStorage.setItem(CMD_LOG_KEY, JSON.stringify(cmdLog));
   } catch (e) {
-    // R56: Storage full — try trimming oldest entries and retry once
-    if (cmdLog.length > 1) {
+    if (e.name === 'QuotaExceededError' && cmdLog.length > 1) {
       cmdLog = cmdLog.slice(-MAX_CMD_LOG);
       try {
         localStorage.setItem(CMD_LOG_KEY, JSON.stringify(cmdLog));
         return;
-      } catch (_) { /* give up */ }
+      } catch (_) {}
     }
-    // Silent failure — don't crash the popup for a failed log write
+    addCmdLog('warn', `Log not saved: ${e.name}`);
   }
 }
 
@@ -125,8 +125,7 @@ function onCancelClick() {
   const cmdIdToCancel = pendingCmdId;
   pendingCmdId = null;
   cancelBtn.classList.add('hidden');
-  // Fix #L12: Route through background to use its runtime _proxyPort
-  browser.runtime.sendMessage({ event: 'cancelCmd', cmdId: cmdIdToCancel })
+  chrome.runtime.sendMessage({ event: 'cancelCmd', cmdId: cmdIdToCancel })
     .then(() => { addCmdLog('error', `Cancelled: ${cmdIdToCancel}`); })
     .catch(() => { addCmdLog('error', 'Cancel failed'); });
 }

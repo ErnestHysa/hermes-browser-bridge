@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Hermes Browser Bridge",
-  "version": "1.3.1",
+  "version": "1.3.2",
   "description": "Gives Hermes Agent full read and control of the current browser tab",
   "permissions": [
     "activeTab",
