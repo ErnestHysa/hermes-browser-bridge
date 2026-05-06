@@ -1,0 +1,27 @@
+{
+  "root": true,
+  "env": {
+    "node": true,
+    "browser": true,
+    "es2022": true,
+    "webextensions": true,
+    "commonjs": true
+  },
+  "parserOptions": {
+    "ecmaVersion": 2022
+  },
+  "extends": ["eslint:recommended"],
+  "rules": {
+    "no-unused-vars": ["warn", { "argsIgnorePattern": "^_" }],
+    "no-console": "off",
+    "no-constant-condition": ["error", { "checkLoops": false }],
+    "no-prototype-builtins": "warn",
+    "no-empty": ["warn", { "allowEmptyCatch": true }]
+  },
+  "ignorePatterns": [
+    "node_modules/",
+    "extension_chrome/lib/",
+    "extension_safari.safariextension/",
+    "certificates/"
+  ]
+}
