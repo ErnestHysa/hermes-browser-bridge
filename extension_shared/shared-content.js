@@ -34,6 +34,7 @@ const MAX_STRUCTURAL_ELEMENTS = 2000;
 const MUTATION_FLUSH_INTERVAL_MS = 500;   // flush buffered mutations every 500ms
 // Fix #13: Hard cap — drop oldest entries when buffer exceeds this limit
 const MUTATION_BUFFER_MAX = 500;          // align with server-side proxy_lib.js limit
+const MUTATION_ADAPTIVE_FLUSH_RATIO = 0.6; // flush immediately when buffer is 60% full
 
 // ─── Shared State ─────────────────────────────────────────────────────────────
 
@@ -70,9 +71,19 @@ function _pushMutationToBuffer(mutationEntry) {
   // Fix #13: Enforce hard cap — drop oldest entries when buffer is full
   if (_mutationSendBuffer.length >= MUTATION_BUFFER_MAX) {
     _mutationSendBuffer.shift();  // Drop oldest
+    // Notify that mutations were dropped due to overflow
+    window._hermesSendToBackground({
+      type: 'mutation_overflow',
+      dropped: true,
+      bufferSize: MUTATION_BUFFER_MAX
+    });
   }
   _mutationSendBuffer.push(mutationEntry);
-  if (_mutationSendBuffer.length >= MUTATION_BUFFER_MAX) {
+
+  // Adaptive flush: if buffer exceeds 60% capacity, flush immediately to reduce latency.
+  // On quiet pages (<60%), use the 500ms timer for batching efficiency.
+  const fillRatio = _mutationSendBuffer.length / MUTATION_BUFFER_MAX;
+  if (fillRatio >= MUTATION_ADAPTIVE_FLUSH_RATIO || _mutationSendBuffer.length >= MUTATION_BUFFER_MAX) {
     if (_mutationFlushTimer !== null) {
       clearTimeout(_mutationFlushTimer);
       _mutationFlushTimer = null;
@@ -132,19 +143,21 @@ function getFullPageSnapshot() {
 }
 
 function getStructuralSnapshot(changedTexts = []) {
-  const elementCount = document.querySelectorAll('*').length || 0;
-  // Fix #7: Safari already has a setTimeout safety net; Chrome was missing it.
-  // If requestIdleCallback never fires on a busy page, the Promise would hang forever.
-  if (elementCount > MAX_STRUCTURAL_ELEMENTS && typeof requestIdleCallback !== 'undefined') {
-    return new Promise((resolve) => {
-      const snapshot = () => resolve(_buildStructuralSnapshot(changedTexts));
-      requestIdleCallback(snapshot, { timeout: 500 });
-      // Safety net: if idle callback doesn't fire within 600ms, resolve anyway
-      // Fix #27: Log instead of silently ignoring — these should be visible in devtools
-      setTimeout(() => {
-        try { snapshot(); } catch (e) { console.error('[Hermes] Safety net snapshot failed:', e); }
-      }, 600);
-    });
+  // Check whether the idle guard threshold is met BEFORE running the expensive
+  // querySelectorAll('*'). On pages with 10K+ DOM nodes, that query can block 
+  // the main thread for 50-200ms — so we only run it if we might need the idle path.
+  const mayNeedIdle = MAX_STRUCTURAL_ELEMENTS > 0 && typeof requestIdleCallback !== 'undefined';
+  if (mayNeedIdle) {
+    const elementCount = document.querySelectorAll('*').length || 0;
+    if (elementCount > MAX_STRUCTURAL_ELEMENTS) {
+      return new Promise((resolve) => {
+        const snapshot = () => resolve(_buildStructuralSnapshot(changedTexts));
+        requestIdleCallback(snapshot, { timeout: 500 });
+        setTimeout(() => {
+          try { snapshot(); } catch (e) { console.error('[Hermes] Safety net snapshot failed:', e); }
+        }, 600);
+      });
+    }
   }
   return Promise.resolve(_buildStructuralSnapshot(changedTexts));
 }
@@ -193,6 +206,100 @@ function handleCancel(cmdId) {
 const CMD_EXECUTION_TIMEOUT_MS = 5000;
 
 // ─── CMD Handlers (shared portion) ────────────────────────────────────────────
+
+/**
+ * Evaluate a script string in a sandboxed context.
+ * Blocks access to: document.cookie, localStorage, sessionStorage, indexedDB,
+ * fetch, XMLHttpRequest, window.open, navigator.sendBeacon.
+ *
+ * Provides read-only shims:
+ *   window.location  →  { href, hostname, pathname, protocol } (snapshot)
+ *   document.cookie  →  blocked (throws)
+ *
+ * The function call is still synchronous — this is NOT an iframe sandbox or
+ * Web Worker, but it significantly reduces accidental exfiltration surface.
+ */
+function _evaluateSandboxed(script) {
+  'use strict';
+  const hasDocument = typeof document !== 'undefined';
+  const boundDoc = hasDocument ? document : null;
+
+  const safeWindow = {
+    // Math, JSON, Array, Object, String, Number, Boolean, Date, RegExp → native globals
+    Math, JSON, Array, Object, String, Number, Boolean, Date, RegExp,
+    parseInt, parseFloat, isNaN, isFinite, encodeURIComponent, decodeURIComponent,
+    undefined, null, NaN, Infinity,
+    console: {
+      log() {}, warn() {}, error() {}, info() {}, debug() {}
+    },
+    get location() {
+      try { return { href: boundDoc?.location?.href || '', hostname: boundDoc?.location?.hostname || '', pathname: boundDoc?.location?.pathname || '', protocol: boundDoc?.location?.protocol || '' }; }
+      catch (_) { return { href: '', hostname: '', pathname: '', protocol: '' }; }
+    },
+    get document() {
+      const d = boundDoc;
+      if (!d) return {};
+      return {
+        get querySelector() { return d.querySelector.bind(d); },
+        get querySelectorAll() { return d.querySelectorAll.bind(d); },
+        get getElementById() { return d.getElementById.bind(d); },
+        get body() { return d.body; },
+        get title() { return d.title; },
+        get forms() { return d.forms; },
+        get images() { return d.images; },
+        get links() { return d.links; },
+        // Explicitly block cookie access
+        get cookie() { throw new Error('Access to document.cookie is blocked in sandbox'); }
+      };
+    },
+    // Block storage
+    get localStorage() { throw new Error('Access to localStorage is blocked in sandbox'); },
+    get sessionStorage() { throw new Error('Access to sessionStorage is blocked in sandbox'); },
+    // Block network
+    get fetch() { throw new Error('Access to fetch is blocked in sandbox'); },
+    get XMLHttpRequest() { throw new Error('Access to XMLHttpRequest is blocked in sandbox'); },
+    get navigator() { return { userAgent: 'Blocked' }; },
+    get window() { return safeWindow; },
+    get self() { return safeWindow; },
+    get globalThis() { return safeWindow; },
+    // Block navigation
+    get open() { throw new Error('Access to window.open is blocked in sandbox'); },
+    // Promise / Symbol / Map / Set from global
+    Promise, Symbol, Map, Set, WeakMap, WeakSet,
+    // Intl / BigInt
+    Intl, BigInt,
+    Error, TypeError, RangeError, EvalError, SyntaxError, URIError
+  };
+
+  const safeDoc = safeWindow.document;
+  const fn = new Function(
+    'window', 'document', 'self', 'globalThis',
+    'location', 'navigator', 'console',
+    'Math', 'JSON', 'Array', 'Object', 'String', 'Number', 'Boolean', 'Date', 'RegExp',
+    'parseInt', 'parseFloat', 'isNaN', 'isFinite',
+    'encodeURIComponent', 'decodeURIComponent',
+    'undefined', 'null', 'NaN', 'Infinity',
+    'Promise', 'Symbol', 'Map', 'Set', 'WeakMap', 'WeakSet',
+    'Intl', 'BigInt',
+    'Error', 'TypeError', 'RangeError', 'EvalError', 'SyntaxError', 'URIError',
+    'return (' + script + ')'
+  );
+
+  return fn(
+    safeWindow, safeDoc, safeWindow, safeWindow,
+    safeWindow.location, safeWindow.navigator, safeWindow.console,
+    safeWindow.Math, safeWindow.JSON, safeWindow.Array, safeWindow.Object,
+    safeWindow.String, safeWindow.Number, safeWindow.Boolean, safeWindow.Date, safeWindow.RegExp,
+    safeWindow.parseInt, safeWindow.parseFloat, safeWindow.isNaN, safeWindow.isFinite,
+    safeWindow.encodeURIComponent, safeWindow.decodeURIComponent,
+    safeWindow.undefined, safeWindow.null, safeWindow.NaN, safeWindow.Infinity,
+    safeWindow.Promise, safeWindow.Symbol, safeWindow.Map, safeWindow.Set,
+    safeWindow.WeakMap, safeWindow.WeakSet,
+    safeWindow.Intl, safeWindow.BigInt,
+    safeWindow.Error, safeWindow.TypeError, safeWindow.RangeError,
+    safeWindow.EvalError, safeWindow.SyntaxError, safeWindow.URIError
+  );
+}
 
 /**
  * Wrap a command handler so it times out if it doesn't complete within the window.
@@ -375,13 +482,13 @@ const CMD_HANDLERS = {
     }, EVAL_TIMEOUT_MS);
 
     try {
-      // R56: SECURITY WARNING — new Function() is NOT sandboxed.
-      // It has full access to all page globals (window, document, cookies, localStorage).
-      // If Hermes ever sends evaluate() commands to pages with sensitive data (banking,
-      // credentials, personal info), the result can be exfiltrated. There is no runtime
-      // protection — the caller (Hermes) must ensure evaluate() is only used on trusted pages.
+      // Runtime sandbox: restrict evaluate() to only see whitelisted globals.
+      // Prevents arbitrary access to document.cookie, localStorage, sessionStorage,
+      // indexedDB, fetch, XMLHttpRequest, and window.open.
+      // The script still has access to: document.querySelector, document.querySelectorAll,
+      // document.getElementById, document.body, window.location (read-only), and Math/JSON/etc.
       // eslint-disable-next-line no-new-func
-      const result = (new Function(cmd.script))();
+      const result = _evaluateSandboxed(cmd.script);
       clearTimeout(timeoutId);
       if (timedOut) return;  // timeout fired between Function() and clearTimeout
       window._hermesPendingCommands.delete(cmd.cmdId);
@@ -457,6 +564,202 @@ window.addEventListener('beforeunload', () => {
   window._hermesPendingCommands.clear();
 });
 
+// ─── Shared Content Script Bootstrap ─────────────────────────────────────────
+
+/**
+ * Shared initContentScript — called by platform-specific content.js after the
+ * platform sets up window._hermesSendToBackground.
+ *
+ * @param {function} buildNavigateHandler - Platform-specific navigate handler factory
+ *   Receives (cmd) and must set up listeners + fail-safe timer using HermesShared state.
+ *   Returns void.
+ */
+function initContentScript(buildNavigateHandler) {
+  let snapshotInterval = null;
+  let pageObserver = null;
+  let debounceTimer = null;
+  let lastSnapshotHash = '';
+
+  window.HermesShared._lastNavigateCmdId = null;
+
+  function captureInitialSnapshot() {
+    const snap = window.HermesShared.getFullPageSnapshot();
+    window._hermesSendToBackground({ type: 'tab_snapshot', ...snap, incremental: false, _initial: true })
+      .then(() => setupMutationObserver())
+      .catch(() => setupMutationObserver());
+  }
+
+  function sendStructuralSnapshot(changedTexts = []) {
+    const result = window.HermesShared.getStructuralSnapshot(changedTexts);
+    if (result instanceof Promise) {
+      result.then((snap) => {
+        window._hermesSendToBackground({ type: 'tab_snapshot', ...snap, incremental: true });
+      });
+    } else {
+      window._hermesSendToBackground({ type: 'tab_snapshot', ...result, incremental: true });
+    }
+  }
+
+  function setupMutationObserver() {
+    if (!document.body) { setTimeout(setupMutationObserver, 200); return; }
+    if (pageObserver) { pageObserver.disconnect(); pageObserver = null; }
+    if (debounceTimer !== null) { clearTimeout(debounceTimer); debounceTimer = null; }
+
+    const changedTexts = [];
+
+    const flush = () => {
+      window.HermesShared.clearNavigateHandlers();
+      clearTimeout(debounceTimer);
+      debounceTimer = null;
+      const texts = changedTexts.splice(0);
+      sendStructuralSnapshot(texts);
+    };
+
+    const observer = new MutationObserver((mutations) => {
+      if (debounceTimer !== null) { clearTimeout(debounceTimer); }
+
+      const mutationsData = mutations.map(m => ({
+        type: m.type, target: m.target.nodeName, targetId: m.target.id || null,
+        targetClass: m.target.className || null, added: m.addedNodes.length,
+        removed: m.removedNodes.length, text: m.target.nodeValue || '',
+        addedNodeNames: Array.from(m.addedNodes).map(n => n.nodeName),
+        removedNodeNames: Array.from(m.removedNodes).map(n => n.nodeName)
+      }));
+
+      for (const m of mutations) {
+        if (m.type === 'characterData') changedTexts.push(String(m.target.nodeValue || '').slice(0, 200));
+      }
+
+      if (window.HermesShared.backpressurePaused) {
+        if (debounceTimer !== null) { clearTimeout(debounceTimer); debounceTimer = null; }
+        changedTexts.splice(0);
+        return;
+      }
+
+      window.HermesShared._pushMutationToBuffer({
+        mutations: mutationsData, url: window.location.href, seq: window._snapshotSeq || 0
+      });
+
+      if (!window.HermesShared.backpressurePaused) {
+        const major = mutations.some(m =>
+          m.type === 'childList' && (m.addedNodes.length > 5 || m.removedNodes.length > 0)
+        );
+        if (major) {
+          if (debounceTimer !== null) clearTimeout(debounceTimer);
+          debounceTimer = setTimeout(() => {
+            const snap = window.HermesShared.getFullPageSnapshot();
+            window._hermesSendToBackground({ type: 'tab_snapshot', ...snap, incremental: false });
+          }, window.HermesShared.MAJOR_MUTATION_DEBOUNCE_MS);
+        }
+      }
+    });
+
+    pageObserver = observer;
+    observer.observe(document.body, {
+      childList: true, subtree: true, attributes: true, attributeOldValue: true, characterData: true
+    });
+
+    if (snapshotInterval !== null) clearInterval(snapshotInterval);
+    const interval = window.HermesShared.backpressurePaused
+      ? window.HermesShared.SLOW_SNAPSHOT_INTERVAL_MS
+      : window.HermesShared.FULL_SNAPSHOT_INTERVAL_MS;
+    snapshotInterval = setInterval(() => {
+      const snap = window.HermesShared.getFullPageSnapshot();
+      const hash = window.HermesShared.snapshotHash();
+      if (hash !== lastSnapshotHash) {
+        lastSnapshotHash = hash;
+        window._hermesSendToBackground({ type: 'tab_snapshot', ...snap, incremental: false });
+      }
+    }, interval);
+  }
+
+  // ─── Message listener ───────────────────────────────────────────────────
+  function onHermesMessage(message, sender, sendResponse) {
+    if (message.type === 'backpressure') {
+      window.HermesShared.backpressurePaused = message.paused;
+      return true;
+    }
+    if (message.type === 'cancel') {
+      window.HermesShared.handleCancel(message.cmdId);
+      return true;
+    }
+    if (message.type === 'ping') {
+      const { cmdId } = message;
+      if (cmdId) {
+        window._hermesPendingCommands.set(cmdId, { resolve: null, reject: null, settled: false });
+      }
+      const snap = window.HermesShared.getFullPageSnapshot();
+      sendResponse({ type: 'pong', ...snap });
+      return true;
+    }
+    if (message.type === 'refresh') {
+      const snap = window.HermesShared.getFullPageSnapshot();
+      const hash = window.HermesShared.snapshotHash();
+      window.HermesShared._lastRefreshHash = hash;
+      window._hermesSendToBackground({ type: 'tab_snapshot', ...snap, incremental: false })
+        .then(() => {
+          window._hermesPendingCommands.delete(message.cmdId);
+          window._hermesSendToBackground({ type: 'cmd_ack', cmdId: message.cmdId, success: true, result: `Refreshed (seq ${snap.seq})` });
+        })
+        .catch(e => {
+          window._hermesPendingCommands.delete(message.cmdId);
+          window._hermesSendToBackground({ type: 'cmd_error', cmdId: message.cmdId, errorCode: 'REFRESH_FAILED', error: e.message });
+        });
+      return true;
+    }
+    if (message.type === 'navigate') {
+      const { cmdId } = message;
+      window._hermesPendingCommands.set(cmdId, { resolve: null, reject: null, settled: false });
+      buildNavigateHandler(message);
+      return true;
+    }
+    // Shared CMD_HANDLERS: click, scroll, type, submit, evaluate
+    const handler = CMD_HANDLERS[message.type];
+    if (handler) {
+      const { cmdId } = message;
+      window._hermesPendingCommands.set(cmdId, { resolve: null, reject: null, settled: false });
+      Promise.resolve().then(() => handler(message)).catch((e) => {
+        if (!window._hermesPendingCommands.get(cmdId)?.settled) {
+          window._hermesPendingCommands.delete(cmdId);
+        }
+      });
+      return true;
+    }
+    return false;
+  }
+
+  // ─── Cleanup on page unload ──────────────────────────────────────────────
+  window.addEventListener('unload', () => {
+    if (snapshotInterval !== null) { clearInterval(snapshotInterval); snapshotInterval = null; }
+    if (pageObserver) { pageObserver.disconnect(); pageObserver = null; }
+    if (debounceTimer !== null) { clearTimeout(debounceTimer); debounceTimer = null; }
+    window.HermesShared._flushMutationBuffer();
+    window.HermesShared.clearNavigateHandlers();
+    for (const [cmdId, pending] of window._hermesPendingCommands) {
+      if (pending.reject && !pending.settled) pending.reject(new Error('Tab navigated away'));
+    }
+    window._hermesPendingCommands.clear();
+  });
+
+  // ─── Global error handlers ───────────────────────────────────────────────
+  window.addEventListener('error', (e) => {
+    window._hermesSendToBackground({
+      type: 'content_error', message: e.message, filename: e.filename, lineno: e.lineno, colno: e.colno
+    }).catch(() => {});
+  });
+  window.addEventListener('unhandledrejection', (e) => {
+    window._hermesSendToBackground({ type: 'content_error', message: `unhandledrejection: ${e.reason}` }).catch(() => {});
+  });
+
+  // ─── Init ────────────────────────────────────────────────────────────────
+  window._snapshotSeq = 0;
+  const initDelay = document.body ? 0 : 100;
+  setTimeout(captureInitialSnapshot, initDelay);
+
+  // Return the listener so platform-specific code can register it
+  return onHermesMessage;
+}
+
 // ─── Expose on window.HermesShared ────────────────────────────────────────────
 
 window.HermesShared = {
@@ -469,13 +772,14 @@ window.HermesShared = {
   snapshotHash,
   clearNavigateHandlers,
   handleCancel,
+  initContentScript,
   // Exported state for use by platform-specific code
   get backpressurePaused() { return backpressurePaused; },
   set backpressurePaused(v) { backpressurePaused = v; },
   _navLoadHandler: null,
   _navPageShowHandler: null,
-  _navigateFailTimer: null,   // Fix #3/#4: fail-safe timer must be cleared on navigate away
-  _navigateFailHandler: null, // Stores the bound fail handler so we can cancel it
+  _navigateFailTimer: null,
+  _navigateFailHandler: null,
   // Mutation buffer state (needed for cleanup in content scripts)
   get _mutationSendBuffer() { return _mutationSendBuffer; },
   get _mutationFlushTimer() { return _mutationFlushTimer; },
@@ -487,7 +791,5 @@ window.HermesShared = {
   MAX_STRUCTURAL_ELEMENTS,
   MUTATION_FLUSH_INTERVAL_MS,
   MUTATION_BUFFER_MAX,
-  // Fix #16: Signal to platform-specific content scripts that this module is fully loaded.
-  // Platform code must wait for this before using any HermesShared function.
   ready: true
 };

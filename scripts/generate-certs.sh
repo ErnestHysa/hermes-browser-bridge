@@ -40,7 +40,6 @@ openssl req -x509 -newkey rsa:2048 \
   -out "$CERTS_DIR/ca.crt" \
   -days 3650 \
   -passout pass:"$CA_KEY_PASSWORD" \
-  -aes256 \
   -subj "/CN=Hermes Browser Bridge CA/O=Hermes Agent/C=US" \
   -addext "basicConstraints=critical,CA:TRUE" \
   -addext "keyUsage=critical,keyCertSign,cRLSign"

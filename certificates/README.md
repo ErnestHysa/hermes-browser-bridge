@@ -64,7 +64,8 @@ Apple may reset CA trust after a macOS update. Re-run the command above after up
 
 2. The proxy reads `HBS_CA_KEY_PASSWORD` from the environment to decrypt the key at startup.
 
-**Important**: Never commit `ca.key` or `.env` to version control.
+**Important**: Never commit `ca.key`, `ca.crt`, or `.env` to version control. These files are
+listed in `.gitignore` and should be generated fresh on each machine.
 
 ---
 

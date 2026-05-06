@@ -17,6 +17,10 @@ extension_safari.safariextension/
 # Environment
 .env
 
+# Certificates (generated per-machine, never commit private keys)
+certificates/ca.key
+certificates/ca.crt
+
 # Editor
 .vscode/
 .idea/
