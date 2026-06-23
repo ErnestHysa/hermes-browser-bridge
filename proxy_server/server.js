@@ -14,6 +14,7 @@ const http = require('node:http');
 const https = require('node:https');
 const { readFileSync } = require('node:fs');
 const { startProxy } = require('./proxy_lib');
+const { reload } = require('./lib/authToken');
 
 const HOST = '127.0.0.1';
 
@@ -21,7 +22,9 @@ let PKG_VERSION = '1.3.2';
 try {
   const pkg = JSON.parse(readFileSync(require.resolve('./package.json'), 'utf-8'));
   PKG_VERSION = pkg.version || PKG_VERSION;
-} catch (_) {}
+} catch (e) {
+  console.error(JSON.stringify({ ts: new Date().toISOString(), lvl: 'error', msg: 'Failed to read package.json version', err: e.message }));
+}
 
 function startHttp() {
   const PORT = parseInt(process.env.HBS_PORT || '9321', 10);
@@ -72,7 +75,9 @@ function startHttps() {
     if (daysUntilExpiry < 30) {
       console.warn(JSON.stringify({ ts: new Date().toISOString(), lvl: 'warn', msg: 'TLS certificate expires soon', expiresAt: x509.validTo, daysRemaining: daysUntilExpiry }));
     }
-  } catch (e) { /* non-critical */ }
+  } catch (e) {
+    console.error(JSON.stringify({ ts: new Date().toISOString(), lvl: 'error', msg: 'Certificate validation failed', err: e.message }));
+  }
 
   const httpServer = https.createServer(tlsOptions);
 
@@ -105,6 +110,10 @@ function setupShutdown(httpServer) {
   };
   process.on('SIGINT', handler);
   process.on('SIGTERM', handler);
+  process.on('SIGHUP', () => {
+    console.log(JSON.stringify({ ts: new Date().toISOString(), lvl: 'info', msg: 'Received SIGHUP — reloading config' }));
+    reload();
+  });
 }
 
 const useHttps = process.argv.includes('--https');

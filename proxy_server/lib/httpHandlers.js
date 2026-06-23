@@ -6,6 +6,7 @@
 
 const { randomUUID } = require('node:crypto');
 const { log } = require('./logger');
+const { getToken } = require('./authToken');
 const { validateHttpAuth, jsonResponse, parseBody, htmlEscape } = require('./utils');
 const { metrics, metricIncr, metricHistogramPush, metricGauge, formatPrometheus, buildMetricsJson } = require('./metrics');
 const { getHistory, pushHistory, deleteHistory } = require('./commandHistory');
@@ -151,7 +152,7 @@ function setupHttpHandlers(httpServer, opts) {
     if (req.method === 'GET' && path === '/config') {
       jsonResponse(res, 200, {
         version: PROXY_VERSION,
-        authEnabled: !!process.env.HBS_AUTH_TOKEN,
+        authEnabled: !!getToken(),
         port: serverPort,
         sessionTtlMs: cfg.SESSION_TTL_MS,
         commandTimeoutMs: cfg.CMD_TIMEOUT_MS,
@@ -190,7 +191,7 @@ function setupHttpHandlers(httpServer, opts) {
       }
       const state = pageMirror.getState(sid);
       const meta = sessionMetaInfo.get(sid) || {};
-      const hermesClientCount = [...hermesPush._clients.values()].filter(sids => sids.has(sid)).length;
+      const hermesClientCount = hermesPush.getSubscriberCount(sid) || 0;
       jsonResponse(res, 200, {
         sessionId: sid,
         connected: ws.readyState === 1,
@@ -546,7 +547,8 @@ ${sessions.map(s => `
           'Content-Security-Policy': "default-src 'none'"
         });
         res.end(jsContent);
-      } catch (_) {
+      } catch (e) {
+        log('warn', 'Failed to serve dashboard.js', { err: e.message });
         res.writeHead(404);
         res.end('Not found');
       }

@@ -119,7 +119,9 @@ function startProxy(opts = {}) {
           log('info', 'Session timeout — evicting', { sessionId: sid });
           const ws = sessionSockets.get(sid);
           if (ws) {
-            try { ws.close(1001, 'Session timeout'); } catch (_) {}
+            try { ws.close(1001, 'Session timeout'); } catch (e) {
+              log('warn', 'Failed to close WS on session timeout', { sessionId: sid, err: e.message });
+            }
           }
           sessionSockets.delete(sid);
           sessionMeta.delete(sid);

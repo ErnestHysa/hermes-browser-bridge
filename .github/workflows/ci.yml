@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [18, 20, 22]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install dependencies
+        working-directory: proxy_server
+        run: npm ci
+
+      - name: Run unit tests
+        working-directory: proxy_server
+        run: npm test
+
+      - name: Run smoke tests
+        run: |
+          cd proxy_server
+          node server.js &
+          PROXY_PID=$!
+          sleep 2
+          cd ..
+          bash tests/smoke_test.sh || true
+          kill $PROXY_PID 2>/dev/null

@@ -30,10 +30,11 @@ class RateLimiter {
   _refill() {
     const now = Date.now();
     const elapsed = now - this.lastRefill;
-    if (elapsed >= this.windowMs) {
-      const refill = Math.min(this.maxTokens, Math.floor(elapsed / this.windowMs * this.maxTokens));
+    const intervals = Math.floor(elapsed / this.windowMs);
+    if (intervals > 0) {
+      const refill = Math.min(this.maxTokens * intervals, Math.floor(elapsed / this.windowMs * this.maxTokens));
       this.tokens = Math.min(this.maxTokens, this.tokens + refill);
-      this.lastRefill = now;
+      this.lastRefill += intervals * this.windowMs;
     }
   }
 

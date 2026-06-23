@@ -8,10 +8,11 @@
     "start:https": "node server.js --https",
     "dev": "nodemon server.js",
     "build:icons": "node ../extension_safari/Contents/Resources/images/generate_icons.js",
-    "build:safari": "swiftc -target arm64-apple-macosx13.0 -sdk $(xcrun --sdk macosx --show-sdk-path) ../extension_safari/Contents/MacOS/SafariWebExtensionHandler.swift -o ../extension_safari/Contents/MacOS/SafariWebExtensionHandler",
+    "build:safari": "ARCH=$(uname -m | sed 's/arm64/arm64/;s/x86_64/x86_64/')-apple-macosx-$(sw_vers -productVersion | cut -d. -f1,2) && swiftc -target $ARCH -sdk $(xcrun --sdk macosx --show-sdk-path) ../extension_safari/Contents/MacOS/SafariWebExtensionHandler.swift -o ../extension_safari/Contents/MacOS/SafariWebExtensionHandler",
     "build:all": "npm run build:safari && npm run build:icons",
     "smoke": "bash ../tests/smoke_test.sh",
-    "test": "npm run smoke"
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "keywords": [],
   "author": "",
@@ -19,9 +20,13 @@
   "dependencies": {
     "ws": "^8.20.0"
   },
-  "engines": { "node": ">=18" },
+  "engines": {
+    "node": ">=18"
+  },
   "devDependencies": {
+    "eslint": "^10.3.0",
     "nodemon": "^3.1.14",
-    "playwright": "^1.52.0"
+    "playwright": "^1.52.0",
+    "vitest": "^4.1.5"
   }
 }

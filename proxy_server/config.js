@@ -1,9 +1,9 @@
 /**
  * config.js — Hermes Browser Bridge runtime configuration
  *
- * ⚠️ INFO-22: HBS_AUTH_TOKEN is read once at startup — there is no hot-reload mechanism.
- *   If the token needs to be rotated, the proxy process must be restarted. A future version
- *   could add POST /admin/reload-config or support SIGHUP to reload without restart.
+ * ⚠️ INFO-22: HBS_AUTH_TOKEN supports hot-reload via SIGHUP (authToken.js).
+ *   Set HBS_AUTH_TOKEN_FILE=/path/to/token for file-based auth that can be
+ *   reloaded at runtime by sending SIGHUP to the proxy process.
  *
  * ⚠️ INFO-23: Prometheus metrics (metrics.js) include counters and gauges but lack histogram
  *   buckets for computing percentile latencies (p50/p95/p99). metricHistogramObserve is called

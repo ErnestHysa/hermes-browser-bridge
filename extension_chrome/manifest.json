@@ -33,7 +33,7 @@
   ],
   "web_accessible_resources": [
     {
-      "resources": ["noop.html"],
+      "resources": ["noop.html", "extension_shared/shared-content.js"],
       "matches": ["<all_urls>"]
     }
   ],

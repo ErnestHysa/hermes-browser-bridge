@@ -7,11 +7,12 @@
 const { createGzip } = require('zlib');
 const cfg = require('../config');
 const { log } = require('./logger');
+const { getToken } = require('./authToken');
 
 const MAX_BODY_BYTES = cfg.MAX_BODY_BYTES;
 
 function validateHttpAuth(req) {
-  const expectedToken = process.env.HBS_AUTH_TOKEN || null;
+  const expectedToken = getToken();
   if (!expectedToken) return { authorized: true };
   const authHeader = req.headers['authorization'] || '';
   const queryToken = new URL(req.url, 'http://localhost').searchParams.get('token');
@@ -26,8 +27,11 @@ function jsonResponse(res, statusCode, data, extraHeaders = {}) {
   const acceptEncoding = (res.req && res.req.headers && res.req.headers['accept-encoding']) || '';
   const reqId = (res.req && res.req._hermesReqId) || 'unknown';
 
+  const origin = (res.req && res.req.headers && res.req.headers['origin']) || '';
+  const allowedOrigin = origin && cfg.ALLOWED_ORIGINS.includes(origin) ? origin : 'null';
+
   const commonHeaders = {
-    'Access-Control-Allow-Origin': 'http://localhost:*',
+    'Access-Control-Allow-Origin': allowedOrigin,
     'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type',
     'X-Content-Type-Options': 'nosniff',

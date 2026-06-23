@@ -52,7 +52,9 @@ class HermesPushManager {
       for (const ws of subs) {
         try {
           ws.send(JSON.stringify({ type: 'session_evicted', sessionId: sid, reason: 'timeout' }));
-        } catch (_) {}
+        } catch (e) {
+          log('warn', 'HermesPush: failed to send session_evicted', { sessionId: sid, err: e.message });
+        }
       }
       this._sessionSubscriptions.delete(sid);
     }
@@ -84,7 +86,9 @@ class HermesPushManager {
     const data = JSON.stringify(payload);
     for (const ws of subscribers) {
       if (ws.readyState === 1) {
-        try { ws.send(data); } catch (_) {}
+        try { ws.send(data); } catch (e) {
+          log('warn', 'HermesPush: failed to push to session subscriber', { sessionId, err: e.message });
+        }
       }
     }
   }
@@ -94,6 +98,12 @@ class HermesPushManager {
   }
 
   get size() { return this._clients.size; }
+
+  /** Returns the number of Hermes WS clients subscribed to a given session. */
+  getSubscriberCount(sessionId) {
+    const subs = this._sessionSubscriptions.get(sessionId);
+    return subs ? subs.size : 0;
+  }
 }
 
 module.exports = { HermesPushManager };

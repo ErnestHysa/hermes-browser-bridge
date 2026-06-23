@@ -7,6 +7,7 @@
 const { WebSocketServer } = require('ws');
 const { randomUUID } = require('node:crypto');
 const { log } = require('./logger');
+const { getToken } = require('./authToken');
 const { metrics, metricIncr, metricGauge, metricHistogramPush } = require('./metrics');
 const { pushHistory } = require('./commandHistory');
 
@@ -94,7 +95,7 @@ function setupWebSocketHandlers({
       log('debug', `Hermes WS ← ${msg.type}`, { reqId });
 
       if (msg.type === 'hello') {
-        const expectedToken = process.env.HBS_AUTH_TOKEN || null;
+        const expectedToken = getToken();
         if (expectedToken && msg.token !== expectedToken) {
           log('warn', 'Hermes WS auth failed — invalid token', { reqId });
           ws.close(1008, 'Invalid token');
@@ -116,7 +117,9 @@ function setupWebSocketHandlers({
 
       if (msg.type === 'subscribe') {
         if (!msg.sessionId) {
-          try { ws.send(JSON.stringify({ type: 'error', message: 'sessionId required' })); } catch (_) {}
+          try { ws.send(JSON.stringify({ type: 'error', message: 'sessionId required' })); } catch (e) {
+            log('warn', 'Hermes WS failed to send error response', { reqId, err: e.message });
+          }
           return;
         }
         hermesPush.subscribe(ws, msg.sessionId, reqId);
@@ -136,13 +139,17 @@ function setupWebSocketHandlers({
         if (newId && oldId) {
           hermesPush.broadcastSessionBridge(newId, oldId);
         }
-        try { ws.send(JSON.stringify({ type: 'session_bridge_ack', sessionId: newId, previousSessionId: oldId })); } catch (_) {}
+        try { ws.send(JSON.stringify({ type: 'session_bridge_ack', sessionId: newId, previousSessionId: oldId })); } catch (e) {
+          log('warn', 'Hermes WS failed to send session_bridge_ack', { reqId, err: e.message });
+        }
         return;
       }
 
       if (msg.type === 'unsubscribe') {
         hermesPush.unsubscribe(ws);
-        try { ws.send(JSON.stringify({ type: 'unsubscribed' })); } catch (_) {}
+        try { ws.send(JSON.stringify({ type: 'unsubscribed' })); } catch (e) {
+          log('warn', 'Hermes WS failed to send unsubscribed', { reqId, err: e.message });
+        }
         return;
       }
 
@@ -171,7 +178,9 @@ function setupWebSocketHandlers({
       }
 
       if (msg.type === 'ping') {
-        try { ws.send(JSON.stringify({ type: 'pong', ts: Date.now() })); } catch (_) {}
+        try { ws.send(JSON.stringify({ type: 'pong', ts: Date.now() })); } catch (e) {
+          log('warn', 'Hermes WS failed to send pong', { reqId, err: e.message });
+        }
       }
     });
 
@@ -195,7 +204,7 @@ function setupWebSocketHandlers({
     const remoteIp = req.socket.remoteAddress || 'unknown';
 
     let extAuthenticated = false;
-    const expectedToken = process.env.HBS_AUTH_TOKEN || null;
+    const expectedToken = getToken();
     const authTimeout = setTimeout(() => {
       if (!extAuthenticated) {
         log('warn', 'Extension WS auth timeout — no hello received', { reqId, remoteIp });
